@@ -12,11 +12,11 @@ use std::process::exit;
 use std::time::{Duration, Instant};
 
 use auth::{AuthorizedKeys, PublicKey};
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use noissh::config::{config_dir, load_authorized_keys, load_or_generate_keypair};
 use noissh::server::{Server, ServerCore};
-use noissh::{ssh, RuntimeError};
+use noissh::{RuntimeError, ssh};
 
 fn main() {
     if let Err(e) = run() {
@@ -75,7 +75,10 @@ fn run() -> Result<(), RuntimeError> {
 
 fn run_standalone(args: Args) -> Result<(), RuntimeError> {
     let dir = config_dir();
-    let key_path = args.key.map(Into::into).unwrap_or_else(|| dir.join("noisshd_key"));
+    let key_path = args
+        .key
+        .map(Into::into)
+        .unwrap_or_else(|| dir.join("noisshd_key"));
     let ak_path = args
         .authorized_keys
         .map(Into::into)

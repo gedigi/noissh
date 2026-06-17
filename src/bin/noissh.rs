@@ -15,8 +15,8 @@ use std::time::Duration;
 use auth::{KnownHosts, PublicKey, Tofu};
 use noissh::client::Client;
 use noissh::config::{config_dir, load_known_hosts, load_or_generate_keypair, save_known_hosts};
-use noissh::tty::{terminal_size, RawMode, Renderer};
-use noissh::{ssh, RuntimeError};
+use noissh::tty::{RawMode, Renderer, terminal_size};
+use noissh::{RuntimeError, ssh};
 use predict::DisplayMode;
 
 fn main() {
@@ -80,7 +80,12 @@ fn run() -> Result<(), RuntimeError> {
 
     let (server_addr, host_label) = if args.ssh {
         // mosh-style bootstrap over SSH.
-        let boot = ssh::bootstrap(&target, &[args.server_cmd.clone()], &keypair.public, &args.ssh_args)?;
+        let boot = ssh::bootstrap(
+            &target,
+            std::slice::from_ref(&args.server_cmd),
+            &keypair.public,
+            &args.ssh_args,
+        )?;
         // The server key arrived over the authenticated SSH channel: pin it
         // directly under the host:port label so the UDP handshake validates.
         let label = format!("{}:{}", ssh::host_of(&target), boot.server_addr.port());

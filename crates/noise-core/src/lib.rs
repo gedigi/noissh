@@ -41,7 +41,10 @@ pub fn generate_keypair() -> Result<Keypair, NoiseError> {
     let params = PATTERN.parse().map_err(NoiseError::from)?;
     let builder = snow::Builder::new(params);
     let kp = builder.generate_keypair()?;
-    Ok(Keypair { private: kp.private, public: kp.public })
+    Ok(Keypair {
+        private: kp.private,
+        public: kp.public,
+    })
 }
 
 /// Which side of the handshake we are.
@@ -105,7 +108,10 @@ impl Handshake {
             .ok_or(NoiseError::NoRemoteStatic)?
             .to_vec();
         let transport = self.state.into_stateless_transport_mode()?;
-        Ok(Session { transport, remote_static: remote })
+        Ok(Session {
+            transport,
+            remote_static: remote,
+        })
     }
 }
 
@@ -239,7 +245,10 @@ mod tests {
     fn into_transport_before_finished_errors() {
         let ik = generate_keypair().unwrap();
         let hs = Handshake::new(Role::Initiator, &ik.private).unwrap();
-        assert!(matches!(hs.into_transport(), Err(NoiseError::HandshakeNotFinished)));
+        assert!(matches!(
+            hs.into_transport(),
+            Err(NoiseError::HandshakeNotFinished)
+        ));
     }
 
     #[test]

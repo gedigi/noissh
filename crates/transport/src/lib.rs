@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use noise_core::{NoiseError, Session as NoiseSession};
 use thiserror::Error;
-use wire::{decode_frames, encode_frames, Frame, WireError};
+use wire::{Frame, WireError, decode_frames, encode_frames};
 
 pub mod input;
 pub mod replay;
@@ -53,8 +53,15 @@ pub fn random_session_id() -> SessionId {
 
 /// What kind of packet a raw datagram is, plus its session id and body.
 pub enum Packet<'a> {
-    Handshake { session_id: SessionId, body: &'a [u8] },
-    Transport { session_id: SessionId, nonce: u64, body: &'a [u8] },
+    Handshake {
+        session_id: SessionId,
+        body: &'a [u8],
+    },
+    Transport {
+        session_id: SessionId,
+        nonce: u64,
+        body: &'a [u8],
+    },
 }
 
 /// Parse the outer header of a raw datagram without decrypting.
@@ -69,13 +76,20 @@ pub fn parse_packet(buf: &[u8]) -> Result<Packet<'_>, TransportError> {
     let mut session_id = [0u8; 8];
     session_id.copy_from_slice(&buf[1..9]);
     match ty {
-        PKT_HANDSHAKE => Ok(Packet::Handshake { session_id, body: &buf[9..] }),
+        PKT_HANDSHAKE => Ok(Packet::Handshake {
+            session_id,
+            body: &buf[9..],
+        }),
         PKT_TRANSPORT => {
             if buf.len() < 17 {
                 return Err(TransportError::Short);
             }
             let nonce = u64::from_be_bytes(buf[9..17].try_into().unwrap());
-            Ok(Packet::Transport { session_id, nonce, body: &buf[17..] })
+            Ok(Packet::Transport {
+                session_id,
+                nonce,
+                body: &buf[17..],
+            })
         }
         other => Err(TransportError::UnknownType(other)),
     }
@@ -142,7 +156,11 @@ impl Session {
     /// On success, updates the roaming peer address to `src`.
     pub fn open(&mut self, src: SocketAddr, packet: &[u8]) -> Result<Vec<Frame>, TransportError> {
         let (session_id, nonce, body) = match parse_packet(packet)? {
-            Packet::Transport { session_id, nonce, body } => (session_id, nonce, body),
+            Packet::Transport {
+                session_id,
+                nonce,
+                body,
+            } => (session_id, nonce, body),
             Packet::Handshake { .. } => return Err(TransportError::UnknownType(PKT_HANDSHAKE)),
         };
         if session_id != self.session_id {
@@ -181,7 +199,10 @@ mod tests {
     #[test]
     fn seal_open_roundtrip() {
         let (mut client, mut server) = pair();
-        let frames = vec![Frame::Input { offset: 0, data: b"ls\n".to_vec() }];
+        let frames = vec![Frame::Input {
+            offset: 0,
+            data: b"ls\n".to_vec(),
+        }];
         let pkt = client.seal(&frames).unwrap();
         let got = server.open(addr("10.0.0.1:5000"), &pkt).unwrap();
         assert_eq!(got, frames);
@@ -239,18 +260,33 @@ mod tests {
         let p1 = client.seal(&[Frame::Ack { seq: 1 }]).unwrap();
         let p2 = client.seal(&[Frame::Ack { seq: 2 }]).unwrap();
         // Deliver reordered.
-        assert_eq!(server.open(addr("10.0.0.1:5000"), &p2).unwrap(), vec![Frame::Ack { seq: 2 }]);
-        assert_eq!(server.open(addr("10.0.0.1:5000"), &p0).unwrap(), vec![Frame::Ack { seq: 0 }]);
-        assert_eq!(server.open(addr("10.0.0.1:5000"), &p1).unwrap(), vec![Frame::Ack { seq: 1 }]);
+        assert_eq!(
+            server.open(addr("10.0.0.1:5000"), &p2).unwrap(),
+            vec![Frame::Ack { seq: 2 }]
+        );
+        assert_eq!(
+            server.open(addr("10.0.0.1:5000"), &p0).unwrap(),
+            vec![Frame::Ack { seq: 0 }]
+        );
+        assert_eq!(
+            server.open(addr("10.0.0.1:5000"), &p1).unwrap(),
+            vec![Frame::Ack { seq: 1 }]
+        );
     }
 
     #[test]
     fn parse_packet_rejects_short_and_unknown() {
         assert!(matches!(parse_packet(&[]), Err(TransportError::Short)));
-        assert!(matches!(parse_packet(&[PKT_TRANSPORT, 0, 0]), Err(TransportError::Short)));
+        assert!(matches!(
+            parse_packet(&[PKT_TRANSPORT, 0, 0]),
+            Err(TransportError::Short)
+        ));
         let mut buf = vec![7u8]; // unknown type
         buf.extend_from_slice(&[0u8; 8]);
-        assert!(matches!(parse_packet(&buf), Err(TransportError::UnknownType(7))));
+        assert!(matches!(
+            parse_packet(&buf),
+            Err(TransportError::UnknownType(7))
+        ));
     }
 
     #[test]

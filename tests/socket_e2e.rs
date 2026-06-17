@@ -3,8 +3,8 @@
 //! a real socket rebind mid-session.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,11 @@ impl Drop for ServerHandle {
     }
 }
 
-fn spawn_server(authorized: AuthorizedKeys, server_kp: noise_core::Keypair, command: Vec<String>) -> ServerHandle {
+fn spawn_server(
+    authorized: AuthorizedKeys,
+    server_kp: noise_core::Keypair,
+    command: Vec<String>,
+) -> ServerHandle {
     let core = ServerCore::new(server_kp, authorized, Box::new(LocalLogin), Some(command));
     let mut server = Server::bind("127.0.0.1:0".parse().unwrap(), core).unwrap();
     let addr = server.local_addr().unwrap();
@@ -43,7 +47,11 @@ fn spawn_server(authorized: AuthorizedKeys, server_kp: noise_core::Keypair, comm
             }
         }
     });
-    ServerHandle { addr, stop, join: Some(join) }
+    ServerHandle {
+        addr,
+        stop,
+        join: Some(join),
+    }
 }
 
 #[test]
@@ -56,7 +64,11 @@ fn e2e_shell_output_over_udp() {
     let srv = spawn_server(
         authorized,
         server_kp,
-        vec!["/bin/sh".into(), "-c".into(), "printf 'E2E-HELLO\\n'; sleep 0.4".into()],
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'E2E-HELLO\\n'; sleep 0.4".into(),
+        ],
     );
 
     let mut client = Client::connect(
@@ -132,7 +144,10 @@ fn e2e_survives_client_rebind_roaming() {
         if client.core().screen().row_text(1).contains("PHASE-B") {
             break;
         }
-        assert!(Instant::now() < deadline, "phase B never arrived after roaming");
+        assert!(
+            Instant::now() < deadline,
+            "phase B never arrived after roaming"
+        );
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(client.core().screen().row_text(1), "PHASE-B");
@@ -146,7 +161,11 @@ fn e2e_unauthorized_client_gets_no_session() {
     let srv = spawn_server(
         AuthorizedKeys::new(),
         server_kp,
-        vec!["/bin/sh".into(), "-c".into(), "printf 'SHOULD-NOT-RUN\\n'".into()],
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'SHOULD-NOT-RUN\\n'".into(),
+        ],
     );
 
     // Connect should fail to establish (handshake completes but server creates
@@ -168,6 +187,10 @@ fn e2e_unauthorized_client_gets_no_session() {
             client.pump_once().unwrap();
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(client.core().screen().row_text(0), "", "unauthorized client received shell output");
+        assert_eq!(
+            client.core().screen().row_text(0),
+            "",
+            "unauthorized client received shell output"
+        );
     }
 }

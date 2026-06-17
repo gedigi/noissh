@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use thiserror::Error;
 
 /// The textual algorithm tag for noissh keys.
@@ -48,7 +48,9 @@ impl PublicKey {
 
     /// Parse from base64 (no algorithm tag).
     pub fn from_base64(b64: &str) -> Result<Self, AuthError> {
-        let raw = STANDARD.decode(b64.trim()).map_err(|_| AuthError::BadBase64)?;
+        let raw = STANDARD
+            .decode(b64.trim())
+            .map_err(|_| AuthError::BadBase64)?;
         PublicKey::from_bytes(&raw)
     }
 
@@ -165,7 +167,9 @@ impl KnownHosts {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (host, rest) = line.split_once(char::is_whitespace).ok_or(AuthError::MalformedLine)?;
+            let (host, rest) = line
+                .split_once(char::is_whitespace)
+                .ok_or(AuthError::MalformedLine)?;
             let key = PublicKey::from_text(rest.trim())?;
             hosts.insert(host.to_string(), key);
         }
@@ -285,6 +289,9 @@ mod tests {
 
     #[test]
     fn known_hosts_parse_rejects_malformed() {
-        assert!(matches!(KnownHosts::parse("onlyhost"), Err(AuthError::MalformedLine)));
+        assert!(matches!(
+            KnownHosts::parse("onlyhost"),
+            Err(AuthError::MalformedLine)
+        ));
     }
 }

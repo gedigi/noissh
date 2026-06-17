@@ -50,28 +50,64 @@ impl StreamKind {
 pub enum Frame {
     // --- v1 datagram class ---
     /// Acknowledge the highest contiguous state-sync sequence applied.
-    Ack { seq: u64 },
+    Ack {
+        seq: u64,
+    },
     /// Client keystroke bytes as a reliable append-only stream from `offset`.
-    Input { offset: u64, data: Vec<u8> },
+    Input {
+        offset: u64,
+        data: Vec<u8>,
+    },
     /// Latest-wins terminal state diff: `seq` is this state's id, `base` is the
     /// state id it was diffed against (0 = full snapshot).
-    StateDiff { seq: u64, base: u64, data: Vec<u8> },
+    StateDiff {
+        seq: u64,
+        base: u64,
+        data: Vec<u8>,
+    },
     /// Window resize.
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     /// Liveness probe carrying an opaque timestamp.
-    Ping { stamp: u64 },
-    Pong { stamp: u64 },
+    Ping {
+        stamp: u64,
+    },
+    Pong {
+        stamp: u64,
+    },
 
     // --- v2 stream class ---
-    StreamOpen { id: u64, kind: StreamKind, meta: Vec<u8> },
-    StreamData { id: u64, offset: u64, data: Vec<u8>, fin: bool },
-    StreamAck { id: u64, ack: u64, window: u32 },
-    StreamClose { id: u64, status: i32 },
-    StreamReset { id: u64 },
+    StreamOpen {
+        id: u64,
+        kind: StreamKind,
+        meta: Vec<u8>,
+    },
+    StreamData {
+        id: u64,
+        offset: u64,
+        data: Vec<u8>,
+        fin: bool,
+    },
+    StreamAck {
+        id: u64,
+        ack: u64,
+        window: u32,
+    },
+    StreamClose {
+        id: u64,
+        status: i32,
+    },
+    StreamReset {
+        id: u64,
+    },
 
     // --- control ---
     /// Opaque control-channel message (proto crate defines payload).
-    Control { data: Vec<u8> },
+    Control {
+        data: Vec<u8>,
+    },
 }
 
 // Frame type tags.
@@ -180,7 +216,12 @@ impl Frame {
                 out.push(*kind as u8);
                 put_bytes(out, meta);
             }
-            Frame::StreamData { id, offset, data, fin } => {
+            Frame::StreamData {
+                id,
+                offset,
+                data,
+                fin,
+            } => {
                 out.push(T_STREAM_DATA);
                 put_varint(out, *id);
                 put_varint(out, *offset);
@@ -213,7 +254,9 @@ impl Frame {
     fn decode(buf: &[u8], pos: &mut usize) -> Result<Frame, WireError> {
         let tag = get_u8(buf, pos)?;
         Ok(match tag {
-            T_ACK => Frame::Ack { seq: get_varint(buf, pos)? },
+            T_ACK => Frame::Ack {
+                seq: get_varint(buf, pos)?,
+            },
             T_INPUT => Frame::Input {
                 offset: get_varint(buf, pos)?,
                 data: get_bytes(buf, pos)?,
@@ -227,8 +270,12 @@ impl Frame {
                 cols: get_varint(buf, pos)? as u16,
                 rows: get_varint(buf, pos)? as u16,
             },
-            T_PING => Frame::Ping { stamp: get_varint(buf, pos)? },
-            T_PONG => Frame::Pong { stamp: get_varint(buf, pos)? },
+            T_PING => Frame::Ping {
+                stamp: get_varint(buf, pos)?,
+            },
+            T_PONG => Frame::Pong {
+                stamp: get_varint(buf, pos)?,
+            },
             T_STREAM_OPEN => Frame::StreamOpen {
                 id: get_varint(buf, pos)?,
                 kind: StreamKind::from_u8(get_u8(buf, pos)?)?,
@@ -239,7 +286,12 @@ impl Frame {
                 let offset = get_varint(buf, pos)?;
                 let fin = get_u8(buf, pos)? != 0;
                 let data = get_bytes(buf, pos)?;
-                Frame::StreamData { id, offset, data, fin }
+                Frame::StreamData {
+                    id,
+                    offset,
+                    data,
+                    fin,
+                }
             }
             T_STREAM_ACK => Frame::StreamAck {
                 id: get_varint(buf, pos)?,
@@ -250,8 +302,12 @@ impl Frame {
                 id: get_varint(buf, pos)?,
                 status: unzigzag(get_varint(buf, pos)?) as i32,
             },
-            T_STREAM_RESET => Frame::StreamReset { id: get_varint(buf, pos)? },
-            T_CONTROL => Frame::Control { data: get_bytes(buf, pos)? },
+            T_STREAM_RESET => Frame::StreamReset {
+                id: get_varint(buf, pos)?,
+            },
+            T_CONTROL => Frame::Control {
+                data: get_bytes(buf, pos)?,
+            },
             other => return Err(WireError::UnknownFrame(other)),
         })
     }
@@ -296,7 +352,17 @@ mod tests {
 
     #[test]
     fn varint_roundtrip() {
-        for v in [0u64, 1, 127, 128, 300, 16383, 16384, u32::MAX as u64, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16383,
+            16384,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             let mut out = Vec::new();
             put_varint(&mut out, v);
             let mut pos = 0;
@@ -323,28 +389,61 @@ mod tests {
     #[test]
     fn roundtrip_all_variants() {
         roundtrip(Frame::Ack { seq: 42 });
-        roundtrip(Frame::Input { offset: 1000, data: b"hello world".to_vec() });
-        roundtrip(Frame::StateDiff { seq: 9, base: 8, data: vec![0, 1, 2, 255] });
+        roundtrip(Frame::Input {
+            offset: 1000,
+            data: b"hello world".to_vec(),
+        });
+        roundtrip(Frame::StateDiff {
+            seq: 9,
+            base: 8,
+            data: vec![0, 1, 2, 255],
+        });
         roundtrip(Frame::Resize { cols: 80, rows: 24 });
         roundtrip(Frame::Ping { stamp: 123456789 });
         roundtrip(Frame::Pong { stamp: 987654321 });
-        roundtrip(Frame::StreamOpen { id: 3, kind: StreamKind::Forward, meta: b"127.0.0.1:22".to_vec() });
-        roundtrip(Frame::StreamData { id: 3, offset: 4096, data: vec![7; 100], fin: true });
-        roundtrip(Frame::StreamData { id: 3, offset: 0, data: vec![], fin: false });
-        roundtrip(Frame::StreamAck { id: 3, ack: 4096, window: 65535 });
+        roundtrip(Frame::StreamOpen {
+            id: 3,
+            kind: StreamKind::Forward,
+            meta: b"127.0.0.1:22".to_vec(),
+        });
+        roundtrip(Frame::StreamData {
+            id: 3,
+            offset: 4096,
+            data: vec![7; 100],
+            fin: true,
+        });
+        roundtrip(Frame::StreamData {
+            id: 3,
+            offset: 0,
+            data: vec![],
+            fin: false,
+        });
+        roundtrip(Frame::StreamAck {
+            id: 3,
+            ack: 4096,
+            window: 65535,
+        });
         roundtrip(Frame::StreamClose { id: 3, status: 0 });
         roundtrip(Frame::StreamClose { id: 3, status: -1 });
         roundtrip(Frame::StreamClose { id: 3, status: 137 });
         roundtrip(Frame::StreamReset { id: 3 });
-        roundtrip(Frame::Control { data: b"open-shell".to_vec() });
+        roundtrip(Frame::Control {
+            data: b"open-shell".to_vec(),
+        });
     }
 
     #[test]
     fn multiple_frames_in_one_payload() {
         let frames = vec![
             Frame::Ack { seq: 1 },
-            Frame::Input { offset: 0, data: b"ls\n".to_vec() },
-            Frame::Resize { cols: 120, rows: 40 },
+            Frame::Input {
+                offset: 0,
+                data: b"ls\n".to_vec(),
+            },
+            Frame::Resize {
+                cols: 120,
+                rows: 40,
+            },
         ];
         let bytes = encode_frames(&frames);
         assert_eq!(decode_frames(&bytes).unwrap(), frames);
@@ -372,7 +471,9 @@ mod tests {
         // Deterministic pseudo-random byte strings must never panic the decoder.
         let mut state = 0x12345678u64;
         for _ in 0..20000 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let len = (state >> 56) as usize % 64;
             let mut buf = Vec::with_capacity(len);
             let mut s = state;

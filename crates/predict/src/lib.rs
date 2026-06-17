@@ -94,7 +94,11 @@ impl Predictor {
                 0x20..=0x7e => {
                     // Printable ASCII: predict an echo at the cursor.
                     let (row, col) = self.cursor;
-                    self.preds.push(Prediction { row, col, ch: b as char });
+                    self.preds.push(Prediction {
+                        row,
+                        col,
+                        ch: b as char,
+                    });
                     self.advance_cursor();
                 }
                 b'\r' | b'\n' => {

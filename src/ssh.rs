@@ -9,8 +9,8 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Command;
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 use crate::RuntimeError;
 
@@ -85,20 +85,27 @@ pub fn bootstrap(
         .next()
         .ok_or(RuntimeError::SshBootstrap)?;
 
-    Ok(Bootstrap { server_addr, server_pubkey })
+    Ok(Bootstrap {
+        server_addr,
+        server_pubkey,
+    })
 }
 
 /// Detach from the controlling SSH session: fork, `setsid`, redirect stdio to
 /// `/dev/null`. The parent exits so `ssh` returns; the child keeps serving.
 /// Call AFTER the connect line has been printed and flushed.
 pub fn daemonize() -> Result<(), RuntimeError> {
-    use nix::unistd::{close, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid, ForkResult};
+    use nix::unistd::{ForkResult, close, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
     match unsafe { fork() }.map_err(errno)? {
         ForkResult::Parent { .. } => std::process::exit(0),
         ForkResult::Child => {
             setsid().map_err(errno)?;
             // Redirect stdio to /dev/null so the SSH pipe is fully released.
-            if let Ok(devnull) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null") {
+            if let Ok(devnull) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+            {
                 let _ = dup2_stdin(&devnull);
                 let _ = dup2_stdout(&devnull);
                 let _ = dup2_stderr(&devnull);
@@ -152,7 +159,9 @@ mod tests {
 
     #[test]
     fn finds_connect_line_among_others() {
-        let blob = "Warning: something\nNOISSH CONNECT 7000 ".to_string() + &STANDARD.encode([2u8; 32]) + "\nbye";
+        let blob = "Warning: something\nNOISSH CONNECT 7000 ".to_string()
+            + &STANDARD.encode([2u8; 32])
+            + "\nbye";
         let (port, pk) = blob.lines().find_map(parse_connect_line).unwrap();
         assert_eq!(port, 7000);
         assert_eq!(pk, vec![2u8; 32]);

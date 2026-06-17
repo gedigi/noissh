@@ -8,3 +8,6 @@ noise-core.workspace = true
 wire.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

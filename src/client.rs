@@ -7,9 +7,9 @@ use std::time::Duration;
 use auth::{KnownHosts, Tofu};
 use noise_core::Keypair;
 use predict::DisplayMode;
-use proto::{verify_server, ClientShell, ControlMsg, Handshaker};
+use proto::{ClientShell, ControlMsg, Handshaker, verify_server};
 use term::Grid;
-use transport::{random_session_id, Packet, Session};
+use transport::{Packet, Session, random_session_id};
 use wire::Frame;
 
 use crate::RuntimeError;
@@ -129,10 +129,16 @@ impl ClientCore {
             out.push(reply);
         }
         if outcome.finished {
-            let server_static = self.hs.as_ref().and_then(|h| h.remote_static()).ok_or(RuntimeError::Handshake)?;
+            let server_static = self
+                .hs
+                .as_ref()
+                .and_then(|h| h.remote_static())
+                .ok_or(RuntimeError::Handshake)?;
             // TOFU known-hosts decision.
             match verify_server(&mut self.known, &self.host_label, &server_static) {
-                Tofu::Mismatch => return Err(RuntimeError::HostKeyMismatch(self.host_label.clone())),
+                Tofu::Mismatch => {
+                    return Err(RuntimeError::HostKeyMismatch(self.host_label.clone()));
+                }
                 Tofu::New => self.known_hosts_dirty = true,
                 Tofu::Match => {}
             }
@@ -187,7 +193,12 @@ impl ClientCore {
         let mut frames = Vec::new();
         if self.open_shell_pending {
             frames.push(Frame::Control {
-                data: ControlMsg::OpenShell { cols: self.cols, rows: self.rows, term: self.term.clone() }.encode(),
+                data: ControlMsg::OpenShell {
+                    cols: self.cols,
+                    rows: self.rows,
+                    term: self.term.clone(),
+                }
+                .encode(),
             });
         }
         frames.append(&mut self.pending_control);
@@ -217,12 +228,28 @@ impl Client {
         cols: u16,
         prediction: DisplayMode,
     ) -> Result<Self, RuntimeError> {
-        let bind: SocketAddr = if server_addr.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
+        let bind: SocketAddr = if server_addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
         let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
-        let (core, first) = ClientCore::new(keypair, known, host_label, server_addr, rows, cols, prediction)?;
+        let (core, first) = ClientCore::new(
+            keypair,
+            known,
+            host_label,
+            server_addr,
+            rows,
+            cols,
+            prediction,
+        )?;
         socket.send_to(&first, server_addr)?;
-        let mut client = Client { core, socket, server_addr };
+        let mut client = Client {
+            core,
+            socket,
+            server_addr,
+        };
         // Drive the handshake to completion.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !client.core.is_established() {
@@ -245,7 +272,11 @@ impl Client {
     /// Rebind the local socket to a new ephemeral port — simulates the client
     /// moving networks. The server must follow via session-id roaming.
     pub fn rebind(&mut self) -> Result<(), RuntimeError> {
-        let bind: SocketAddr = if self.server_addr.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
+        let bind: SocketAddr = if self.server_addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
         let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
         self.socket = socket;
@@ -261,7 +292,9 @@ impl Client {
                     self.socket.send_to(&pkt, self.server_addr)?;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(e.into()),
         }
         for pkt in self.core.tick() {

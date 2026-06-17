@@ -7,6 +7,6 @@ pub mod cell;
 pub mod diff;
 pub mod grid;
 
-pub use cell::{flags, Cell, Color};
-pub use diff::{apply_diff, encode_diff, is_full, DiffError};
+pub use cell::{Cell, Color, flags};
+pub use diff::{DiffError, apply_diff, encode_diff, is_full};
 pub use grid::{Grid, Terminal};

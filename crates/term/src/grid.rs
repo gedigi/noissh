@@ -2,7 +2,7 @@
 
 use vte::{Params, Parser, Perform};
 
-use crate::cell::{flags, Cell, Color};
+use crate::cell::{Cell, Color, flags};
 
 /// The authoritative screen state: a grid of cells plus cursor and modes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +79,10 @@ impl Grid {
             return String::new();
         }
         let start = self.idx(row, 0);
-        let s: String = self.cells[start..start + self.cols].iter().map(|c| c.ch).collect();
+        let s: String = self.cells[start..start + self.cols]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
         s.trim_end().to_string()
     }
 
@@ -248,7 +251,10 @@ impl Grid {
     fn enter_alt_screen(&mut self) {
         if !self.alt_screen {
             self.alt_screen = true;
-            self.alt_saved = Some(std::mem::replace(&mut self.cells, vec![Cell::blank(); self.rows * self.cols]));
+            self.alt_saved = Some(std::mem::replace(
+                &mut self.cells,
+                vec![Cell::blank(); self.rows * self.cols],
+            ));
             self.move_to(0, 0);
         }
     }
@@ -301,24 +307,46 @@ impl Grid {
                         // colon form: 38:5:n or 38:2:r:g:b
                         let color = parse_ext_color(&g[1..]);
                         if let Some(c) = color {
-                            if is_fg { self.pen.fg = c } else { self.pen.bg = c }
+                            if is_fg {
+                                self.pen.fg = c
+                            } else {
+                                self.pen.bg = c
+                            }
                         }
                     } else {
                         let kind = groups.get(i + 1).and_then(|x| x.first().copied());
                         match kind {
                             Some(5) => {
-                                if let Some(n) = groups.get(i + 2).and_then(|x| x.first().copied()) {
+                                if let Some(n) = groups.get(i + 2).and_then(|x| x.first().copied())
+                                {
                                     let c = Color::Indexed(n as u8);
-                                    if is_fg { self.pen.fg = c } else { self.pen.bg = c }
+                                    if is_fg {
+                                        self.pen.fg = c
+                                    } else {
+                                        self.pen.bg = c
+                                    }
                                 }
                                 i += 2;
                             }
                             Some(2) => {
-                                let r = groups.get(i + 2).and_then(|x| x.first().copied()).unwrap_or(0) as u8;
-                                let gg = groups.get(i + 3).and_then(|x| x.first().copied()).unwrap_or(0) as u8;
-                                let b = groups.get(i + 4).and_then(|x| x.first().copied()).unwrap_or(0) as u8;
+                                let r = groups
+                                    .get(i + 2)
+                                    .and_then(|x| x.first().copied())
+                                    .unwrap_or(0) as u8;
+                                let gg = groups
+                                    .get(i + 3)
+                                    .and_then(|x| x.first().copied())
+                                    .unwrap_or(0) as u8;
+                                let b = groups
+                                    .get(i + 4)
+                                    .and_then(|x| x.first().copied())
+                                    .unwrap_or(0) as u8;
                                 let c = Color::Rgb(r, gg, b);
-                                if is_fg { self.pen.fg = c } else { self.pen.bg = c }
+                                if is_fg {
+                                    self.pen.fg = c
+                                } else {
+                                    self.pen.bg = c
+                                }
                                 i += 4;
                             }
                             _ => {}
@@ -368,7 +396,11 @@ fn parse_ext_color(sub: &[u16]) -> Option<Color> {
         Some(2) => {
             // Could be 2:r:g:b or 2:colorspace:r:g:b. Take the last three.
             if sub.len() >= 4 {
-                Some(Color::Rgb(sub[sub.len() - 3] as u8, sub[sub.len() - 2] as u8, sub[sub.len() - 1] as u8))
+                Some(Color::Rgb(
+                    sub[sub.len() - 3] as u8,
+                    sub[sub.len() - 2] as u8,
+                    sub[sub.len() - 1] as u8,
+                ))
             } else {
                 None
             }
@@ -387,7 +419,11 @@ fn arg(params: &Params, idx: usize, default: u16) -> u16 {
 
 /// Extract CSI param at `idx` allowing zero (for ED/EL/SGR-like modes).
 fn arg_raw(params: &Params, idx: usize, default: u16) -> u16 {
-    params.iter().nth(idx).and_then(|s| s.first().copied()).unwrap_or(default)
+    params
+        .iter()
+        .nth(idx)
+        .and_then(|s| s.first().copied())
+        .unwrap_or(default)
 }
 
 impl Perform for Grid {
@@ -528,7 +564,10 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Self {
-        Terminal { parser: Parser::new(), grid: Grid::new(rows, cols) }
+        Terminal {
+            parser: Parser::new(),
+            grid: Grid::new(rows, cols),
+        }
     }
 
     /// Feed output bytes from the shell/pty into the emulator.

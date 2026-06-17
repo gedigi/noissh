@@ -37,7 +37,12 @@ pub struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { ch: ' ', fg: Color::Default, bg: Color::Default, flags: 0 }
+        Cell {
+            ch: ' ',
+            fg: Color::Default,
+            bg: Color::Default,
+            flags: 0,
+        }
     }
 }
 

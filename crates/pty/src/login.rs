@@ -1,6 +1,6 @@
 //! Login backends behind a common trait.
 
-use crate::{spawn_with, PtyError, PtyHandle, SpawnRequest};
+use crate::{PtyError, PtyHandle, SpawnRequest, spawn_with};
 
 /// Allocates a PTY and execs a login session for a [`SpawnRequest`].
 pub trait LoginSession {
@@ -31,7 +31,9 @@ pub struct PrivsepLogin {
 #[cfg(target_os = "linux")]
 impl PrivsepLogin {
     pub fn new(service: impl Into<String>) -> Self {
-        PrivsepLogin { service: service.into() }
+        PrivsepLogin {
+            service: service.into(),
+        }
     }
 }
 

@@ -16,3 +16,6 @@ pam = ["dep:pam-client"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pam-client = { version = "0.5", optional = true }
+
+[lints]
+workspace = true

@@ -1,3 +1,7 @@
 /target
-Cargo.lock
 **/*.rs.bk
+
+# On-demand vendored sources for offline builds (see README); not committed
+# because the full cross-platform tree is ~240MB. Recreate with `cargo vendor`.
+/vendor
+/.cargo/config.toml

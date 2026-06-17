@@ -43,13 +43,8 @@ fn ssh_bootstrap_then_session() {
     let client_kp = generate_keypair().unwrap();
 
     // Bootstrap: the fake ssh launches noisshd --one-shot locally.
-    let boot = ssh::bootstrap(
-        "127.0.0.1",
-        &[noisshd.to_string()],
-        &client_kp.public,
-        &[],
-    )
-    .expect("bootstrap");
+    let boot = ssh::bootstrap("127.0.0.1", &[noisshd.to_string()], &client_kp.public, &[])
+        .expect("bootstrap");
 
     // Pin the server key (delivered over the trusted SSH channel).
     let mut known = KnownHosts::new();
@@ -76,7 +71,10 @@ fn ssh_bootstrap_then_session() {
         if client.core().screen().row_text(0).contains("SSH-BOOT-OK") {
             break;
         }
-        assert!(Instant::now() < deadline, "bootstrap session produced no output");
+        assert!(
+            Instant::now() < deadline,
+            "bootstrap session produced no output"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(client.core().screen().row_text(0), "SSH-BOOT-OK");

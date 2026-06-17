@@ -11,3 +11,6 @@ term.workspace = true
 predict.workspace = true
 auth.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

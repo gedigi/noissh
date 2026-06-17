@@ -8,7 +8,7 @@ use std::time::Duration;
 use auth::AuthorizedKeys;
 use nix::errno::Errno;
 use noise_core::Keypair;
-use proto::{authorize_client, ControlMsg, Handshaker, ServerShell};
+use proto::{ControlMsg, Handshaker, ServerShell, authorize_client};
 use pty::{LocalLogin, LoginSession, PtyError, PtyHandle, SpawnRequest};
 use transport::{Packet, Session, SessionId};
 use wire::Frame;
@@ -92,10 +92,8 @@ impl ServerCore {
 
     /// Handle one inbound datagram from `src`; returns datagrams to send.
     pub fn handle_packet(&mut self, src: SocketAddr, buf: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
-        match self.try_handle_packet(src, buf) {
-            Ok(out) => out,
-            Err(_) => Vec::new(), // malformed/unauthorized: drop silently
-        }
+        // Malformed/unauthorized packets are silently dropped.
+        self.try_handle_packet(src, buf).unwrap_or_default()
     }
 
     fn try_handle_packet(
@@ -137,7 +135,14 @@ impl ServerCore {
             let session = hs.into_session(Some(src))?;
             self.sessions.insert(
                 sid,
-                ServerSession { session, shell: None, pty: None, rows: 24, cols: 80, exit_sent: false },
+                ServerSession {
+                    session,
+                    shell: None,
+                    pty: None,
+                    rows: 24,
+                    cols: 80,
+                    exit_sent: false,
+                },
             );
             self.ever_active = true;
         } else {
@@ -202,7 +207,9 @@ impl ServerCore {
     fn handle_control(&mut self, sid: SessionId, msg: ControlMsg) {
         match msg {
             ControlMsg::OpenShell { cols, rows, term } => {
-                let Some(sess) = self.sessions.get_mut(&sid) else { return };
+                let Some(sess) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
                 if sess.pty.is_some() {
                     return; // already open
                 }
@@ -223,7 +230,9 @@ impl ServerCore {
                 }
             }
             ControlMsg::Resize { cols, rows } => {
-                let Some(sess) = self.sessions.get_mut(&sid) else { return };
+                let Some(sess) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
                 sess.rows = rows;
                 sess.cols = cols;
                 if let Some(pty) = &sess.pty {
@@ -243,7 +252,9 @@ impl ServerCore {
         let mut finished: Vec<SessionId> = Vec::new();
         let sids: Vec<SessionId> = self.sessions.keys().copied().collect();
         for sid in sids {
-            let Some(sess) = self.sessions.get_mut(&sid) else { continue };
+            let Some(sess) = self.sessions.get_mut(&sid) else {
+                continue;
+            };
             // Drain available PTY output.
             if let Some(pty) = &sess.pty {
                 let mut buf = [0u8; 8192];
@@ -325,7 +336,9 @@ impl Server {
                     let _ = self.socket.send_to(&pkt, addr);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return false,
         }
         for (addr, pkt) in self.core.tick() {

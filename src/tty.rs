@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 
 use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
-use term::cell::{flags, Color};
 use term::Grid;
+use term::cell::{Color, flags};
 
 use crate::RuntimeError;
 
@@ -84,14 +84,9 @@ fn sgr_for(out: &mut String, cell_flags: u8, fg: Color, bg: Color) {
 }
 
 /// Incremental renderer: repaints only rows that changed since the last frame.
+#[derive(Default)]
 pub struct Renderer {
     last: Option<Grid>,
-}
-
-impl Default for Renderer {
-    fn default() -> Self {
-        Renderer { last: None }
-    }
 }
 
 impl Renderer {
@@ -133,7 +128,11 @@ impl Renderer {
             buf.push_str("\x1b[0m");
         }
         // Position the real cursor and restore visibility.
-        buf.push_str(&format!("\x1b[{};{}H", grid.cursor_row + 1, grid.cursor_col + 1));
+        buf.push_str(&format!(
+            "\x1b[{};{}H",
+            grid.cursor_row + 1,
+            grid.cursor_col + 1
+        ));
         if grid.cursor_visible {
             buf.push_str("\x1b[?25h");
         }

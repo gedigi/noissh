@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use noise_core::{Handshake, NoiseError, Role};
 use thiserror::Error;
-use transport::{build_handshake_packet, Session, SessionId};
+use transport::{Session, SessionId, build_handshake_packet};
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -37,17 +37,31 @@ pub struct HsOutcome {
 
 impl Handshaker {
     /// Begin as the client. Returns the driver and the first packet to send.
-    pub fn client(local_private: &[u8], session_id: SessionId) -> Result<(Self, Vec<u8>), HandshakeError> {
+    pub fn client(
+        local_private: &[u8],
+        session_id: SessionId,
+    ) -> Result<(Self, Vec<u8>), HandshakeError> {
         let mut hs = Handshake::new(Role::Initiator, local_private)?;
         let msg1 = hs.write_message(&[])?;
         let pkt = build_handshake_packet(&session_id, &msg1);
-        Ok((Handshaker { hs: Some(hs), session_id, finished: false }, pkt))
+        Ok((
+            Handshaker {
+                hs: Some(hs),
+                session_id,
+                finished: false,
+            },
+            pkt,
+        ))
     }
 
     /// Begin as the server, awaiting the client's first message.
     pub fn server(local_private: &[u8], session_id: SessionId) -> Result<Self, HandshakeError> {
         let hs = Handshake::new(Role::Responder, local_private)?;
-        Ok(Handshaker { hs: Some(hs), session_id, finished: false })
+        Ok(Handshaker {
+            hs: Some(hs),
+            session_id,
+            finished: false,
+        })
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -66,13 +80,19 @@ impl Handshaker {
         if hs.is_finished() {
             // Responder completes upon reading the final message.
             self.finished = true;
-            return Ok(HsOutcome { reply: None, finished: true });
+            return Ok(HsOutcome {
+                reply: None,
+                finished: true,
+            });
         }
         // Otherwise we owe the peer the next message.
         let out = hs.write_message(&[])?;
         self.finished = hs.is_finished();
         let pkt = build_handshake_packet(&self.session_id, &out);
-        Ok(HsOutcome { reply: Some(pkt), finished: self.finished })
+        Ok(HsOutcome {
+            reply: Some(pkt),
+            finished: self.finished,
+        })
     }
 
     /// The peer's authenticated static public key (once available).
@@ -92,7 +112,7 @@ impl Handshaker {
 mod tests {
     use super::*;
     use noise_core::generate_keypair;
-    use transport::{parse_packet, random_session_id, Packet};
+    use transport::{Packet, parse_packet, random_session_id};
 
     fn body(pkt: &[u8]) -> Vec<u8> {
         match parse_packet(pkt).unwrap() {

@@ -19,10 +19,21 @@ pub const DEFAULT_WINDOW: u32 = 256 * 1024;
 /// Events surfaced to the application as frames are processed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
-    Opened { id: u64, kind: StreamKind, meta: Vec<u8> },
-    Readable { id: u64 },
-    Closed { id: u64, status: i32 },
-    Reset { id: u64 },
+    Opened {
+        id: u64,
+        kind: StreamKind,
+        meta: Vec<u8>,
+    },
+    Readable {
+        id: u64,
+    },
+    Closed {
+        id: u64,
+        status: i32,
+    },
+    Reset {
+        id: u64,
+    },
 }
 
 /// Reassembles out-of-order segments into a contiguous in-order byte stream.
@@ -216,7 +227,10 @@ impl StreamState {
             window: self.recv_window,
         });
         if let Some(status) = self.close_status {
-            out.push(Frame::StreamClose { id: self.id, status });
+            out.push(Frame::StreamClose {
+                id: self.id,
+                status,
+            });
         }
     }
 }
@@ -248,7 +262,8 @@ impl StreamMux {
     pub fn open(&mut self, kind: StreamKind, meta: Vec<u8>) -> Stream {
         let id = self.next_local_id;
         self.next_local_id += self.id_step;
-        self.streams.insert(id, StreamState::new(id, kind, meta, true));
+        self.streams
+            .insert(id, StreamState::new(id, kind, meta, true));
         id
     }
 
@@ -307,7 +322,12 @@ impl StreamMux {
                     self.events.push(StreamEvent::Opened { id, kind, meta });
                 }
             }
-            Frame::StreamData { id, offset, data, fin } => {
+            Frame::StreamData {
+                id,
+                offset,
+                data,
+                fin,
+            } => {
                 if let Some(s) = self.streams.get_mut(&id) {
                     let had = s.recv.ack_point();
                     if fin {
@@ -363,7 +383,10 @@ impl StreamMux {
 
     /// Bytes written but not yet acked by the peer (send-side backlog).
     pub fn in_flight(&self, id: Stream) -> u64 {
-        self.streams.get(&id).map(|s| s.send_buf.len() as u64).unwrap_or(0)
+        self.streams
+            .get(&id)
+            .map(|s| s.send_buf.len() as u64)
+            .unwrap_or(0)
     }
 
     /// Bytes received contiguously but not yet read by the app (recv buffer).
@@ -378,7 +401,12 @@ mod tests {
     use super::*;
 
     /// Pump frames between two muxes with optional loss/reorder for N rounds.
-    fn pump(a: &mut StreamMux, b: &mut StreamMux, rounds: usize, mut lossy: impl FnMut(usize) -> bool) {
+    fn pump(
+        a: &mut StreamMux,
+        b: &mut StreamMux,
+        rounds: usize,
+        mut lossy: impl FnMut(usize) -> bool,
+    ) {
         let mut step = 0;
         for _ in 0..rounds {
             let af = a.poll_transmit();
@@ -418,7 +446,13 @@ mod tests {
         client.write(id, b"hello server");
         pump(&mut client, &mut server, 4, |_| false);
         let evs = server.take_events();
-        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Opened { kind: StreamKind::Session, .. })));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            StreamEvent::Opened {
+                kind: StreamKind::Session,
+                ..
+            }
+        )));
         assert_eq!(drain(&mut server, id), b"hello server");
     }
 
@@ -472,7 +506,10 @@ mod tests {
         pump(&mut client, &mut server, 6, |_| false);
         assert_eq!(drain(&mut server, id), b"bye");
         let evs = server.take_events();
-        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Closed { status: 42, .. })));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, StreamEvent::Closed { status: 42, .. }))
+        );
         assert!(server.is_recv_finished(id));
     }
 

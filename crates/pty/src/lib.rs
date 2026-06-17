@@ -13,9 +13,9 @@
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use nix::pty::{openpty, Winsize};
-use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::pty::{Winsize, openpty};
+use nix::sys::signal::{Signal, kill};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid};
 use thiserror::Error;
 
@@ -65,7 +65,12 @@ impl Default for SpawnRequest {
 }
 
 fn winsize(rows: u16, cols: u16) -> Winsize {
-    Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 }
+    Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
 }
 
 /// A running PTY-backed child process.
@@ -83,7 +88,7 @@ impl PtyHandle {
 
     /// Make the master end non-blocking (for event-loop integration).
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), PtyError> {
-        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
         let fd = self.master.as_raw_fd();
         let mut flags = OFlag::from_bits_truncate(fcntl(self.master_borrow(), FcntlArg::F_GETFL)?);
         flags.set(OFlag::O_NONBLOCK, nonblocking);
@@ -191,7 +196,8 @@ pub(crate) fn spawn_with(
     };
 
     // Build the program, argv, and env *before* fork (no allocation in child).
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| target.shell.to_string_lossy().into_owned());
+    let shell =
+        std::env::var("SHELL").unwrap_or_else(|_| target.shell.to_string_lossy().into_owned());
     let (program, argv) = match &req.command {
         Some(cmd) if !cmd.is_empty() => {
             let prog = resolve_program(&cmd[0])?;
@@ -209,7 +215,10 @@ pub(crate) fn spawn_with(
 
     let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
     env_map.insert("TERM".to_string(), req.term.clone());
-    env_map.insert("HOME".to_string(), target.dir.to_string_lossy().into_owned());
+    env_map.insert(
+        "HOME".to_string(),
+        target.dir.to_string_lossy().into_owned(),
+    );
     env_map.insert("USER".to_string(), target.name.clone());
     env_map.insert("SHELL".to_string(), shell.clone());
     for (k, v) in &req.env {
@@ -257,7 +266,11 @@ pub(crate) fn spawn_with(
         }
         ForkResult::Parent { child } => {
             drop(slave); // parent doesn't need the slave end
-            Ok(PtyHandle { master, pid: child, status: None })
+            Ok(PtyHandle {
+                master,
+                pid: child,
+                status: None,
+            })
         }
     }
 }
@@ -287,7 +300,7 @@ fn resolve_program(prog: &str) -> Result<CString, PtyError> {
 /// Only meaningful when running as root. Linux-only (uses `initgroups`).
 #[cfg(target_os = "linux")]
 pub(crate) fn drop_privileges(name: &str) -> Result<(), nix::errno::Errno> {
-    use nix::unistd::{initgroups, setgid, setuid, User};
+    use nix::unistd::{User, initgroups, setgid, setuid};
     let user = match User::from_name(name) {
         Ok(Some(u)) => u,
         _ => return Err(nix::errno::Errno::ENOENT),

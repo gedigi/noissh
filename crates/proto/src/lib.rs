@@ -60,13 +60,22 @@ mod tests {
 
         assert!(server.is_finished());
         // The server authorizes the authenticated client key BEFORE any session.
-        assert!(authorize_client(&authorized, &server.remote_static().unwrap()));
+        assert!(authorize_client(
+            &authorized,
+            &server.remote_static().unwrap()
+        ));
 
         // The client pins the server on first contact (TOFU New).
         let mut known = KnownHosts::new();
-        assert_eq!(verify_server(&mut known, "host:9999", &client.remote_static().unwrap()), Tofu::New);
+        assert_eq!(
+            verify_server(&mut known, "host:9999", &client.remote_static().unwrap()),
+            Tofu::New
+        );
         // Reconnect: same key -> Match.
-        assert_eq!(verify_server(&mut known, "host:9999", &client.remote_static().unwrap()), Tofu::Match);
+        assert_eq!(
+            verify_server(&mut known, "host:9999", &client.remote_static().unwrap()),
+            Tofu::Match
+        );
     }
 
     #[test]
@@ -84,7 +93,10 @@ mod tests {
         let p3 = client.read(body(&p2)).unwrap().reply.unwrap();
         server.read(body(&p3)).unwrap();
 
-        assert!(!authorize_client(&authorized, &server.remote_static().unwrap()));
+        assert!(!authorize_client(
+            &authorized,
+            &server.remote_static().unwrap()
+        ));
     }
 
     #[test]

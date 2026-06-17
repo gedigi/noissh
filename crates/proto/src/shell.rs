@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use predict::{DisplayMode, Predictor};
-use term::{apply_diff, encode_diff, is_full, Grid, Terminal};
+use term::{Grid, Terminal, apply_diff, encode_diff, is_full};
 use transport::{InputReceiver, InputSender};
 use wire::Frame;
 
@@ -66,7 +66,12 @@ impl ServerShell {
     /// to the pty) and the input-ack frame to send back.
     pub fn ingest_input(&mut self, offset: u64, data: &[u8]) -> (Vec<u8>, Frame) {
         let fresh = self.input_rx.ingest(offset, data);
-        (fresh, Frame::Ack { seq: self.input_rx.ack() })
+        (
+            fresh,
+            Frame::Ack {
+                seq: self.input_rx.ack(),
+            },
+        )
     }
 
     /// Produce a state-diff frame if the client is behind. Idempotent retransmit
@@ -83,7 +88,11 @@ impl ServerShell {
         }
         let acked_grid = self.history.get(&self.acked_seq);
         let data = encode_diff(acked_grid, &self.last_sent);
-        Some(Frame::StateDiff { seq: self.seq, base: self.acked_seq, data })
+        Some(Frame::StateDiff {
+            seq: self.seq,
+            base: self.acked_seq,
+            data,
+        })
     }
 }
 
@@ -123,7 +132,9 @@ impl ClientShell {
         if let Some(input) = self.input_tx.pending() {
             frames.push(input);
         }
-        frames.push(Frame::Ack { seq: self.current_seq });
+        frames.push(Frame::Ack {
+            seq: self.current_seq,
+        });
         frames
     }
 

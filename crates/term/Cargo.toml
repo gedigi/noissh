@@ -7,3 +7,6 @@ edition.workspace = true
 vte.workspace = true
 wire.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@
 //! interactive data plane (state-sync + input).
 
 use thiserror::Error;
-use wire::{get_varint, put_varint, WireError};
+use wire::{WireError, get_varint, put_varint};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ControlError {
@@ -50,7 +50,9 @@ fn get_str(buf: &[u8], pos: &mut usize) -> Result<String, ControlError> {
     if end > buf.len() {
         return Err(ControlError::Eof);
     }
-    let s = std::str::from_utf8(&buf[*pos..end]).map_err(|_| ControlError::BadUtf8)?.to_string();
+    let s = std::str::from_utf8(&buf[*pos..end])
+        .map_err(|_| ControlError::BadUtf8)?
+        .to_string();
     *pos = end;
     Ok(s)
 }
@@ -109,14 +111,18 @@ impl ControlMsg {
                 let rows = get_varint(buf, &mut pos)? as u16;
                 ControlMsg::Resize { cols, rows }
             }
-            M_EXIT => ControlMsg::Exit { status: unzigzag(get_varint(buf, &mut pos)?) as i32 },
+            M_EXIT => ControlMsg::Exit {
+                status: unzigzag(get_varint(buf, &mut pos)?) as i32,
+            },
             M_AUTH_PROMPT => {
                 let echo = *buf.get(pos).ok_or(ControlError::Eof)? != 0;
                 pos += 1;
                 let prompt = get_str(buf, &mut pos)?;
                 ControlMsg::AuthPrompt { echo, prompt }
             }
-            M_AUTH_RESPONSE => ControlMsg::AuthResponse { data: get_str(buf, &mut pos)? },
+            M_AUTH_RESPONSE => ControlMsg::AuthResponse {
+                data: get_str(buf, &mut pos)?,
+            },
             other => return Err(ControlError::Unknown(other)),
         })
     }
@@ -132,18 +138,33 @@ mod tests {
 
     #[test]
     fn all_messages_roundtrip() {
-        roundtrip(ControlMsg::OpenShell { cols: 80, rows: 24, term: "xterm-256color".into() });
-        roundtrip(ControlMsg::Resize { cols: 120, rows: 40 });
+        roundtrip(ControlMsg::OpenShell {
+            cols: 80,
+            rows: 24,
+            term: "xterm-256color".into(),
+        });
+        roundtrip(ControlMsg::Resize {
+            cols: 120,
+            rows: 40,
+        });
         roundtrip(ControlMsg::Exit { status: 0 });
         roundtrip(ControlMsg::Exit { status: 137 });
         roundtrip(ControlMsg::Exit { status: -1 });
-        roundtrip(ControlMsg::AuthPrompt { echo: false, prompt: "Password: ".into() });
-        roundtrip(ControlMsg::AuthResponse { data: "secret".into() });
+        roundtrip(ControlMsg::AuthPrompt {
+            echo: false,
+            prompt: "Password: ".into(),
+        });
+        roundtrip(ControlMsg::AuthResponse {
+            data: "secret".into(),
+        });
     }
 
     #[test]
     fn unknown_tag_errors() {
-        assert_eq!(ControlMsg::decode(&[0xff]), Err(ControlError::Unknown(0xff)));
+        assert_eq!(
+            ControlMsg::decode(&[0xff]),
+            Err(ControlError::Unknown(0xff))
+        );
     }
 
     #[test]

@@ -67,3 +67,6 @@ nix = { workspace = true }
 libc = "0.2"
 base64 = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -4,18 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use auth::{AuthorizedKeys, KnownHosts};
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use noise_core::{generate_keypair, Keypair};
+use base64::engine::general_purpose::STANDARD;
+use noise_core::{Keypair, generate_keypair};
 
 use crate::RuntimeError;
 
 /// The noissh config directory (`$XDG_CONFIG_HOME/noissh` or `~/.config/noissh`).
 pub fn config_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Path::new(&xdg).join("noissh");
-        }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Path::new(&xdg).join("noissh");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     Path::new(&home).join(".config").join("noissh")

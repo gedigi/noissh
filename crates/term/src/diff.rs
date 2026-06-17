@@ -6,7 +6,7 @@
 //! them to its render grid. Property: `apply(diff(a, b))` renders as `b`.
 
 use thiserror::Error;
-use wire::{get_varint, put_varint, WireError};
+use wire::{WireError, get_varint, put_varint};
 
 use crate::cell::{Cell, Color};
 use crate::grid::Grid;
@@ -86,7 +86,9 @@ fn put_header(out: &mut Vec<u8>, g: &Grid) {
 /// Encode a diff from `base` (if any) to `target`.
 pub fn encode_diff(base: Option<&Grid>, target: &Grid) -> Vec<u8> {
     let mut out = Vec::new();
-    let same_dims = base.map(|b| b.rows == target.rows && b.cols == target.cols).unwrap_or(false);
+    let same_dims = base
+        .map(|b| b.rows == target.rows && b.cols == target.cols)
+        .unwrap_or(false);
     if !same_dims {
         out.push(TAG_FULL);
         put_header(&mut out, target);
@@ -180,7 +182,12 @@ mod tests {
         let target = grid_from(10, 40, b"line one\r\nline two!!!");
         let delta = encode_diff(Some(&base), &target);
         let full = encode_diff(None, &target);
-        assert!(delta.len() < full.len(), "delta {} !< full {}", delta.len(), full.len());
+        assert!(
+            delta.len() < full.len(),
+            "delta {} !< full {}",
+            delta.len(),
+            full.len()
+        );
         let mut client = base.clone();
         apply_diff(&mut client, &delta).unwrap();
         assert!(client.render_eq(&target));
@@ -211,7 +218,9 @@ mod tests {
         // Pseudo-random sessions; apply(diff(a,b)) must render as b.
         let mut state = 0x1234_5678_9abc_def0u64;
         let mut rng = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state >> 33
         };
         for _ in 0..300 {
