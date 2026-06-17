@@ -47,7 +47,7 @@ pub enum TransportError {
 /// Generate a random session id.
 pub fn random_session_id() -> SessionId {
     let mut id = [0u8; 8];
-    getrandom::getrandom(&mut id).expect("getrandom");
+    getrandom::fill(&mut id).expect("getrandom");
     id
 }
 

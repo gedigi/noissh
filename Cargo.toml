@@ -22,7 +22,7 @@ snow = "0.10"
 vte = "0.15"
 nix = { version = "0.31", features = ["term", "fs", "process", "signal", "user", "socket", "ioctl"] }
 base64 = "0.22"
-getrandom = "0.2"
+getrandom = "0.4"
 thiserror = "2"
 
 noise-core = { path = "crates/noise-core" }

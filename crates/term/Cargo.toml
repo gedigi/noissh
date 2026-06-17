@@ -5,4 +5,5 @@ edition.workspace = true
 
 [dependencies]
 vte.workspace = true
+wire.workspace = true
 thiserror.workspace = true
