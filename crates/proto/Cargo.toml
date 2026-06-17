@@ -1,0 +1,13 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+noise-core.workspace = true
+wire.workspace = true
+transport.workspace = true
+term.workspace = true
+predict.workspace = true
+auth.workspace = true
+thiserror.workspace = true

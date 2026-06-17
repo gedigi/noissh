@@ -1,0 +1,9 @@
+[package]
+name = "noise-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snow.workspace = true
+base64.workspace = true
+thiserror.workspace = true

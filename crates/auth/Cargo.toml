@@ -1,0 +1,8 @@
+[package]
+name = "auth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+thiserror.workspace = true

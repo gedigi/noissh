@@ -1,0 +1,8 @@
+[package]
+name = "term"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vte.workspace = true
+thiserror.workspace = true

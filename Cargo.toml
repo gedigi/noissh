@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/noise-core",
+    "crates/wire",
+    "crates/transport",
+    "crates/term",
+    "crates/predict",
+    "crates/auth",
+    "crates/pty",
+    "crates/proto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Gerardo <gedigi@live.com>"]
+
+[workspace.dependencies]
+snow = "0.10"
+vte = "0.15"
+nix = { version = "0.31", features = ["term", "fs", "process", "signal", "user", "socket", "ioctl"] }
+base64 = "0.22"
+getrandom = "0.2"
+thiserror = "2"
+
+noise-core = { path = "crates/noise-core" }
+wire = { path = "crates/wire" }
+transport = { path = "crates/transport" }
+term = { path = "crates/term" }
+predict = { path = "crates/predict" }
+auth = { path = "crates/auth" }
+pty = { path = "crates/pty" }
+proto = { path = "crates/proto" }
+
+[package]
+name = "noissh"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "noissh"
+path = "src/bin/noissh.rs"
+
+[[bin]]
+name = "noisshd"
+path = "src/bin/noisshd.rs"
+
+[dependencies]
+noise-core = { workspace = true }
+wire = { workspace = true }
+transport = { workspace = true }
+term = { workspace = true }
+predict = { workspace = true }
+auth = { workspace = true }
+pty = { workspace = true }
+proto = { workspace = true }
+nix = { workspace = true }
+base64 = { workspace = true }

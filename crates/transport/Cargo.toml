@@ -1,0 +1,10 @@
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+noise-core.workspace = true
+wire.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
