@@ -8,5 +8,5 @@ pub mod diff;
 pub mod grid;
 
 pub use cell::{flags, Cell, Color};
-pub use diff::{apply_diff, encode_diff, DiffError};
+pub use diff::{apply_diff, encode_diff, is_full, DiffError};
 pub use grid::{Grid, Terminal};

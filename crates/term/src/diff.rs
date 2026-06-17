@@ -109,6 +109,11 @@ pub fn encode_diff(base: Option<&Grid>, target: &Grid) -> Vec<u8> {
     out
 }
 
+/// Whether an encoded diff is a full snapshot (applicable regardless of base).
+pub fn is_full(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&TAG_FULL)
+}
+
 /// Apply an encoded diff to `grid`, mutating it to the target state.
 pub fn apply_diff(grid: &mut Grid, bytes: &[u8]) -> Result<(), DiffError> {
     let mut pos = 0usize;
