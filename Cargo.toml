@@ -42,6 +42,9 @@ edition = "2024"
 [workspace.lints.clippy]
 all = "warn"
 
+[lib]
+name = "noissh"
+path = "src/lib.rs"
 
 [[bin]]
 name = "noissh"
@@ -61,4 +64,6 @@ auth = { workspace = true }
 pty = { workspace = true }
 proto = { workspace = true }
 nix = { workspace = true }
+libc = "0.2"
 base64 = { workspace = true }
+thiserror = { workspace = true }
