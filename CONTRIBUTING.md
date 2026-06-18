@@ -40,9 +40,8 @@ cargo test --workspace                            # all tests green
 
 ## Repository layout
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate map and
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire format. The design rationale
-is in [`docs/specs/2026-06-18-noissh-design.md`](docs/specs/2026-06-18-noissh-design.md).
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate map and design
+rationale, and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire format.
 
 ## Safety
 
