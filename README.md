@@ -1,5 +1,9 @@
 # noissh
 
+[![CI](https://github.com/gedigi/noissh/actions/workflows/ci.yml/badge.svg)](https://github.com/gedigi/noissh/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/gedigi/noissh?sort=semver)](https://github.com/gedigi/noissh/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A remote shell that doesn't drop when your network does.**
 
 Close your laptop, hop from Wi-Fi to cellular, change networks, walk through a
@@ -33,12 +37,14 @@ laptop going to sleep.
 
 ## Install
 
-One line — grabs a prebuilt binary for your platform, or builds from source if
-needed (it'll offer to install Rust for you):
+One line — downloads a prebuilt binary for your platform (Linux and macOS,
+`x86_64` and `arm64`), or builds from source if one isn't available:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/gedigi/noissh/main/install.sh | sh
 ```
+
+Prebuilt binaries are on the [releases page](https://github.com/gedigi/noissh/releases/latest).
 
 Prefer something else?
 
