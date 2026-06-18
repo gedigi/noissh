@@ -899,13 +899,13 @@ impl Server {
 
         // Pump agent-forwarding connections (same model as port forwards).
         // Drop any whose session has gone away so their Unix fds don't leak.
-        let live_agents: Vec<(SessionId, u64)> = self
+        let dead_agents: Vec<(SessionId, u64)> = self
             .agent_conns
             .keys()
             .copied()
             .filter(|(sid, _)| !self.core.has_session(*sid))
             .collect();
-        for k in live_agents {
+        for k in dead_agents {
             self.agent_conns.remove(&k);
         }
         let akeys: Vec<(SessionId, u64)> = self.agent_conns.keys().copied().collect();
