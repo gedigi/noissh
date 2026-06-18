@@ -5,3 +5,7 @@
 # because the full cross-platform tree is ~240MB. Recreate with `cargo vendor`.
 /vendor
 /.cargo/config.toml
+
+# Claude/superpowers working notes (not part of the project)
+/docs/superpowers
+/.claude-local
