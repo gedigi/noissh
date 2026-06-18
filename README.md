@@ -1,145 +1,113 @@
 # noissh
 
-A remote-shell utility that aims to be **as resilient as mosh** (instant feel on
-lossy/high-latency links; survives IP changes, NAT rebinding, and laptop sleep
-with no reconnect) and **as rich as SSH**, built entirely on the
-[Noise Protocol Framework](https://noiseprotocol.org/) for its cryptography —
-"Noise all the way down".
+**A remote shell that doesn't drop when your network does.**
 
-## Documentation
+Close your laptop, hop from Wi-Fi to cellular, change networks, walk through a
+dead spot — your session is still right there when you come back. No reconnect,
+no lost work. noissh gives you that mosh-like resilience with the everyday feel
+of SSH, secured end-to-end by the modern [Noise Protocol](https://noiseprotocol.org/).
 
-| Document | What it covers |
-|---|---|
-| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Install, connect, configure, troubleshoot |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate map, data flow, design rationale (diagrams) |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Wire format, handshake, frames, state-sync, streams |
-| [docs/SECURITY.md](docs/SECURITY.md) | Trust & threat model |
-| [docs/specs/2026-06-18-noissh-design.md](docs/specs/2026-06-18-noissh-design.md) | Original design spec |
-| [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) | Dev workflow · history |
-| man pages | [docs/man/noissh.1](docs/man/noissh.1) · [docs/man/noisshd.1](docs/man/noisshd.1) |
+```sh
+# If you can already SSH to a box, you can noissh to it:
+noissh --ssh you@server
+```
 
-## Status
+That's it. You get a normal shell — except it shrugs off flaky links and survives
+your laptop going to sleep.
 
-v1 (resilient interactive shell) is implemented and tested end-to-end, and the
-v2 reliable-stream multiplexer that SSH-richness builds on is implemented and
-tested. 121 tests pass; `cargo clippy --workspace --all-targets -- -D warnings`
-is clean.
+## Why you'll like it
 
-## Architecture
-
-A Cargo workspace of focused, independently-testable crates plus two binaries:
-
-| Crate | Responsibility |
-|---|---|
-| `wire` | Wire frame codec (datagram **and** stream frame classes from day one) + varint |
-| `noise-core` | `snow` wrapper: `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake + stateless transport AEAD |
-| `transport` | Session id, roaming, anti-replay window, reliable input channel, v2 stream multiplexer |
-| `term` | Clean-room authoritative terminal emulator (`vte`-based) + latest-wins screen diff |
-| `predict` | Client-side predictive-echo engine (guess → paint → reconcile) |
-| `auth` | `known_hosts` TOFU + `authorized_keys`, X25519 key text format |
-| `pty` | PTY allocation + login-shell launching (safe, via `pty-process`) |
-| `proto` | Handshake driver, control channel, server-authoritative state-sync data plane |
-| `noissh` (root) | UDP client/server runtime, config, raw-tty renderer, SSH bootstrap, binaries |
-
-The interesting design is the **hybrid resilient transport + predictive TTY
-overlay**: every datagram carries a cryptographic session id and is
-individually AEAD-authenticated, so the server demuxes by session id (not source
-IP) and follows the client across address changes. The interactive shell rides
-unreliable latest-wins state-sync so packet loss never stalls the stream.
+- **It survives everything.** IP changes, NAT timeouts, Wi-Fi↔cellular handoff,
+  suspend/resume — the session just keeps going.
+- **It feels instant.** Your keystrokes show up immediately, even on a laggy or
+  lossy connection, instead of waiting for a round trip to the server.
+- **It's secure by design.** Every connection is mutually authenticated and
+  encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
+  authorized keys can connect.
+- **It's easy to start.** Already have SSH access? One command and you're in — no
+  server setup, no extra keys to copy around.
+- **It's safe code.** Written in 100% safe Rust (`#![forbid(unsafe_code)]`),
+  thoroughly tested, with zero compiler/linter warnings.
 
 ## Install
 
-One-line install (tries a prebuilt release for your platform, else builds from
-source, offering to install Rust if needed):
+One line — grabs a prebuilt binary for your platform, or builds from source if
+needed (it'll offer to install Rust for you):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/gedigi/noissh/main/install.sh | sh
 ```
 
-Other options:
+Prefer something else?
 
 ```sh
-cargo install --git https://github.com/gedigi/noissh   # via cargo
+cargo install --git https://github.com/gedigi/noissh   # with Rust's cargo
 make install PREFIX=~/.local                            # from a clone
-./install.sh --uninstall                                # remove binaries
 ```
 
-Install `noissh` on your machine and `noisshd` on the server.
+Put `noissh` on your laptop and `noisshd` on the server. (To remove it later:
+`./install.sh --uninstall`.)
 
-## Build & test
+## Getting started
+
+**The easy way — if you can already SSH to the host:**
 
 ```sh
-cargo build --release
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+noissh --ssh you@server
 ```
 
-Requires Rust stable (edition 2024; tested on 1.96).
+noissh uses your existing SSH access to start the server for you and then runs
+the session over its own resilient, encrypted channel. (The server just needs
+`noisshd` installed — same idea as mosh needing `mosh-server`.)
 
-## Usage
-
-### Standalone daemon
-
-On the server, authorize a client's public key (printed by the client on first
-run in `~/.config/noissh/id`) by adding its `noissh-x25519 <base64>` line to
-`~/.config/noissh/authorized_keys`, then:
+**Running your own always-on server:**
 
 ```sh
+# on the server
 noisshd --listen 0.0.0.0:51820
+
+# on your machine (first connect remembers the server's key)
+noissh you@server
 ```
 
-Connect (first connect pins the server key via TOFU in `~/.config/noissh/known_hosts`):
+Authorize a client by adding its public key (printed on first run, stored at
+`~/.config/noissh/id`) to `~/.config/noissh/authorized_keys` on the server.
 
-```sh
-noissh user@server      # uses --port 51820 by default
-```
+> **Tip:** noissh talks over **UDP**. If SSH works but noissh times out, the
+> usual culprit is a firewall blocking the UDP port — open it and you're set.
 
-### mosh-style SSH bootstrap
+Full walkthrough, configuration, and troubleshooting:
+**[User Guide »](docs/USER_GUIDE.md)**
 
-If you can already SSH to the host, let SSH launch the server and hand back the
-UDP port + an ephemeral key — no pre-shared `authorized_keys` needed:
+## How it works (the short version)
 
-```sh
-noissh --ssh user@server          # runs `ssh user@server noisshd --one-shot ...`
-```
+The server keeps the real terminal; your client shows a live picture of it and
+predicts your typing locally so it feels instant. Every packet is encrypted and
+tagged with a session id, so the server recognizes you no matter which network
+address you appear from — that's what lets the connection roam. Packet loss never
+stalls anything, because only the *latest* screen matters.
 
-SSH is used **only** to bootstrap; the session itself runs over Noise/UDP and
-roams. The one-shot server detaches and survives the SSH connection closing,
-just like `mosh-server`.
+Want the details? See the **[Architecture](docs/ARCHITECTURE.md)** and
+**[Protocol](docs/PROTOCOL.md)** docs.
 
-## Resilience
+## Project status
 
-The session survives Wi-Fi↔cellular handoff, NAT rebinding, and laptop
-sleep/resume with no reconnect: any authenticated datagram from a new source
-address transparently updates the server's notion of the peer address. This is
-covered by automated tests — both an in-process harness that injects
-loss/reorder and rewrites the source address mid-session, and a real-socket e2e
-that rebinds the client's UDP socket mid-session.
+Working and tested end-to-end: the resilient interactive shell, predictive
+typing, roaming, and the reliable-stream layer that future SSH-style features
+(port forwarding, file transfer) build on. This is young software and hasn't had
+an independent security audit yet — see the **[Security model](docs/SECURITY.md)**
+before relying on it for anything sensitive.
 
-## Safety
+## Documentation
 
-The whole project is `#![forbid(unsafe_code)]` — **no `unsafe` in any crate or
-binary**. OS primitives (PTY, fork/exec, daemonize, terminal size) are delegated
-to well-tested safe-API crates.
+| Guide | What's inside |
+|---|---|
+| [User Guide](docs/USER_GUIDE.md) | Install, connect, configure, troubleshoot |
+| [Architecture](docs/ARCHITECTURE.md) | How the pieces fit together (with diagrams) |
+| [Protocol](docs/PROTOCOL.md) | The wire format and handshake, in detail |
+| [Security](docs/SECURITY.md) | Trust model and threat model |
+| [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) | Hacking on noissh · history |
 
-## Platform notes
+## License
 
-- **Server:** Linux and macOS. The login backend allocates a real PTY and runs
-  the login shell as the current user (no root needed) — the tested path.
-  Multi-user deployments use the mosh model: the SSH bootstrap launches the
-  server already running as the authenticated user (no in-process `setuid`).
-- **Non-goals:** Windows *server*, X11 forwarding, GSSAPI/Kerberos, SSH
-  wire-protocol interop.
-
-## Offline / vendored builds
-
-For hermetic or air-gapped builds:
-
-```sh
-cargo vendor vendor > .cargo/config.toml
-cargo build --offline
-```
-
-`vendor/` and the generated `.cargo/config.toml` are git-ignored (the full
-cross-platform dependency tree is large); regenerate them on demand.
-`Cargo.lock` is committed for reproducibility.
+MIT — see [LICENSE](LICENSE).

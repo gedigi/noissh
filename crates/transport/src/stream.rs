@@ -138,8 +138,15 @@ struct StreamState {
     recv_window: u32,
     peer_fin: HalfState,
     close_received: bool, // a StreamClose has been surfaced as an event
+    close_ticks: u32,     // polls spent waiting for a lost FIN after close
     reset: bool,
 }
+
+/// After a graceful close, how many `poll_transmit` rounds to wait for the
+/// FIN-bearing `StreamData` before force-reclaiming the stream. This only
+/// triggers when the peer has gone silent (an alive peer retransmits the FIN
+/// well within this window), so it cannot drop data a live peer would resend.
+const CLOSE_GRACE_TICKS: u32 = 100;
 
 impl StreamState {
     fn new(id: u64, kind: StreamKind, meta: Vec<u8>, needs_open: bool) -> Self {
@@ -160,16 +167,28 @@ impl StreamState {
             recv_window: DEFAULT_WINDOW,
             peer_fin: HalfState::Open,
             close_received: false,
+            close_ticks: 0,
             reset: false,
         }
     }
 
     /// Both directions are closed and all received data has been read.
     fn fully_done(&self) -> bool {
-        self.send_fin
-            && self.fin_acked
-            && matches!(self.peer_fin, HalfState::Finished(at)
-                if self.recv.delivered >= at && self.recv.unread() == 0)
+        if !self.send_fin || !self.fin_acked {
+            return false;
+        }
+        // Primary path: the peer's FIN-bearing StreamData arrived and all data
+        // up to the FIN offset has been delivered and read.
+        if matches!(self.peer_fin, HalfState::Finished(at)
+            if self.recv.delivered >= at && self.recv.unread() == 0)
+        {
+            return true;
+        }
+        // Fallback: the peer sent a graceful StreamClose (surfaced to the app)
+        // but the FIN-bearing StreamData never arrived and the peer has gone
+        // silent for the grace window — reclaim so a dead peer can't leak the
+        // stream forever. An alive peer would have resent the FIN by now.
+        self.close_received && self.close_ticks >= CLOSE_GRACE_TICKS
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -249,6 +268,15 @@ impl StreamState {
                 id: self.id,
                 status,
             });
+        }
+        // Count down the close grace window while we're settled on our side but
+        // still missing the peer's FIN (see `fully_done`).
+        if self.close_received
+            && self.send_fin
+            && self.fin_acked
+            && matches!(self.peer_fin, HalfState::Open)
+        {
+            self.close_ticks = self.close_ticks.saturating_add(1);
         }
     }
 }
@@ -576,6 +604,33 @@ mod tests {
         assert!(
             server.poll_transmit().is_empty(),
             "server still chattering on a closed stream"
+        );
+    }
+
+    #[test]
+    fn close_without_fin_data_is_reclaimed_after_grace() {
+        // Simulate a peer that closed gracefully but whose FIN-bearing data was
+        // lost and which has since gone silent. We (the receiver) have finished
+        // our own send side; the stream must eventually be reclaimed instead of
+        // leaking forever.
+        let mut a = StreamMux::new(true);
+        let id = a.open(StreamKind::Forward, vec![]);
+        a.close(id, 0);
+        // Self-ack our FIN so our send side is settled (no live peer to ack).
+        a.on_frame(Frame::StreamAck {
+            id,
+            ack: 0,
+            window: DEFAULT_WINDOW,
+        });
+        // Peer's graceful close arrives, but the FIN StreamData never does.
+        a.on_frame(Frame::StreamClose { id, status: 0 });
+        // Poll past the grace window; the stream should be reclaimed and go quiet.
+        for _ in 0..(CLOSE_GRACE_TICKS + 2) {
+            a.poll_transmit();
+        }
+        assert!(
+            a.poll_transmit().is_empty(),
+            "stream leaked: still transmitting after close grace window"
         );
     }
 

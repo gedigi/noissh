@@ -92,11 +92,17 @@ impl PtyHandle {
     /// Read shell output. Returns `Ok(0)` at EOF (child closed the PTY) and
     /// `Err(WouldBlock)` when non-blocking and no data is ready.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
-        match (&self.pty).read(buf) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(PtyError::WouldBlock),
-            // EIO and other read errors on a PTY master mean the slave is gone.
-            Err(_) => Ok(0),
+        loop {
+            match (&self.pty).read(buf) {
+                Ok(n) => return Ok(n),
+                // Interrupted by a signal (e.g. SIGWINCH): retry, don't treat as EOF.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(PtyError::WouldBlock);
+                }
+                // EIO and other read errors on a PTY master mean the slave is gone.
+                Err(_) => return Ok(0),
+            }
         }
     }
 
