@@ -547,17 +547,9 @@ impl Client {
                             None => self.core.stream_close(id),
                         }
                     }
-                    StreamEvent::Readable { id } => {
-                        if let Some(c) = conns.get_mut(&id) {
-                            loop {
-                                let d = self.core.stream_read(id);
-                                if d.is_empty() {
-                                    break;
-                                }
-                                c.queue_to_tcp(&d);
-                            }
-                        }
-                    }
+                    // Session→TCP draining happens in the pump loop below, bounded
+                    // by the out buffer; Readable just signals data is available.
+                    StreamEvent::Readable { .. } => {}
                     // Peer closed its send half: keep flushing what we have, but
                     // stop expecting more session data. Reset aborts immediately.
                     StreamEvent::Closed { id, .. } => {
@@ -572,17 +564,27 @@ impl Client {
                 }
             }
 
-            // TCP → session, flush, propagate half-close, and reap when finished.
+            // Pump both directions, with caps, propagate half-close, reap.
             let ids: Vec<u64> = conns.keys().copied().collect();
             for id in ids {
                 if let Some(c) = conns.get_mut(&id) {
+                    // session → TCP, bounded so a stuck local peer backpressures
+                    // the session (its mux recv window closes as we stop reading).
+                    c.flush();
+                    while c.out_len() < SEND_CAP as usize {
+                        let d = self.core.stream_read(id);
+                        if d.is_empty() {
+                            break;
+                        }
+                        c.queue_to_tcp(&d);
+                    }
+                    // TCP → session, bounded by unacked in-flight bytes.
                     if self.core.stream_in_flight(id) < SEND_CAP {
                         let data = c.read_tcp();
                         if !data.is_empty() {
                             self.core.stream_write(id, &data);
                         }
                     }
-                    c.flush();
                     if c.needs_fin() {
                         self.core.stream_close(id);
                     }

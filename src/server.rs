@@ -563,17 +563,8 @@ impl Server {
                         None => self.core.stream_close(sid, id), // unreachable target
                     }
                 }
-                StreamEvent::Readable { id } => {
-                    if let Some(c) = self.forwards.get_mut(&(sid, id)) {
-                        loop {
-                            let d = self.core.stream_read(sid, id);
-                            if d.is_empty() {
-                                break;
-                            }
-                            c.queue_to_tcp(&d);
-                        }
-                    }
-                }
+                // Draining happens in the bounded pump loop below.
+                StreamEvent::Readable { .. } => {}
                 StreamEvent::Closed { id, .. } => {
                     if let Some(c) = self.forwards.get_mut(&(sid, id)) {
                         c.mark_peer_closed();
@@ -585,18 +576,27 @@ impl Server {
                 _ => {}
             }
         }
-        // TCP → session, flush, propagate half-close, reap when finished.
+        // Pump both directions, with caps, propagate half-close, reap.
         const SEND_CAP: u64 = 512 * 1024;
         let keys: Vec<(SessionId, u64)> = self.forwards.keys().copied().collect();
         for k in keys {
             if let Some(c) = self.forwards.get_mut(&k) {
+                // session → TCP, bounded so a stuck peer backpressures the session.
+                c.flush();
+                while c.out_len() < SEND_CAP as usize {
+                    let d = self.core.stream_read(k.0, k.1);
+                    if d.is_empty() {
+                        break;
+                    }
+                    c.queue_to_tcp(&d);
+                }
+                // TCP → session, bounded by unacked in-flight bytes.
                 if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
                     let d = c.read_tcp();
                     if !d.is_empty() {
                         self.core.stream_write(k.0, k.1, &d);
                     }
                 }
-                c.flush();
                 if c.needs_fin() {
                     self.core.stream_close(k.0, k.1);
                 }

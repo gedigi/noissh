@@ -21,7 +21,14 @@ pub struct ForwardConn {
     fin_sent: bool,
     /// The TCP socket errored and is unusable.
     dead: bool,
+    /// Consecutive flush attempts that made no progress (TCP peer not draining).
+    flush_stall: u32,
 }
+
+/// Reap a connection whose TCP peer makes no write progress for this many flush
+/// attempts (a permanently-stuck local app). At the driver cadence this is on
+/// the order of a minute, after which the connection is considered dead.
+const FLUSH_STALL_LIMIT: u32 = 3000;
 
 impl ForwardConn {
     pub fn new(stream: TcpStream) -> std::io::Result<Self> {
@@ -33,6 +40,7 @@ impl ForwardConn {
             peer_closed: false,
             fin_sent: false,
             dead: false,
+            flush_stall: 0,
         })
     }
 
@@ -80,8 +88,19 @@ impl ForwardConn {
                 Ok(0) => break,
                 Ok(n) => {
                     self.out.drain(0..n);
+                    self.flush_stall = 0; // progress
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // TCP peer's receive buffer is full. Bound how long we wait
+                    // for it to drain before declaring the connection dead, so a
+                    // permanently-stuck peer can't leak the connection forever.
+                    self.flush_stall = self.flush_stall.saturating_add(1);
+                    if self.flush_stall >= FLUSH_STALL_LIMIT {
+                        self.dead = true;
+                        self.out.clear();
+                    }
+                    break;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => {
                     self.dead = true;
@@ -117,6 +136,12 @@ impl ForwardConn {
     /// Whether buffered output is waiting to be written (for POLLOUT interest).
     pub fn wants_write(&self) -> bool {
         !self.out.is_empty()
+    }
+
+    /// Bytes buffered toward TCP (so the driver can bound it and apply
+    /// receive-side backpressure to the session peer).
+    pub fn out_len(&self) -> usize {
+        self.out.len()
     }
 
     pub fn as_fd(&self) -> BorrowedFd<'_> {
