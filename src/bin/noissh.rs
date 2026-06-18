@@ -32,6 +32,20 @@ struct Args {
     target: Option<String>,
     server_cmd: String,
     ssh_args: Vec<String>,
+    /// Local port forwards: (local_port, "host:port").
+    local_forwards: Vec<(u16, String)>,
+    /// Remote port forwards: (remote_port, "host:port").
+    remote_forwards: Vec<(u16, String)>,
+}
+
+/// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
+fn parse_forward(s: &str) -> Option<(u16, String)> {
+    let (lport, target) = s.split_once(':')?;
+    let port: u16 = lport.parse().ok()?;
+    if target.is_empty() {
+        return None;
+    }
+    Some((port, target.to_string()))
 }
 
 fn parse_args() -> Args {
@@ -41,6 +55,8 @@ fn parse_args() -> Args {
         target: None,
         server_cmd: "noisshd".to_string(),
         ssh_args: Vec::new(),
+        local_forwards: Vec::new(),
+        remote_forwards: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -54,6 +70,20 @@ fn parse_args() -> Args {
             "--server-cmd" => {
                 if let Some(c) = it.next() {
                     a.server_cmd = c;
+                }
+            }
+            "-L" => {
+                if let Some(spec) = it.next().as_deref().and_then(parse_forward) {
+                    a.local_forwards.push(spec);
+                } else {
+                    eprintln!("noissh: ignoring malformed -L spec (want LPORT:HOST:PORT)");
+                }
+            }
+            "-R" => {
+                if let Some(spec) = it.next().as_deref().and_then(parse_forward) {
+                    a.remote_forwards.push(spec);
+                } else {
+                    eprintln!("noissh: ignoring malformed -R spec (want RPORT:HOST:PORT)");
                 }
             }
             "--" => a.ssh_args = it.by_ref().collect(),
@@ -102,7 +132,9 @@ fn run() -> Result<(), RuntimeError> {
         (addr, format!("{host}:{}", args.port))
     };
 
-    let mut client = Client::connect(
+    // Forward-only when `-L`/`-R` is given (no interactive shell), like `ssh -N`.
+    let forward_only = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
+    let mut client = Client::connect_with(
         &keypair,
         known,
         host_label,
@@ -110,6 +142,7 @@ fn run() -> Result<(), RuntimeError> {
         rows,
         cols,
         DisplayMode::Adaptive,
+        !forward_only,
     )?;
 
     // Persist any newly-pinned host key (direct-mode TOFU).
@@ -117,7 +150,11 @@ fn run() -> Result<(), RuntimeError> {
         save_known_hosts(&kh_path, client.core().known_hosts())?;
     }
 
-    interactive_loop(&mut client)
+    if forward_only {
+        client.run_forwards(&args.local_forwards, &args.remote_forwards)
+    } else {
+        interactive_loop(&mut client)
+    }
 }
 
 /// Pin a key under a label, hard-failing on mismatch (used after SSH bootstrap).
@@ -141,6 +178,10 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
 
     let _raw = RawMode::enable()?;
     let mut renderer = Renderer::new();
+
+    // The loop waits via poll(); make the UDP socket non-blocking so draining
+    // recv returns WouldBlock instead of blocking on each retransmit.
+    client.socket().set_nonblocking(true).ok();
 
     let stdin = std::io::stdin();
     set_nonblocking(stdin.as_fd());

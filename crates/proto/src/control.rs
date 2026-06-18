@@ -31,6 +31,9 @@ pub enum ControlMsg {
     AuthPrompt { echo: bool, prompt: String },
     /// Optional second-factor response (client → server).
     AuthResponse { data: String },
+    /// Client → server: please listen on `bind_port` and forward accepted
+    /// connections back to the client, which connects them to `target` (`-R`).
+    RemoteForward { bind_port: u16, target: String },
 }
 
 const M_OPEN_SHELL: u8 = 1;
@@ -38,6 +41,7 @@ const M_RESIZE: u8 = 2;
 const M_EXIT: u8 = 3;
 const M_AUTH_PROMPT: u8 = 4;
 const M_AUTH_RESPONSE: u8 = 5;
+const M_REMOTE_FORWARD: u8 = 6;
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u64);
@@ -92,6 +96,11 @@ impl ControlMsg {
                 out.push(M_AUTH_RESPONSE);
                 put_str(&mut out, data);
             }
+            ControlMsg::RemoteForward { bind_port, target } => {
+                out.push(M_REMOTE_FORWARD);
+                put_varint(&mut out, *bind_port as u64);
+                put_str(&mut out, target);
+            }
         }
         out
     }
@@ -123,6 +132,11 @@ impl ControlMsg {
             M_AUTH_RESPONSE => ControlMsg::AuthResponse {
                 data: get_str(buf, &mut pos)?,
             },
+            M_REMOTE_FORWARD => {
+                let bind_port = get_varint(buf, &mut pos)? as u16;
+                let target = get_str(buf, &mut pos)?;
+                ControlMsg::RemoteForward { bind_port, target }
+            }
             other => return Err(ControlError::Unknown(other)),
         })
     }
@@ -156,6 +170,10 @@ mod tests {
         });
         roundtrip(ControlMsg::AuthResponse {
             data: "secret".into(),
+        });
+        roundtrip(ControlMsg::RemoteForward {
+            bind_port: 8080,
+            target: "127.0.0.1:80".into(),
         });
     }
 

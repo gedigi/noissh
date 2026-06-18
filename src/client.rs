@@ -9,8 +9,8 @@ use noise_core::Keypair;
 use predict::DisplayMode;
 use proto::{ClientShell, ControlMsg, Handshaker, verify_server};
 use term::Grid;
-use transport::{Packet, Session, random_session_id};
-use wire::Frame;
+use transport::{Packet, Session, StreamEvent, StreamMux, random_session_id};
+use wire::{Frame, StreamKind};
 
 use crate::RuntimeError;
 
@@ -34,6 +34,12 @@ pub struct ClientCore {
     /// A state-diff arrived since we last sent frames; re-ack so the server is
     /// not left retransmitting if a prior ack was lost.
     need_ack: bool,
+    /// Reliable stream multiplexer (port forwarding etc.) over this session.
+    mux: StreamMux,
+    stream_events: Vec<StreamEvent>,
+    /// Whether to request an interactive shell on connect (false for `-N`-style
+    /// forward-only sessions).
+    want_shell: bool,
     known_hosts_dirty: bool,
 }
 
@@ -71,6 +77,9 @@ impl ClientCore {
             open_shell_pending: false,
             open_shell_ticks: 0,
             need_ack: false,
+            mux: StreamMux::new(true),
+            stream_events: Vec::new(),
+            want_shell: true,
             known_hosts_dirty: false,
         };
         Ok((core, first))
@@ -78,6 +87,12 @@ impl ClientCore {
 
     pub fn is_established(&self) -> bool {
         self.established
+    }
+
+    /// Disable the interactive-shell request (for forward-only sessions). Must
+    /// be called before the handshake completes.
+    pub fn set_want_shell(&mut self, want: bool) {
+        self.want_shell = want;
     }
 
     pub fn exit_status(&self) -> Option<i32> {
@@ -156,10 +171,11 @@ impl ClientCore {
             let hs = self.hs.take().unwrap();
             self.session = Some(hs.into_session(Some(self.server_addr))?);
             self.established = true;
-            // Request a shell with our geometry. Retransmitted every tick until
-            // the server starts sending screen state (the request could be lost
-            // or reordered ahead of the final handshake message).
-            self.open_shell_pending = true;
+            // Request a shell with our geometry (unless this is a forward-only
+            // session). Retransmitted every tick until the server starts sending
+            // screen state (the request could be lost or reordered ahead of the
+            // final handshake message).
+            self.open_shell_pending = self.want_shell;
             out.extend(self.outgoing()?);
         }
         Ok(out)
@@ -184,9 +200,15 @@ impl ClientCore {
                         self.exited = Some(status);
                     }
                 }
+                f @ (Frame::StreamOpen { .. }
+                | Frame::StreamData { .. }
+                | Frame::StreamAck { .. }
+                | Frame::StreamClose { .. }
+                | Frame::StreamReset { .. }) => self.mux.on_frame(f),
                 _ => {} // Pong and others: liveness only
             }
         }
+        self.stream_events.extend(self.mux.take_events());
         // Once the server is sending screen state, the shell is open.
         if self.shell.current_seq() > 0 {
             self.open_shell_pending = false;
@@ -206,7 +228,49 @@ impl ClientCore {
             && (self.open_shell_pending
                 || !self.pending_control.is_empty()
                 || self.need_ack
-                || self.shell.has_pending_input())
+                || self.shell.has_pending_input()
+                || self.mux.has_traffic())
+    }
+
+    // --- reliable streams (port forwarding) ---
+
+    /// Open a forwarded-connection stream toward `target` (e.g. "host:port").
+    /// Returns the stream id.
+    pub fn open_forward(&mut self, target: &str) -> u64 {
+        self.mux
+            .open(StreamKind::Forward, target.as_bytes().to_vec())
+    }
+
+    /// Queue bytes to send on a stream.
+    pub fn stream_write(&mut self, id: u64, data: &[u8]) {
+        self.mux.write(id, data);
+    }
+
+    /// Read available contiguous bytes from a stream.
+    pub fn stream_read(&mut self, id: u64) -> Vec<u8> {
+        self.mux.read(id)
+    }
+
+    /// Close our send half of a stream.
+    pub fn stream_close(&mut self, id: u64) {
+        self.mux.close(id, 0);
+    }
+
+    /// Request a remote forward (`-R`): ask the server to listen on `bind_port`
+    /// and tunnel accepted connections back to us for delivery to `target`.
+    pub fn request_remote_forward(&mut self, bind_port: u16, target: &str) {
+        self.pending_control.push(Frame::Control {
+            data: ControlMsg::RemoteForward {
+                bind_port,
+                target: target.to_string(),
+            }
+            .encode(),
+        });
+    }
+
+    /// Drain stream lifecycle events (Opened/Readable/Closed/Reset).
+    pub fn take_stream_events(&mut self) -> Vec<StreamEvent> {
+        std::mem::take(&mut self.stream_events)
     }
 
     /// A keepalive datagram (Ping) to refresh NAT mappings and prove liveness
@@ -237,6 +301,8 @@ impl ClientCore {
         }
         frames.append(&mut self.pending_control);
         frames.extend(self.shell.poll_frames());
+        frames.extend(self.mux.poll_transmit());
+        self.stream_events.extend(self.mux.take_events());
         self.need_ack = false;
         if frames.is_empty() {
             return Ok(Vec::new());
@@ -263,6 +329,31 @@ impl Client {
         cols: u16,
         prediction: DisplayMode,
     ) -> Result<Self, RuntimeError> {
+        Self::connect_with(
+            keypair,
+            known,
+            host_label,
+            server_addr,
+            rows,
+            cols,
+            prediction,
+            true,
+        )
+    }
+
+    /// Like [`Client::connect`], but `want_shell = false` opens a forward-only
+    /// session (no interactive shell is requested).
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with(
+        keypair: &Keypair,
+        known: KnownHosts,
+        host_label: impl Into<String>,
+        server_addr: SocketAddr,
+        rows: u16,
+        cols: u16,
+        prediction: DisplayMode,
+        want_shell: bool,
+    ) -> Result<Self, RuntimeError> {
         let bind: SocketAddr = if server_addr.is_ipv6() {
             "[::]:0".parse().unwrap()
         } else {
@@ -270,7 +361,7 @@ impl Client {
         };
         let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
-        let (core, first) = ClientCore::new(
+        let (mut core, first) = ClientCore::new(
             keypair,
             known,
             host_label,
@@ -279,6 +370,7 @@ impl Client {
             cols,
             prediction,
         )?;
+        core.set_want_shell(want_shell);
         socket.send_to(&first, server_addr)?;
         let mut client = Client {
             core,
@@ -321,6 +413,144 @@ impl Client {
     /// Borrow the UDP socket (e.g. to register it with a poller).
     pub fn socket(&self) -> &UdpSocket {
         &self.socket
+    }
+
+    /// Run port forwarding until interrupted.
+    ///
+    /// `local` are `-L` forwards `(local_port, "host:port")`: connections to
+    /// `127.0.0.1:local_port` tunnel to `host:port` reachable from the server.
+    /// `remote` are `-R` forwards `(remote_port, "host:port")`: the server
+    /// listens on `remote_port` and tunnels accepted connections back here to be
+    /// delivered to `host:port`.
+    pub fn run_forwards(
+        &mut self,
+        local: &[(u16, String)],
+        remote: &[(u16, String)],
+    ) -> Result<(), RuntimeError> {
+        use crate::forward::ForwardConn;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::collections::HashMap;
+        use std::net::TcpListener;
+        use std::os::fd::AsFd;
+        use std::time::Instant;
+
+        // The loop waits via poll(); the UDP socket must be non-blocking so
+        // recv drains to WouldBlock instead of blocking on each retransmit.
+        self.socket.set_nonblocking(true)?;
+
+        let mut listeners = Vec::new();
+        for (port, target) in local {
+            let l = TcpListener::bind(("127.0.0.1", *port))?;
+            l.set_nonblocking(true)?;
+            eprintln!("-L 127.0.0.1:{port} -> {target} (via {})", self.server_addr);
+            listeners.push((l, target.clone()));
+        }
+        for (port, target) in remote {
+            self.core.request_remote_forward(*port, target);
+            eprintln!("-R {}:{port} -> {target}", self.server_addr.ip());
+        }
+
+        let mut conns: HashMap<u64, ForwardConn> = HashMap::new();
+        let keepalive = Duration::from_secs(3);
+        let mut next_keepalive = Instant::now() + keepalive;
+
+        loop {
+            let timeout = if conns.is_empty() && !self.core.has_outgoing() {
+                next_keepalive
+                    .saturating_duration_since(Instant::now())
+                    .min(keepalive)
+            } else {
+                Duration::from_millis(5)
+            };
+            {
+                let sock = self.socket.as_fd();
+                let mut fds = vec![PollFd::new(sock, PollFlags::POLLIN)];
+                for (l, _) in &listeners {
+                    fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
+                }
+                let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
+                let _ = poll(&mut fds, PollTimeout::from(ms));
+            }
+
+            // Accept new local (`-L`) connections and open a forward stream each.
+            for (l, target) in &listeners {
+                loop {
+                    match l.accept() {
+                        Ok((s, _)) => {
+                            if let Ok(conn) = ForwardConn::new(s) {
+                                let id = self.core.open_forward(target);
+                                conns.insert(id, conn);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            // Inbound session packets.
+            while self.recv_and_handle()? {}
+
+            // React to stream events (incl. inbound `-R` opens → dial out).
+            for ev in self.core.take_stream_events() {
+                match ev {
+                    StreamEvent::Opened {
+                        id,
+                        kind: StreamKind::Forward,
+                        meta,
+                    } => {
+                        match std::str::from_utf8(&meta)
+                            .ok()
+                            .and_then(|t| ForwardConn::connect(t).ok())
+                        {
+                            Some(conn) => {
+                                conns.insert(id, conn);
+                            }
+                            None => self.core.stream_close(id),
+                        }
+                    }
+                    StreamEvent::Readable { id } => {
+                        if let Some(c) = conns.get_mut(&id) {
+                            loop {
+                                let d = self.core.stream_read(id);
+                                if d.is_empty() {
+                                    break;
+                                }
+                                c.queue_to_tcp(&d);
+                            }
+                        }
+                    }
+                    StreamEvent::Closed { id, .. } | StreamEvent::Reset { id } => {
+                        conns.remove(&id);
+                    }
+                    _ => {}
+                }
+            }
+
+            // TCP → session, and reap finished connections.
+            let ids: Vec<u64> = conns.keys().copied().collect();
+            for id in ids {
+                if let Some(c) = conns.get_mut(&id) {
+                    let data = c.read_tcp();
+                    if !data.is_empty() {
+                        self.core.stream_write(id, &data);
+                    }
+                    c.flush();
+                    if c.tcp_closed() {
+                        self.core.stream_close(id);
+                        if c.is_done() {
+                            conns.remove(&id);
+                        }
+                    }
+                }
+            }
+
+            self.flush()?;
+            if Instant::now() >= next_keepalive {
+                self.send_keepalive()?;
+                next_keepalive = Instant::now() + keepalive;
+            }
+        }
     }
 
     /// Drain a single ready datagram (non-blocking) and send any replies.

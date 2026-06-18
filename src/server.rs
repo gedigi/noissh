@@ -9,8 +9,8 @@ use auth::AuthorizedKeys;
 use noise_core::Keypair;
 use proto::{ControlMsg, Handshaker, ServerShell, authorize_client};
 use pty::{LocalLogin, LoginSession, PtyError, PtyHandle, SpawnRequest};
-use transport::{Packet, Session, SessionId};
-use wire::Frame;
+use transport::{Packet, Session, SessionId, StreamEvent, StreamMux};
+use wire::{Frame, StreamKind};
 
 use crate::RuntimeError;
 
@@ -30,6 +30,8 @@ struct ServerSession {
     /// Ticks elapsed since exit, used to bound Exit retransmission before the
     /// session is reclaimed.
     exit_ticks: u32,
+    /// Reliable stream multiplexer (port forwarding etc.) for this session.
+    mux: StreamMux,
 }
 
 /// How many ticks to keep retransmitting the Exit notice before reclaiming a
@@ -57,6 +59,11 @@ pub struct ServerCore {
     pending: HashMap<SessionId, Handshaker>,
     sessions: HashMap<SessionId, ServerSession>,
     ever_active: bool,
+    /// Stream lifecycle events surfaced to the driver, tagged by session.
+    stream_events: Vec<(SessionId, StreamEvent)>,
+    /// Remote-forward (`-R`) listen requests surfaced to the driver:
+    /// (session, bind_port, target).
+    remote_forward_requests: Vec<(SessionId, u16, String)>,
 }
 
 impl ServerCore {
@@ -77,6 +84,8 @@ impl ServerCore {
             pending: HashMap::new(),
             sessions: HashMap::new(),
             ever_active: false,
+            stream_events: Vec::new(),
+            remote_forward_requests: Vec::new(),
         }
     }
 
@@ -181,6 +190,7 @@ impl ServerCore {
                 idle_ticks: 0,
                 exit_status: None,
                 exit_ticks: 0,
+                mux: StreamMux::new(false),
             };
             if let Some(old_sid) = existing
                 && let Some(mut old) = self.sessions.remove(&old_sid)
@@ -244,8 +254,25 @@ impl ServerCore {
                     }
                 }
                 Frame::Ping { stamp } => reply_frames.push(Frame::Pong { stamp }),
+                f @ (Frame::StreamOpen { .. }
+                | Frame::StreamData { .. }
+                | Frame::StreamAck { .. }
+                | Frame::StreamClose { .. }
+                | Frame::StreamReset { .. }) => {
+                    if let Some(sess) = self.sessions.get_mut(&sid) {
+                        sess.mux.on_frame(f);
+                    }
+                }
                 _ => {}
             }
+        }
+        let evs = self
+            .sessions
+            .get_mut(&sid)
+            .map(|sess| sess.mux.take_events())
+            .unwrap_or_default();
+        for ev in evs {
+            self.stream_events.push((sid, ev));
         }
         let mut out = Vec::new();
         if !reply_frames.is_empty()
@@ -295,6 +322,9 @@ impl ServerCore {
                     shell.resize(rows as usize, cols as usize);
                 }
             }
+            ControlMsg::RemoteForward { bind_port, target } => {
+                self.remote_forward_requests.push((sid, bind_port, target));
+            }
             _ => {}
         }
     }
@@ -303,6 +333,7 @@ impl ServerCore {
     pub fn tick(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut out = Vec::new();
         let mut finished: Vec<SessionId> = Vec::new();
+        let mut events_buf: Vec<(SessionId, StreamEvent)> = Vec::new();
         let sids: Vec<SessionId> = self.sessions.keys().copied().collect();
         for sid in sids {
             let Some(sess) = self.sessions.get_mut(&sid) else {
@@ -343,6 +374,17 @@ impl ServerCore {
             {
                 out.push((addr, pkt));
             }
+            // Emit reliable-stream frames (port forwarding) and surface events.
+            let stream_frames = sess.mux.poll_transmit();
+            for ev in sess.mux.take_events() {
+                events_buf.push((sid, ev));
+            }
+            if !stream_frames.is_empty()
+                && let Some(addr) = sess.session.peer_addr()
+                && let Ok(pkt) = sess.session.seal(&stream_frames)
+            {
+                out.push((addr, pkt));
+            }
             // Detect child exit: record the status and release the PTY.
             if sess.exit_status.is_none()
                 && let Some(pty) = &mut sess.pty
@@ -371,7 +413,51 @@ impl ServerCore {
         for sid in finished {
             self.sessions.remove(&sid);
         }
+        self.stream_events.append(&mut events_buf);
         out
+    }
+
+    // --- reliable streams (port forwarding) ---
+
+    /// Drain stream lifecycle events (tagged by session).
+    pub fn take_stream_events(&mut self) -> Vec<(SessionId, StreamEvent)> {
+        std::mem::take(&mut self.stream_events)
+    }
+
+    /// Drain pending remote-forward (`-R`) listen requests for the driver to
+    /// open TCP listeners for.
+    pub fn take_remote_forward_requests(&mut self) -> Vec<(SessionId, u16, String)> {
+        std::mem::take(&mut self.remote_forward_requests)
+    }
+
+    /// Read available contiguous bytes from a stream within a session.
+    pub fn stream_read(&mut self, sid: SessionId, id: u64) -> Vec<u8> {
+        self.sessions
+            .get_mut(&sid)
+            .map(|s| s.mux.read(id))
+            .unwrap_or_default()
+    }
+
+    /// Queue bytes to send on a stream within a session.
+    pub fn stream_write(&mut self, sid: SessionId, id: u64, data: &[u8]) {
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            s.mux.write(id, data);
+        }
+    }
+
+    /// Close our send half of a stream within a session.
+    pub fn stream_close(&mut self, sid: SessionId, id: u64) {
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            s.mux.close(id, 0);
+        }
+    }
+
+    /// Open a forward stream from the server side (used by remote `-R`
+    /// forwarding); returns the new stream id.
+    pub fn open_forward(&mut self, sid: SessionId, target: &str) -> Option<u64> {
+        self.sessions
+            .get_mut(&sid)
+            .map(|s| s.mux.open(StreamKind::Forward, target.as_bytes().to_vec()))
     }
 }
 
@@ -379,13 +465,107 @@ impl ServerCore {
 pub struct Server {
     core: ServerCore,
     socket: UdpSocket,
+    /// Forwarded TCP connections (both `-L` dial-outs and `-R` accepts), keyed
+    /// by (session, stream id).
+    forwards: HashMap<(SessionId, u64), crate::forward::ForwardConn>,
+    /// Remote-forward (`-R`) listeners: (listener, session, target).
+    remote_listeners: Vec<(std::net::TcpListener, SessionId, String)>,
 }
 
 impl Server {
     pub fn bind(addr: SocketAddr, core: ServerCore) -> Result<Self, RuntimeError> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(10)))?;
-        Ok(Server { core, socket })
+        Ok(Server {
+            core,
+            socket,
+            forwards: HashMap::new(),
+            remote_listeners: Vec::new(),
+        })
+    }
+
+    /// Service forwarded TCP connections: dial out for new forward streams,
+    /// move bytes between TCP and the session streams in both directions.
+    fn pump_forwards(&mut self) {
+        use crate::forward::ForwardConn;
+
+        // Honour remote-forward (`-R`) requests: open a TCP listener per request.
+        for (sid, bind_port, target) in self.core.take_remote_forward_requests() {
+            if let Ok(l) = std::net::TcpListener::bind(("0.0.0.0", bind_port)) {
+                let _ = l.set_nonblocking(true);
+                self.remote_listeners.push((l, sid, target));
+            }
+        }
+        // Accept on remote listeners: open a forward stream toward the client.
+        let mut accepted: Vec<(SessionId, String, std::net::TcpStream)> = Vec::new();
+        for (l, sid, target) in &self.remote_listeners {
+            loop {
+                match l.accept() {
+                    Ok((s, _)) => accepted.push((*sid, target.clone(), s)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        for (sid, target, s) in accepted {
+            if let (Some(id), Ok(conn)) =
+                (self.core.open_forward(sid, &target), ForwardConn::new(s))
+            {
+                self.forwards.insert((sid, id), conn);
+            }
+        }
+
+        for (sid, ev) in self.core.take_stream_events() {
+            match ev {
+                StreamEvent::Opened {
+                    id,
+                    kind: StreamKind::Forward,
+                    meta,
+                } => {
+                    match std::str::from_utf8(&meta)
+                        .ok()
+                        .and_then(|t| ForwardConn::connect(t).ok())
+                    {
+                        Some(conn) => {
+                            self.forwards.insert((sid, id), conn);
+                        }
+                        None => self.core.stream_close(sid, id), // unreachable target
+                    }
+                }
+                StreamEvent::Readable { id } => {
+                    if let Some(c) = self.forwards.get_mut(&(sid, id)) {
+                        loop {
+                            let d = self.core.stream_read(sid, id);
+                            if d.is_empty() {
+                                break;
+                            }
+                            c.queue_to_tcp(&d);
+                        }
+                    }
+                }
+                StreamEvent::Closed { id, .. } | StreamEvent::Reset { id } => {
+                    self.forwards.remove(&(sid, id));
+                }
+                _ => {}
+            }
+        }
+        // TCP → session, and reap finished connections.
+        let keys: Vec<(SessionId, u64)> = self.forwards.keys().copied().collect();
+        for k in keys {
+            if let Some(c) = self.forwards.get_mut(&k) {
+                let d = c.read_tcp();
+                if !d.is_empty() {
+                    self.core.stream_write(k.0, k.1, &d);
+                }
+                c.flush();
+                if c.tcp_closed() {
+                    self.core.stream_close(k.0, k.1);
+                    if c.is_done() {
+                        self.forwards.remove(&k);
+                    }
+                }
+            }
+        }
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, RuntimeError> {
@@ -411,6 +591,9 @@ impl Server {
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return false,
         }
+        // Move bytes between forwarded TCP connections and their session streams
+        // before ticking, so freshly-read TCP data ships out in this iteration.
+        self.pump_forwards();
         for (addr, pkt) in self.core.tick() {
             let _ = self.socket.send_to(&pkt, addr);
         }

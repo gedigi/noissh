@@ -435,6 +435,12 @@ impl StreamMux {
         out
     }
 
+    /// Whether any streams are currently open (so the driver knows it has
+    /// stream-class frames to send and should keep polling).
+    pub fn has_traffic(&self) -> bool {
+        !self.streams.is_empty()
+    }
+
     /// Bytes written but not yet acked by the peer (send-side backlog).
     pub fn in_flight(&self, id: Stream) -> u64 {
         self.streams
