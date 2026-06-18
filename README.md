@@ -47,6 +47,25 @@ individually AEAD-authenticated, so the server demuxes by session id (not source
 IP) and follows the client across address changes. The interactive shell rides
 unreliable latest-wins state-sync so packet loss never stalls the stream.
 
+## Install
+
+One-line install (tries a prebuilt release for your platform, else builds from
+source, offering to install Rust if needed):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gedigi/noissh/main/install.sh | sh
+```
+
+Other options:
+
+```sh
+cargo install --git https://github.com/gedigi/noissh   # via cargo
+make install PREFIX=~/.local                            # from a clone
+./install.sh --uninstall                                # remove binaries
+```
+
+Install `noissh` on your machine and `noisshd` on the server.
+
 ## Build & test
 
 ```sh
