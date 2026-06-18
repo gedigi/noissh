@@ -472,7 +472,10 @@ impl ServerCore {
 
     /// Bytes written to a stream but not yet acked (driver backpressure).
     pub fn stream_in_flight(&self, sid: SessionId, id: u64) -> u64 {
-        self.sessions.get(&sid).map(|s| s.mux.in_flight(id)).unwrap_or(0)
+        self.sessions
+            .get(&sid)
+            .map(|s| s.mux.in_flight(id))
+            .unwrap_or(0)
     }
 }
 
@@ -509,10 +512,9 @@ impl Server {
         // network — that would be an SSH "GatewayPorts yes" behaviour, which is
         // off by default). Skip duplicates for the same (session, port).
         for (sid, bind_port, target) in self.core.take_remote_forward_requests() {
-            let already = self
-                .remote_listeners
-                .iter()
-                .any(|(l, s, _)| *s == sid && l.local_addr().map(|a| a.port()).ok() == Some(bind_port));
+            let already = self.remote_listeners.iter().any(|(l, s, _)| {
+                *s == sid && l.local_addr().map(|a| a.port()).ok() == Some(bind_port)
+            });
             if already {
                 continue;
             }
@@ -522,7 +524,8 @@ impl Server {
             }
         }
         // Drop listeners whose session is gone (avoids port squatting + leak).
-        self.remote_listeners.retain(|(_, sid, _)| self.core.has_session(*sid));
+        self.remote_listeners
+            .retain(|(_, sid, _)| self.core.has_session(*sid));
 
         // Accept on remote listeners: open a forward stream toward the client.
         let mut accepted: Vec<(SessionId, String, std::net::TcpStream)> = Vec::new();

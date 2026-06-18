@@ -23,9 +23,12 @@ laptop going to sleep.
 ## Why you'll like it
 
 - **It survives everything.** IP changes, NAT timeouts, Wi-Fi↔cellular handoff,
-  suspend/resume — the session just keeps going.
+  suspend/resume — the session just keeps going. And if your client itself
+  restarts, **reconnect and you're back in the same running session.**
 - **It feels instant.** Your keystrokes show up immediately, even on a laggy or
   lossy connection, instead of waiting for a round trip to the server.
+- **It tunnels too.** Local and remote **port forwarding** (`-L`/`-R`) ride the
+  same resilient, encrypted session.
 - **It's secure by design.** Every connection is mutually authenticated and
   encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
   authorized keys can connect.
@@ -98,6 +101,18 @@ Authorize a client by adding its public key (printed on first run, stored at
 
 > **Tip:** noissh talks over **UDP**. If SSH works but noissh times out, the
 > usual culprit is a firewall blocking the UDP port — open it and you're set.
+
+**Port forwarding** works like SSH's `-L`/`-R` and rides the same session:
+
+```sh
+# Local: localhost:8080 (your machine) -> 10.0.0.5:80 (reachable from the server)
+noissh --ssh user@server -L 8080:10.0.0.5:80
+
+# Remote: server:9000 -> localhost:3000 (on your machine)
+noissh --ssh user@server -R 9000:localhost:3000
+```
+
+Adding `-L`/`-R` makes the session forward-only (no shell), like `ssh -N`.
 
 Full walkthrough, configuration, and troubleshooting:
 **[User Guide »](docs/USER_GUIDE.md)**

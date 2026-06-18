@@ -313,11 +313,15 @@ impl ClientCore {
             }
         }
         // Retransmit remote-forward (`-R`) requests for a bounded window.
-        if !self.remote_forwards.is_empty() && self.remote_forward_ticks < REMOTE_FORWARD_MAX_TICKS {
+        if !self.remote_forwards.is_empty() && self.remote_forward_ticks < REMOTE_FORWARD_MAX_TICKS
+        {
             for (bind_port, target) in &self.remote_forwards {
                 frames.push(Frame::Control {
-                    data: ControlMsg::RemoteForward { bind_port: *bind_port, target: target.clone() }
-                        .encode(),
+                    data: ControlMsg::RemoteForward {
+                        bind_port: *bind_port,
+                        target: target.clone(),
+                    }
+                    .encode(),
                 });
             }
             self.remote_forward_ticks += 1;
@@ -528,7 +532,11 @@ impl Client {
             // React to stream events (incl. inbound `-R` opens → dial out).
             for ev in self.core.take_stream_events() {
                 match ev {
-                    StreamEvent::Opened { id, kind: StreamKind::Forward, meta } => {
+                    StreamEvent::Opened {
+                        id,
+                        kind: StreamKind::Forward,
+                        meta,
+                    } => {
                         match std::str::from_utf8(&meta)
                             .ok()
                             .and_then(|t| ForwardConn::connect(t).ok())

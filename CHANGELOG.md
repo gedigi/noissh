@@ -8,6 +8,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Port forwarding** over the reliable stream multiplexer: local (`-L
+  LPORT:HOST:PORT`) and remote (`-R RPORT:HOST:PORT`), `ssh -N`-style
+  forward-only sessions, with real-socket end-to-end tests.
+- **Session reattach**: a returning client (same static key) rebinds to its
+  still-running shell and receives a full snapshot, instead of spawning a new one.
+- **Keepalives + idle reaping**: clients send periodic Ping keepalives (server
+  replies Pong) to refresh NAT and prove liveness; the server reaps sessions
+  whose client has gone silent past a grace window.
+- **Event-driven client loop** (`poll`-based) replacing the previous busy-poll —
+  far lower idle CPU/bandwidth.
+- **Unicode width handling** in the terminal: double-width CJK/emoji occupy two
+  cells; zero-width combining marks no longer desync the grid.
+- **Supply-chain CI**: `cargo-deny` + `cargo-audit`, a macOS test/clippy matrix
+  leg, and release artifacts carry SHA-256 checksums + Sigstore build-provenance
+  attestations (the installer verifies the checksum).
+
+### Changed
+
+- The `-R` listener binds to loopback (`127.0.0.1`) by default — forwarded ports
+  are not exposed to the network (no implicit `GatewayPorts`).
+
+## [0.1.0]
+
+### Added
+
 - **v1 — resilient interactive shell.**
   - Noise `XX` handshake (`Noise_XX_25519_ChaChaPoly_BLAKE2s`) with stateless
     per-datagram AEAD (`noise-core`).

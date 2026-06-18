@@ -133,12 +133,17 @@ Files live under `$XDG_CONFIG_HOME/noissh` (or `~/.config/noissh`):
 ### `noissh`
 
 ```
-noissh [--ssh] [--port N] [--server-cmd CMD] [user@]host [-- <ssh args>]
+noissh [--ssh] [--port N] [--server-cmd CMD] [-L SPEC] [-R SPEC] [user@]host [-- <ssh args>]
   --ssh           bootstrap the server over SSH
   --port N        UDP port for direct connection (default 51820)
   --server-cmd C  remote server command for --ssh (default "noisshd")
+  -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
+  -R RPORT:HOST:PORT   remote forward (repeatable); implies forward-only
   -- <args>       pass remaining args to ssh (only with --ssh)
 ```
+
+Port forwarding rides the same resilient session. `-R` listeners bind to
+loopback on the server (forwarded ports are not exposed to the network).
 
 ### `noisshd`
 

@@ -41,6 +41,20 @@ Remote server command used with
 (default
 .IR noisshd ).
 .TP
+.BI \-L " LPORT:HOST:PORT"
+Local port forward: connections to
+.IR 127.0.0.1:LPORT
+on this machine are tunnelled, over the resilient session, to
+.IR HOST:PORT
+reachable from the server. May be repeated. Implies forward\-only (no shell).
+.TP
+.BI \-R " RPORT:HOST:PORT"
+Remote port forward: the server listens on
+.IR 127.0.0.1:RPORT
+and tunnels accepted connections back to this client for delivery to
+.IR HOST:PORT .
+May be repeated. Implies forward\-only (no shell).
+.TP
 .BI \-\- " ssh args"
 With
 .BR \-\-ssh ,
