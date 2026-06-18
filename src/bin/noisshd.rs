@@ -34,6 +34,7 @@ struct Args {
     authorized_keys: Option<String>,
     authorize: Option<String>,
     command: Option<Vec<String>>,
+    verbose: bool,
 }
 
 fn parse_args() -> Args {
@@ -45,11 +46,13 @@ fn parse_args() -> Args {
         authorized_keys: None,
         authorize: None,
         command: None,
+        verbose: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--one-shot" => a.one_shot = true,
+            "-v" | "--verbose" => a.verbose = true,
             "--listen" => a.listen = it.next(),
             "--bind" => a.bind = it.next(),
             "--key" => a.key = it.next(),
@@ -105,8 +108,34 @@ fn run_standalone(args: Args) -> Result<(), RuntimeError> {
         server.local_addr()?,
         STANDARD.encode(&keypair.public)
     );
-    server.run();
+    if args.verbose {
+        serve_verbose(&mut server);
+    } else {
+        server.run();
+    }
     Ok(())
+}
+
+/// Standalone serve loop with session-lifecycle logging (`-v`). Logs whenever
+/// the active-session count changes and on a fatal socket error.
+fn serve_verbose(server: &mut Server) {
+    let mut active = server.core().session_count();
+    eprintln!("noisshd: verbose logging enabled");
+    loop {
+        if !server.poll_once() {
+            eprintln!("noisshd: fatal socket error; stopping");
+            break;
+        }
+        let now = server.core().session_count();
+        if now != active {
+            if now > active {
+                eprintln!("noisshd: session established ({now} active)");
+            } else {
+                eprintln!("noisshd: session ended ({now} active)");
+            }
+            active = now;
+        }
+    }
 }
 
 fn run_one_shot(args: Args) -> Result<(), RuntimeError> {

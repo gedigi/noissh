@@ -1,0 +1,65 @@
+.TH NOISSH-KEYGEN 1 "2026-06-19" "noissh 0.4.0" "User Commands"
+.SH NAME
+noissh\-keygen \- ensure a noissh static keypair exists and print its public key
+.SH SYNOPSIS
+.B noissh\-keygen
+.RB [ \-\-key
+.IR PATH ]
+.br
+.B noissh\-keygen \-\-help
+.SH DESCRIPTION
+.B noissh\-keygen
+ensures a long\-term static keypair exists for noissh and prints its public key
+line. If the key file is missing it is created (with
+.B 0600
+permissions); if it already exists, its public key is printed without
+regenerating, so the command is safe to run repeatedly.
+.PP
+The printed line has the form
+.RS
+.B noissh\-x25519
+.I <base64-public-key>
+.RE
+.PP
+Paste that line into a server's
+.I authorized_keys
+file to authorize this identity. The keypair is the same one the
+.BR noissh (1)
+client generates on first use, so running this is only necessary when you want
+to print or pre\-create the key (for example, to authorize yourself on a server
+before your first connection).
+.SH OPTIONS
+.TP
+.BI \-\-key " PATH"
+Use the keypair at
+.IR PATH
+instead of the default
+.RI ( <config>/id ,
+where
+.I <config>
+is
+.I ~/.config/noissh
+unless overridden by the platform's config directory).
+.TP
+.B \-\-help
+Print usage and exit.
+.SH FILES
+.TP
+.I ~/.config/noissh/id
+Default static keypair (private key; created
+.BR 0600 ).
+.SH EXIT STATUS
+.TP
+.B 0
+The key was printed successfully.
+.TP
+.B 1
+An error occurred (for example, the key file could not be read or created).
+.TP
+.B 2
+Invalid command\-line arguments.
+.SH SEE ALSO
+.BR noissh (1),
+.BR noisshd (1)
+.SH AUTHORS
+The noissh authors. https://github.com/gedigi/noissh
