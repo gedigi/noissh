@@ -73,8 +73,13 @@ pub fn bootstrap(
 
     let output = cmd.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Use the LAST matching line: the server prints the connect line as the very
+    // last thing it does (after any SSH banner / MOTD), so this prevents a
+    // server-controlled banner from injecting a forged connect line earlier in
+    // the stream.
     let (port, server_pubkey) = stdout
         .lines()
+        .rev()
         .find_map(parse_connect_line)
         .ok_or(RuntimeError::SshBootstrap)?;
 
@@ -91,35 +96,43 @@ pub fn bootstrap(
     })
 }
 
-/// Detach from the controlling SSH session: fork, `setsid`, redirect stdio to
-/// `/dev/null`. The parent exits so `ssh` returns; the child keeps serving.
+/// Detach from the controlling SSH session via a double fork: after `setsid`
+/// the first child is a session leader (and could reacquire a controlling
+/// terminal when it later opens a PTY); a second fork yields a process that is
+/// not a session leader, the standard daemon pattern. The original and the
+/// intermediate parent exit so `ssh` returns; the grandchild keeps serving.
 /// Call AFTER the connect line has been printed and flushed.
 pub fn daemonize() -> Result<(), RuntimeError> {
     use nix::unistd::{ForkResult, close, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
+    // First fork + setsid: detach from the controlling terminal.
     match unsafe { fork() }.map_err(errno)? {
         ForkResult::Parent { .. } => std::process::exit(0),
-        ForkResult::Child => {
-            setsid().map_err(errno)?;
-            // Redirect stdio to /dev/null so the SSH pipe is fully released.
-            if let Ok(devnull) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/null")
-            {
-                let _ = dup2_stdin(&devnull);
-                let _ = dup2_stdout(&devnull);
-                let _ = dup2_stderr(&devnull);
-                use std::os::fd::IntoRawFd;
-                let raw = devnull.into_raw_fd();
-                if raw > 2 {
-                    use std::os::fd::FromRawFd;
-                    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-                    let _ = close(owned);
-                }
-            }
-            Ok(())
+        ForkResult::Child => {}
+    }
+    setsid().map_err(errno)?;
+    // Second fork: ensure we are not a session leader.
+    match unsafe { fork() }.map_err(errno)? {
+        ForkResult::Parent { .. } => std::process::exit(0),
+        ForkResult::Child => {}
+    }
+    // Redirect stdio to /dev/null so the SSH pipe is fully released.
+    if let Ok(devnull) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
+        let _ = dup2_stdin(&devnull);
+        let _ = dup2_stdout(&devnull);
+        let _ = dup2_stderr(&devnull);
+        use std::os::fd::IntoRawFd;
+        let raw = devnull.into_raw_fd();
+        if raw > 2 {
+            use std::os::fd::FromRawFd;
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            let _ = close(owned);
         }
     }
+    Ok(())
 }
 
 fn errno(e: nix::errno::Errno) -> RuntimeError {

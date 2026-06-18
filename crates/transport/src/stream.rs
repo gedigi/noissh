@@ -137,6 +137,7 @@ struct StreamState {
     recv: Reassembler,
     recv_window: u32,
     peer_fin: HalfState,
+    close_received: bool, // a StreamClose has been surfaced as an event
     reset: bool,
 }
 
@@ -158,8 +159,17 @@ impl StreamState {
             recv: Reassembler::default(),
             recv_window: DEFAULT_WINDOW,
             peer_fin: HalfState::Open,
+            close_received: false,
             reset: false,
         }
+    }
+
+    /// Both directions are closed and all received data has been read.
+    fn fully_done(&self) -> bool {
+        self.send_fin
+            && self.fin_acked
+            && matches!(self.peer_fin, HalfState::Finished(at)
+                if self.recv.delivered >= at && self.recv.unread() == 0)
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -174,7 +184,9 @@ impl StreamState {
             self.send_buf.drain(0..advance);
             self.send_base += advance as u64;
         }
-        if self.send_fin && ack > self.send_next {
+        // The receiver acks up to the data end; once it covers all our bytes,
+        // our FIN is acknowledged (there is no extra FIN byte in the sequence).
+        if self.send_fin && ack >= self.send_next {
             self.fin_acked = true;
         }
     }
@@ -219,14 +231,20 @@ impl StreamState {
             });
             self.fin_sent = true;
         }
-        // Always advertise our current receive window via an ack.
-        self.recv_window = DEFAULT_WINDOW.saturating_sub(self.recv.unread() as u32);
+        // Always advertise our current receive window via an ack (saturating
+        // cast guards against a misbehaving peer pushing past 4 GiB unread).
+        let unread = self.recv.unread().min(DEFAULT_WINDOW as u64) as u32;
+        self.recv_window = DEFAULT_WINDOW.saturating_sub(unread);
         out.push(Frame::StreamAck {
             id: self.id,
             ack: self.recv.ack_point(),
             window: self.recv_window,
         });
-        if let Some(status) = self.close_status {
+        // Retransmit the graceful close until the peer has acked all our data;
+        // then stop (no perpetual StreamClose on a settled stream).
+        if let Some(status) = self.close_status
+            && !self.fin_acked
+        {
             out.push(Frame::StreamClose {
                 id: self.id,
                 status,
@@ -350,7 +368,12 @@ impl StreamMux {
                         HalfState::Finished(at) => HalfState::Finished(at),
                         HalfState::Open => HalfState::Finished(s.recv.ack_point()),
                     };
-                    self.events.push(StreamEvent::Closed { id, status });
+                    // Surface Closed only once, even though the close frame is
+                    // retransmitted until acked.
+                    if !s.close_received {
+                        s.close_received = true;
+                        self.events.push(StreamEvent::Closed { id, status });
+                    }
                 }
             }
             Frame::StreamReset { id } => {
@@ -366,16 +389,20 @@ impl StreamMux {
     /// Collect all frames that should be sent now.
     pub fn poll_transmit(&mut self) -> Vec<Frame> {
         let mut out = Vec::new();
-        let mut reset_ids = Vec::new();
+        let mut retire_ids = Vec::new();
         for (id, s) in self.streams.iter_mut() {
             if s.reset {
                 out.push(Frame::StreamReset { id: *id });
-                reset_ids.push(*id);
+                retire_ids.push(*id);
                 continue;
             }
             s.transmit(&mut out);
+            // Reclaim streams that are fully closed in both directions.
+            if s.fully_done() {
+                retire_ids.push(*id);
+            }
         }
-        for id in reset_ids {
+        for id in retire_ids {
             self.streams.remove(&id);
         }
         out
@@ -511,6 +538,46 @@ mod tests {
                 .any(|e| matches!(e, StreamEvent::Closed { status: 42, .. }))
         );
         assert!(server.is_recv_finished(id));
+    }
+
+    #[test]
+    fn fully_closed_stream_is_reclaimed_and_quiescent() {
+        // Close BOTH directions; after draining, the mux must reclaim the stream
+        // and stop emitting frames (no perpetual StreamClose/StreamAck), and the
+        // Closed event must be surfaced exactly once despite retransmission.
+        let mut client = StreamMux::new(true);
+        let mut server = StreamMux::new(false);
+        let id = client.open(StreamKind::Session, vec![]);
+        client.write(id, b"hi");
+        client.close(id, 0);
+        // Drive a few rounds so the server learns the stream, then it closes back
+        // on the same id.
+        pump(&mut client, &mut server, 4, |_| false);
+        let _ = drain(&mut server, id);
+        server.write(id, b"ok");
+        server.close(id, 0);
+        pump(&mut client, &mut server, 10, |_| false);
+        let _ = drain(&mut client, id);
+        let _ = drain(&mut server, id);
+        pump(&mut client, &mut server, 10, |_| false);
+
+        // Closed surfaced at most once per side.
+        let cev = client
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e, StreamEvent::Closed { .. }))
+            .count();
+        assert!(cev <= 1, "Closed emitted {cev} times");
+
+        // Steady state: nothing left to transmit on either side.
+        assert!(
+            client.poll_transmit().is_empty(),
+            "client still chattering on a closed stream"
+        );
+        assert!(
+            server.poll_transmit().is_empty(),
+            "server still chattering on a closed stream"
+        );
     }
 
     #[test]

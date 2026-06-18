@@ -8,10 +8,14 @@
 use wire::Frame;
 
 /// Client side: buffers typed bytes and produces retransmittable Input frames.
+///
+/// `buffer` holds only the unacknowledged suffix `[base, total)`; acknowledged
+/// bytes are drained so memory stays proportional to the in-flight window, not
+/// to everything ever typed.
 #[derive(Default)]
 pub struct InputSender {
     buffer: Vec<u8>,
-    acked: u64,
+    base: u64, // absolute offset of buffer[0] == bytes acknowledged so far
 }
 
 impl InputSender {
@@ -27,25 +31,28 @@ impl InputSender {
     /// The frame to (re)send: everything not yet acknowledged. `None` if all
     /// sent data is acknowledged.
     pub fn pending(&self) -> Option<Frame> {
-        let acked = self.acked as usize;
-        if acked >= self.buffer.len() {
+        if self.buffer.is_empty() {
             return None;
         }
         Some(Frame::Input {
-            offset: self.acked,
-            data: self.buffer[acked..].to_vec(),
+            offset: self.base,
+            data: self.buffer.clone(),
         })
     }
 
-    /// Total bytes the client has queued.
+    /// Total bytes the client has queued (absolute).
     pub fn total(&self) -> u64 {
-        self.buffer.len() as u64
+        self.base + self.buffer.len() as u64
     }
 
     /// Process a server ack confirming bytes up to `seq` are received.
     pub fn on_ack(&mut self, seq: u64) {
-        if seq > self.acked {
-            self.acked = seq.min(self.buffer.len() as u64);
+        let total = self.total();
+        let new_base = seq.min(total);
+        if new_base > self.base {
+            let drain = (new_base - self.base) as usize;
+            self.buffer.drain(0..drain);
+            self.base = new_base;
         }
     }
 }
@@ -155,6 +162,21 @@ mod tests {
         // Now the retransmitted full suffix delivers the rest.
         assert_eq!(r.ingest(0, b"abcxyz"), b"xyz");
         assert_eq!(r.ack(), 6);
+    }
+
+    #[test]
+    fn acked_bytes_are_drained_offset_advances() {
+        let mut s = InputSender::new();
+        s.push(b"hello");
+        s.on_ack(5); // all acked -> buffer drained
+        assert!(s.pending().is_none());
+        assert_eq!(s.total(), 5);
+        // Newly typed bytes are sent from the advanced offset, not from 0.
+        s.push(b"world");
+        let (off, data) = input_parts(&s.pending().unwrap());
+        assert_eq!(off, 5);
+        assert_eq!(data, b"world");
+        assert_eq!(s.total(), 10);
     }
 
     #[test]

@@ -254,7 +254,12 @@ pub(crate) fn spawn_with(
                 if slave_raw > 2 {
                     libc::close(slave_raw);
                 }
-                libc::close(master_raw);
+                // Guard against master_raw being a std stream (0/1/2): those were
+                // just reassigned to the slave by dup2 above, so closing them
+                // would close the slave-backed stdio.
+                if master_raw > 2 {
+                    libc::close(master_raw);
+                }
             }
             // Privilege drop / PAM credential hook.
             if pre_exec().is_err() {
@@ -296,20 +301,47 @@ fn resolve_program(prog: &str) -> Result<CString, PtyError> {
     cstr(prog) // let execve fail -> _exit(127) if not found
 }
 
-/// Drop privileges to `user`: setgid, initgroups, then setuid (in that order).
-/// Only meaningful when running as root. Linux-only (uses `initgroups`).
+/// Resolved target-user credentials, computed in the parent BEFORE fork so the
+/// post-fork child needs no heap allocation or NSS lookup (`getpwnam` and
+/// `CString::new` are not async-signal-safe and can deadlock a multi-threaded
+/// process after fork). Linux-only (uses `initgroups`).
 #[cfg(target_os = "linux")]
-pub(crate) fn drop_privileges(name: &str) -> Result<(), nix::errno::Errno> {
-    use nix::unistd::{User, initgroups, setgid, setuid};
-    let user = match User::from_name(name) {
-        Ok(Some(u)) => u,
-        _ => return Err(nix::errno::Errno::ENOENT),
-    };
-    let cname = CString::new(name).map_err(|_| nix::errno::Errno::EINVAL)?;
-    setgid(user.gid)?;
-    initgroups(&cname, user.gid)?;
-    setuid(user.uid)?;
-    Ok(())
+pub(crate) struct Credentials {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    name: CString,
+}
+
+#[cfg(target_os = "linux")]
+impl Credentials {
+    /// Resolve `name` to numeric uid/gid + a C name string (heap work happens
+    /// here, in the parent, before fork).
+    pub(crate) fn resolve(name: &str) -> Result<Self, PtyError> {
+        use nix::unistd::User;
+        let user = User::from_name(name)?.ok_or_else(|| PtyError::UnknownUser(name.to_string()))?;
+        Ok(Credentials {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            name: cstr(name)?,
+        })
+    }
+
+    /// Apply the privilege drop in the child: setgid, initgroups, then setuid
+    /// (that order matters). Uses only async-signal-safe raw libc calls.
+    pub(crate) fn apply(&self) -> Result<(), nix::errno::Errno> {
+        unsafe {
+            if libc::setgid(self.gid) < 0 {
+                return Err(nix::errno::Errno::last());
+            }
+            if libc::initgroups(self.name.as_ptr(), self.gid) < 0 {
+                return Err(nix::errno::Errno::last());
+            }
+            if libc::setuid(self.uid) < 0 {
+                return Err(nix::errno::Errno::last());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

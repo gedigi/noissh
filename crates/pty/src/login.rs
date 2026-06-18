@@ -51,11 +51,10 @@ impl LoginSession for PrivsepLogin {
         #[cfg(not(feature = "pam"))]
         let _ = &self.service;
 
-        let user_for_child = user.clone();
-        let handle = spawn_with(req, move || {
-            // Child: drop privileges to the target user before exec.
-            crate::drop_privileges(&user_for_child)
-        })?;
+        // Resolve credentials in the parent (heap/NSS work) so the post-fork
+        // child uses only async-signal-safe raw libc calls.
+        let creds = crate::Credentials::resolve(&user)?;
+        let handle = spawn_with(req, move || creds.apply())?;
 
         #[cfg(feature = "pam")]
         _session.leak();

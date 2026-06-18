@@ -180,6 +180,9 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
 fn set_nonblocking(fd: i32) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return; // could not query flags; leave the fd as-is
+        }
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 }

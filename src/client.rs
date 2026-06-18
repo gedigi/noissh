@@ -30,8 +30,13 @@ pub struct ClientCore {
     exited: Option<i32>,
     pending_control: Vec<Frame>,
     open_shell_pending: bool,
+    open_shell_ticks: u32,
     known_hosts_dirty: bool,
 }
+
+/// Bound on OpenShell retransmissions, so a shell that produces no screen output
+/// does not cause the request to be resent for the whole session.
+const OPEN_SHELL_MAX_TICKS: u32 = 300;
 
 impl ClientCore {
     /// Begin a connection. Returns the core and the first handshake packet.
@@ -61,6 +66,7 @@ impl ClientCore {
             exited: None,
             pending_control: Vec::new(),
             open_shell_pending: false,
+            open_shell_ticks: 0,
             known_hosts_dirty: false,
         };
         Ok((core, first))
@@ -200,6 +206,10 @@ impl ClientCore {
                 }
                 .encode(),
             });
+            self.open_shell_ticks += 1;
+            if self.open_shell_ticks >= OPEN_SHELL_MAX_TICKS {
+                self.open_shell_pending = false;
+            }
         }
         frames.append(&mut self.pending_control);
         frames.extend(self.shell.poll_frames());

@@ -21,8 +21,20 @@ struct ServerSession {
     pty: Option<PtyHandle>,
     rows: u16,
     cols: u16,
-    exit_sent: bool,
+    /// Set once the shell has exited; carries its status for retransmission.
+    exit_status: Option<i32>,
+    /// Ticks elapsed since exit, used to bound Exit retransmission before the
+    /// session is reclaimed.
+    exit_ticks: u32,
 }
+
+/// How many ticks to keep retransmitting the Exit notice before reclaiming a
+/// finished session (the notice is best-effort; this bounds delivery + memory).
+const EXIT_RETRANSMIT_TICKS: u32 = 50;
+
+/// Cap on simultaneously in-flight (incomplete) handshakes, bounding memory
+/// against a flood of fresh session-ids from a spoofed source.
+const MAX_PENDING_HANDSHAKES: usize = 512;
 
 /// Per-session, socket-free server logic. Consumes raw packets and returns raw
 /// packets to send, so it can be driven directly by an in-memory shim.
@@ -67,7 +79,7 @@ impl ServerCore {
     /// One-shot lifecycle: true once a session existed and all sessions have
     /// since reported their shell's exit.
     pub fn all_done(&self) -> bool {
-        self.ever_active && self.sessions.values().all(|s| s.exit_sent)
+        self.ever_active && self.sessions.values().all(|s| s.exit_status.is_some())
     }
 
     /// Use the portable local-login backend running the current user's shell.
@@ -118,7 +130,14 @@ impl ServerCore {
         }
         let hs = match self.pending.remove(&sid) {
             Some(hs) => hs,
-            None => Handshaker::server(&self.keypair.private, sid)?,
+            None => {
+                // New handshake: refuse if we're already tracking too many, to
+                // bound memory against a session-id flood.
+                if self.pending.len() >= MAX_PENDING_HANDSHAKES {
+                    return Ok(Vec::new());
+                }
+                Handshaker::server(&self.keypair.private, sid)?
+            }
         };
         let mut hs = hs;
         let outcome = hs.read(body)?;
@@ -141,7 +160,8 @@ impl ServerCore {
                     pty: None,
                     rows: 24,
                     cols: 80,
-                    exit_sent: false,
+                    exit_status: None,
+                    exit_ticks: 0,
                 },
             );
             self.ever_active = true;
@@ -279,27 +299,33 @@ impl ServerCore {
             {
                 out.push((addr, pkt));
             }
-            // Has the child exited? Notify once, then retire the session.
-            if let Some(pty) = &mut sess.pty
+            // Detect child exit: record the status and release the PTY.
+            if sess.exit_status.is_none()
+                && let Some(pty) = &mut sess.pty
                 && let Ok(Some(status)) = pty.try_wait()
-                && !sess.exit_sent
             {
-                sess.exit_sent = true;
-                let ctrl = ControlMsg::Exit { status }.encode();
+                sess.exit_status = Some(status);
+                sess.pty = None;
+            }
+            // While exited, retransmit the Exit notice for a bounded number of
+            // ticks, then reclaim the session.
+            if let Some(status) = sess.exit_status {
                 if let Some(addr) = sess.session.peer_addr()
-                    && let Ok(pkt) = sess.session.seal(&[Frame::Control { data: ctrl }])
+                    && let Ok(pkt) = sess.session.seal(&[Frame::Control {
+                        data: ControlMsg::Exit { status }.encode(),
+                    }])
                 {
                     out.push((addr, pkt));
                 }
-                finished.push(sid);
+                sess.exit_ticks += 1;
+                if sess.exit_ticks >= EXIT_RETRANSMIT_TICKS {
+                    finished.push(sid);
+                }
             }
         }
-        // Give the exit notice a couple of ticks to flush before retiring; here
-        // we keep the session until the next tick by deferring removal one round.
+        // Reclaim fully-finished sessions so memory does not grow without bound.
         for sid in finished {
-            if let Some(sess) = self.sessions.get_mut(&sid) {
-                sess.pty = None;
-            }
+            self.sessions.remove(&sid);
         }
         out
     }

@@ -78,12 +78,18 @@ impl Predictor {
         }
     }
 
-    fn advance_cursor(&mut self) {
+    /// Advance the predicted cursor one cell; returns false if it is already at
+    /// the last cell of the last row and cannot advance.
+    fn advance_cursor(&mut self) -> bool {
         let (r, c) = self.cursor;
         if c + 1 < self.base.cols {
             self.cursor = (r, c + 1);
+            true
         } else if r + 1 < self.base.rows {
             self.cursor = (r + 1, 0);
+            true
+        } else {
+            false
         }
     }
 
@@ -92,14 +98,19 @@ impl Predictor {
         for &b in bytes {
             match b {
                 0x20..=0x7e => {
-                    // Printable ASCII: predict an echo at the cursor.
+                    // Printable ASCII: predict an echo at the cursor — but not
+                    // when the screen is full (cursor stuck at the bottom-right
+                    // corner), which would stack predictions on one cell.
                     let (row, col) = self.cursor;
-                    self.preds.push(Prediction {
-                        row,
-                        col,
-                        ch: b as char,
-                    });
-                    self.advance_cursor();
+                    let at_end = col + 1 >= self.base.cols && row + 1 >= self.base.rows;
+                    if !at_end {
+                        self.preds.push(Prediction {
+                            row,
+                            col,
+                            ch: b as char,
+                        });
+                        self.advance_cursor();
+                    }
                 }
                 b'\r' | b'\n' => {
                     // Enter: hard to predict the resulting layout; abandon and
@@ -174,10 +185,18 @@ impl Predictor {
             self.confirmed_echo = true;
             self.glitch = false;
         }
-        self.preds = kept;
         self.base = new_base;
+        // Drop predictions that fall outside the (possibly resized) grid so they
+        // cannot accumulate forever, and keep the cursor in bounds.
+        kept.retain(|p| p.row < self.base.rows && p.col < self.base.cols);
+        self.preds = kept;
         if self.preds.is_empty() {
             self.cursor = (self.base.cursor_row, self.base.cursor_col);
+        } else {
+            self.cursor = (
+                self.cursor.0.min(self.base.rows - 1),
+                self.cursor.1.min(self.base.cols - 1),
+            );
         }
     }
 }
@@ -195,6 +214,23 @@ mod tests {
 
     fn has_predicted(g: &Grid) -> bool {
         g.cells.iter().any(|c| c.flags & flags::PREDICTED != 0)
+    }
+
+    #[test]
+    fn resize_smaller_drops_out_of_range_predictions() {
+        // Cursor pushed near the right edge of a 20-col grid.
+        let base = grid(5, 20, &[b' '; 18]);
+        let mut p = Predictor::new(base).with_mode(DisplayMode::Always);
+        p.predict_input(b"ab"); // predictions at cols 18, 19
+        assert_eq!(p.outstanding(), 2);
+        // Server resizes to 10 cols without having echoed the input.
+        p.reconcile(grid(5, 10, b""));
+        // Out-of-range predictions are dropped (no unbounded accumulation), and
+        // the overlay stays in bounds without panicking.
+        assert_eq!(p.outstanding(), 0);
+        let o = p.overlay();
+        assert_eq!(o.cols, 10);
+        assert!(o.cursor_col < 10);
     }
 
     #[test]

@@ -25,6 +25,9 @@ pub fn config_dir() -> PathBuf {
 /// File format: two lines, `private <base64>` and `public <base64>`.
 pub fn load_or_generate_keypair(path: &Path) -> Result<Keypair, RuntimeError> {
     if path.exists() {
+        // Tighten an over-permissive key file before reading it (defends against
+        // a key left group/world-readable by an older version or bad umask).
+        tighten_if_loose(path);
         let contents = fs::read_to_string(path)?;
         let mut private = None;
         let mut public = None;
@@ -54,20 +57,46 @@ pub fn load_or_generate_keypair(path: &Path) -> Result<Keypair, RuntimeError> {
             STANDARD.encode(&kp.private),
             STANDARD.encode(&kp.public)
         );
-        fs::write(path, body)?;
-        set_private_perms(path);
+        write_private(path, body.as_bytes())?;
         Ok(kp)
     }
 }
 
+/// Write a private file, creating it with `0600` atomically so the secret is
+/// never momentarily world-readable (no write-then-chmod window).
 #[cfg(unix)]
-fn set_private_perms(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+fn write_private(path: &Path, body: &[u8]) -> Result<(), RuntimeError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(body)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_perms(_path: &Path) {}
+fn write_private(path: &Path, body: &[u8]) -> Result<(), RuntimeError> {
+    fs::write(path, body)?;
+    Ok(())
+}
+
+/// If `path` is group/other-accessible, restrict it to `0600`.
+#[cfg(unix)]
+fn tighten_if_loose(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_if_loose(_path: &Path) {}
 
 /// Load known_hosts (empty if the file does not exist).
 pub fn load_known_hosts(path: &Path) -> Result<KnownHosts, RuntimeError> {

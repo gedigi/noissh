@@ -18,6 +18,8 @@ pub enum HandshakeError {
     Noise(#[from] NoiseError),
     #[error("handshake already finished")]
     AlreadyFinished,
+    #[error("handshake not finished")]
+    NotFinished,
 }
 
 /// Drives one side of the XX handshake.
@@ -100,8 +102,12 @@ impl Handshaker {
         self.hs.as_ref().and_then(|h| h.remote_static())
     }
 
-    /// Consume into a live transport session anchored at `peer_addr`.
+    /// Consume into a live transport session anchored at `peer_addr`. Errors if
+    /// the handshake has not completed.
     pub fn into_session(self, peer_addr: Option<SocketAddr>) -> Result<Session, HandshakeError> {
+        if !self.finished {
+            return Err(HandshakeError::NotFinished);
+        }
         let hs = self.hs.ok_or(HandshakeError::AlreadyFinished)?;
         let noise = hs.into_transport()?;
         Ok(Session::new(self.session_id, noise, peer_addr))

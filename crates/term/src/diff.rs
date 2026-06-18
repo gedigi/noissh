@@ -21,10 +21,16 @@ pub enum DiffError {
     BadTag(u8),
     #[error("delta dimensions do not match base grid")]
     DimMismatch,
+    #[error("invalid screen dimensions")]
+    BadDimensions,
 }
 
 const TAG_FULL: u8 = 0;
 const TAG_DELTA: u8 = 1;
+
+/// Upper bound on `rows * cols` accepted from a decoded diff, to cap memory and
+/// prevent integer overflow on attacker-controlled dimensions (~1M cells).
+const MAX_CELLS: usize = 1 << 20;
 
 fn put_color(out: &mut Vec<u8>, c: Color) {
     match c {
@@ -126,6 +132,13 @@ pub fn apply_diff(grid: &mut Grid, bytes: &[u8]) -> Result<(), DiffError> {
     let cur_col = get_varint(bytes, &mut pos)? as usize;
     let visible = get_u8(bytes, &mut pos)? != 0;
 
+    // Reject degenerate/oversized dimensions from attacker-controlled bytes:
+    // zero would underflow `rows - 1` below, and an unbounded product would
+    // overflow or force a huge allocation in `Grid::new`.
+    if rows == 0 || cols == 0 || rows.checked_mul(cols).is_none_or(|n| n > MAX_CELLS) {
+        return Err(DiffError::BadDimensions);
+    }
+
     match tag {
         TAG_FULL => {
             if grid.rows != rows || grid.cols != cols {
@@ -211,6 +224,31 @@ mod tests {
         let delta = encode_diff(Some(&base), &target);
         let mut client = Grid::new(6, 10);
         assert_eq!(apply_diff(&mut client, &delta), Err(DiffError::DimMismatch));
+    }
+
+    #[test]
+    fn apply_diff_rejects_zero_dimensions() {
+        // A full snapshot claiming 0 rows/cols must not underflow `rows - 1`.
+        let mut bytes = vec![0u8]; // TAG_FULL
+        super::put_varint(&mut bytes, 0); // rows = 0
+        super::put_varint(&mut bytes, 10); // cols
+        super::put_varint(&mut bytes, 0); // cursor_row
+        super::put_varint(&mut bytes, 0); // cursor_col
+        bytes.push(1); // visible
+        let mut g = Grid::new(5, 10);
+        assert_eq!(apply_diff(&mut g, &bytes), Err(DiffError::BadDimensions));
+    }
+
+    #[test]
+    fn apply_diff_rejects_oversized_dimensions() {
+        let mut bytes = vec![0u8]; // TAG_FULL
+        super::put_varint(&mut bytes, u32::MAX as u64);
+        super::put_varint(&mut bytes, u32::MAX as u64);
+        super::put_varint(&mut bytes, 0);
+        super::put_varint(&mut bytes, 0);
+        bytes.push(1);
+        let mut g = Grid::new(5, 10);
+        assert_eq!(apply_diff(&mut g, &bytes), Err(DiffError::BadDimensions));
     }
 
     #[test]
