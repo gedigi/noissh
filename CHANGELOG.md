@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+### Security
+
+- **Hardened the reliable-stream layer against a malicious/misbehaving peer**:
+  out-of-window or overflowing `StreamData` is dropped (no huge allocation or
+  unbounded buffering), the peer FIN offset is recorded only once, acks for
+  unsent data are ignored, peer stream-id parity is enforced, and concurrent
+  peer-opened streams are capped.
+- **Atomic `known_hosts` writes** (temp + fsync + rename) so a crash mid-write
+  can't destroy the TOFU pin and silently re-enable trust-on-first-use; newly
+  generated private keys are fsynced before use.
+
+### Fixed
+
+- **File transfer is now atomic**: uploads and downloads write to a temporary
+  file and rename into place on success, so a failed or aborted transfer never
+  truncates or partially overwrites an existing destination (notably
+  `--get REMOTE:EXISTING_LOCAL` of a missing remote no longer clobbers the local
+  file).
+- **Forwarded-connection and transfer cleanup on session reap/reattach**: TCP
+  file descriptors and transfer handles are no longer leaked, and an interrupted
+  upload is no longer wrongly finalized as complete.
+- **Lenient `known_hosts` parsing**: a single malformed line is skipped rather
+  than failing the whole file (which previously could lock a user out of every
+  pinned host).
+- Bounded the `--exec` stdin staging buffer; single-quoted the auto-install
+  installer URL.
+
 ## [0.4.0]
 
 ### Added
