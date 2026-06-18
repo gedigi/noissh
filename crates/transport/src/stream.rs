@@ -20,6 +20,13 @@ pub const DEFAULT_WINDOW: u32 = 256 * 1024;
 /// datagram stays within a conservative path MTU (no IP fragmentation).
 pub const MAX_STREAM_CHUNK: usize = 1024;
 
+/// Retransmit timeout, expressed in `poll_transmit` rounds: unacked data is
+/// resent only after this many rounds without an acknowledgement (instead of
+/// every round). At the drivers' active cadence (~tens of ms/round) this is a
+/// few hundred milliseconds — a coarse RTO without a wall clock in this
+/// (deterministic) core.
+const RETX_TICKS: u32 = 16;
+
 /// Events surfaced to the application as frames are processed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -130,11 +137,15 @@ struct StreamState {
     // --- send side ---
     send_buf: Vec<u8>, // bytes from `send_base` onward, not yet acked
     send_base: u64,    // offset of send_buf[0]; everything below is acked
+    send_high: u64,    // highest offset transmitted at least once
     send_next: u64,    // total bytes written by us
     peer_window: u32,  // flow-control limit advertised by peer
     send_fin: bool,    // app closed our send side
-    fin_sent: bool,
+    fin_sent: bool,    // an (empty) FIN has been emitted at least once
     fin_acked: bool,
+    /// `poll_transmit` rounds since the oldest unacked byte was last sent;
+    /// gates retransmission so we don't resend the whole window every poll.
+    idle_retx: u32,
     close_status: Option<i32>,
 
     // --- recv side ---
@@ -161,11 +172,13 @@ impl StreamState {
             needs_open,
             send_buf: Vec::new(),
             send_base: 0,
+            send_high: 0,
             send_next: 0,
             peer_window: DEFAULT_WINDOW,
             send_fin: false,
             fin_sent: false,
             fin_acked: false,
+            idle_retx: 0,
             close_status: None,
             recv: Reassembler::default(),
             recv_window: DEFAULT_WINDOW,
@@ -206,11 +219,32 @@ impl StreamState {
             let advance = (ack - self.send_base).min(self.send_buf.len() as u64) as usize;
             self.send_buf.drain(0..advance);
             self.send_base += advance as u64;
+            self.send_high = self.send_high.max(self.send_base);
+            self.idle_retx = 0; // forward progress resets the retransmit timer
         }
         // The receiver acks up to the data end; once it covers all our bytes,
         // our FIN is acknowledged (there is no extra FIN byte in the sequence).
         if self.send_fin && ack >= self.send_next {
             self.fin_acked = true;
+        }
+    }
+
+    /// Emit `[from, to)` as MTU-sized StreamData chunks, flagging FIN on the
+    /// chunk that reaches `send_next` (while our FIN is still unacked).
+    fn emit_range(&mut self, out: &mut Vec<Frame>, from: u64, to: u64) {
+        let mut off = from;
+        while off < to {
+            let chunk_end = (off + MAX_STREAM_CHUNK as u64).min(to);
+            let lo = (off - self.send_base) as usize;
+            let hi = (chunk_end - self.send_base) as usize;
+            let fin = self.send_fin && chunk_end == self.send_next && !self.fin_acked;
+            out.push(Frame::StreamData {
+                id: self.id,
+                offset: off,
+                data: self.send_buf[lo..hi].to_vec(),
+                fin,
+            });
+            off = chunk_end;
         }
     }
 
@@ -227,38 +261,38 @@ impl StreamState {
             });
             self.needs_open = false;
         }
-        // Retransmit all unacked data within the flow window, split into
-        // MTU-safe chunks so a single StreamData frame never produces an
-        // oversized UDP datagram.
+        // Send new data immediately; retransmit unacked data only after a
+        // retransmit timeout — so we don't resend the whole window every poll.
+        // Everything stays within the peer's advertised flow-control window and
+        // is split into MTU-safe chunks by `emit_range`.
         let in_flight_cap = self.send_base + self.peer_window as u64;
-        if !self.send_buf.is_empty() {
-            let send_end = self.send_next.min(in_flight_cap);
-            let mut off = self.send_base;
-            while off < send_end {
-                let chunk_end = (off + MAX_STREAM_CHUNK as u64).min(send_end);
-                let lo = (off - self.send_base) as usize;
-                let hi = (chunk_end - self.send_base) as usize;
-                let fin = self.send_fin && chunk_end == self.send_next && !self.fin_sent;
+        let send_end = self.send_next.min(in_flight_cap);
+        if self.send_high < send_end {
+            // Never-sent data: send it now.
+            let from = self.send_high.max(self.send_base);
+            self.emit_range(out, from, send_end);
+            self.send_high = send_end;
+            self.idle_retx = 0;
+        } else if self.send_base < self.send_high {
+            // Outstanding unacked data: retransmit after the RTO.
+            self.idle_retx = self.idle_retx.saturating_add(1);
+            if self.idle_retx >= RETX_TICKS {
+                self.emit_range(out, self.send_base, self.send_high);
+                self.idle_retx = 0;
+            }
+        } else if self.send_fin && !self.fin_acked && self.send_next == self.send_base {
+            // Zero-byte stream closed: (re)send an empty FIN promptly, then on RTO.
+            self.idle_retx = self.idle_retx.saturating_add(1);
+            if !self.fin_sent || self.idle_retx >= RETX_TICKS {
                 out.push(Frame::StreamData {
                     id: self.id,
-                    offset: off,
-                    data: self.send_buf[lo..hi].to_vec(),
-                    fin,
+                    offset: self.send_next,
+                    data: Vec::new(),
+                    fin: true,
                 });
-                if fin {
-                    self.fin_sent = true;
-                }
-                off = chunk_end;
+                self.fin_sent = true;
+                self.idle_retx = 0;
             }
-        } else if self.send_fin && !self.fin_sent {
-            // Empty FIN (no payload).
-            out.push(Frame::StreamData {
-                id: self.id,
-                offset: self.send_next,
-                data: Vec::new(),
-                fin: true,
-            });
-            self.fin_sent = true;
         }
         // Always advertise our current receive window via an ack (saturating
         // cast guards against a misbehaving peer pushing past 4 GiB unread).
@@ -648,6 +682,37 @@ mod tests {
             a.poll_transmit().is_empty(),
             "stream leaked: still transmitting after close grace window"
         );
+    }
+
+    #[test]
+    fn unacked_data_is_not_retransmitted_every_poll() {
+        // After sending new data once, an un-acked stream must NOT resend it on
+        // every poll — only after the retransmit timeout (RETX_TICKS rounds).
+        let mut a = StreamMux::new(true);
+        let id = a.open(StreamKind::Forward, vec![]);
+        a.write(id, b"hello world");
+
+        let count_data = |frames: &[Frame]| {
+            frames
+                .iter()
+                .filter(|f| matches!(f, Frame::StreamData { data, .. } if !data.is_empty()))
+                .count()
+        };
+
+        // First poll sends the data.
+        assert_eq!(count_data(&a.poll_transmit()), 1);
+        // The next RETX_TICKS-1 polls send NO data (no spurious retransmits).
+        let mut retx = 0;
+        for _ in 0..(RETX_TICKS - 1) {
+            retx += count_data(&a.poll_transmit());
+        }
+        assert_eq!(retx, 0, "data was retransmitted before the RTO elapsed");
+        // By a couple of polls past the RTO, a retransmit has occurred.
+        let mut after = 0;
+        for _ in 0..2 {
+            after += count_data(&a.poll_transmit());
+        }
+        assert!(after >= 1, "data was never retransmitted after the RTO");
     }
 
     #[test]
