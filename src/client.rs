@@ -333,9 +333,9 @@ impl ClientCore {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
-        let pkt = session.seal(&frames)?;
+        let pkts = session.seal_many(&frames, transport::MAX_DATAGRAM_PLAINTEXT)?;
         self.need_ack = false; // only clear once the ack is actually sealed
-        Ok(vec![pkt])
+        Ok(pkts)
     }
 }
 

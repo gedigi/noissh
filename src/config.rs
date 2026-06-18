@@ -125,6 +125,63 @@ pub fn load_authorized_keys(path: &Path) -> Result<AuthorizedKeys, RuntimeError>
     }
 }
 
+/// Path to the optional config file (`<config_dir>/config`).
+pub fn config_file_path() -> PathBuf {
+    config_dir().join("config")
+}
+
+/// Parsed config-file settings. All fields are optional so callers can fall
+/// back to their own defaults; the file itself is optional too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Config {
+    /// Default UDP port for direct connections.
+    pub port: Option<u16>,
+    /// `$TERM` value to advertise to the remote shell.
+    pub term: Option<String>,
+}
+
+/// Parse a simple config file. The format is one setting per line as either
+/// `key = value` or `key value`. Blank lines and lines beginning with `#`
+/// (after optional leading whitespace) are ignored. Unknown keys and lines
+/// that fail to parse are ignored, so a malformed file never aborts startup.
+///
+/// A missing file returns [`Config::default`].
+pub fn load_config(path: &Path) -> Config {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Config::default(),
+    };
+    let mut cfg = Config::default();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Accept either `key = value` or `key value`. Split on the first `=`
+        // if present, otherwise on the first run of whitespace.
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => match line.split_once(char::is_whitespace) {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => continue, // a bare key with no value: nothing to set
+            },
+        };
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "port" => {
+                if let Ok(p) = value.parse::<u16>() {
+                    cfg.port = Some(p);
+                }
+            }
+            "term" => cfg.term = Some(value.to_string()),
+            _ => {} // unknown key: ignore
+        }
+    }
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +197,62 @@ mod tests {
         assert_eq!(k1.private, k2.private);
         assert_eq!(k1.public, k2.public);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn write_temp_config(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "noissh-config-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn config_parses_valid_lines_both_separators() {
+        let path = write_temp_config("valid", "port = 2222\nterm xterm-256color\n");
+        let cfg = load_config(&path);
+        assert_eq!(cfg.port, Some(2222));
+        assert_eq!(cfg.term.as_deref(), Some("xterm-256color"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_ignores_comments_and_blank_lines() {
+        let body = "# a comment\n\n   \n  # indented comment\nport=51820\n";
+        let path = write_temp_config("comments", body);
+        let cfg = load_config(&path);
+        assert_eq!(cfg.port, Some(51820));
+        assert_eq!(cfg.term, None);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_missing_file_returns_default() {
+        let path = std::env::temp_dir().join("noissh-config-test-does-not-exist-xyz/config");
+        let cfg = load_config(&path);
+        assert_eq!(cfg, Config::default());
+        assert_eq!(cfg.port, None);
+        assert_eq!(cfg.term, None);
+    }
+
+    #[test]
+    fn config_ignores_bad_and_unknown_lines() {
+        // Bad port value, unknown key, bare key with no value, and a junk line
+        // are all skipped; the one valid line still takes effect.
+        let body = "port = not-a-number\nunknown = whatever\nbareword\n=novalue\nterm = vt100\n";
+        let path = write_temp_config("bad", body);
+        let cfg = load_config(&path);
+        assert_eq!(cfg.port, None); // bad value ignored, no default applied here
+        assert_eq!(cfg.term.as_deref(), Some("vt100"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_file_path_is_under_config_dir() {
+        assert_eq!(config_file_path(), config_dir().join("config"));
     }
 }

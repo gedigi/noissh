@@ -284,7 +284,12 @@ impl ServerCore {
             && let Some(sess) = self.sessions.get_mut(&sid)
             && let Some(addr) = sess.session.peer_addr()
         {
-            out.push((addr, sess.session.seal(&reply_frames)?));
+            for pkt in sess
+                .session
+                .seal_many(&reply_frames, transport::MAX_DATAGRAM_PLAINTEXT)?
+            {
+                out.push((addr, pkt));
+            }
         }
         Ok(out)
     }
@@ -386,9 +391,13 @@ impl ServerCore {
             }
             if !stream_frames.is_empty()
                 && let Some(addr) = sess.session.peer_addr()
-                && let Ok(pkt) = sess.session.seal(&stream_frames)
+                && let Ok(pkts) = sess
+                    .session
+                    .seal_many(&stream_frames, transport::MAX_DATAGRAM_PLAINTEXT)
             {
-                out.push((addr, pkt));
+                for pkt in pkts {
+                    out.push((addr, pkt));
+                }
             }
             // Detect child exit: record the status and release the PTY.
             if sess.exit_status.is_none()

@@ -14,8 +14,11 @@ This guide covers installing, connecting, configuring, and troubleshooting.
   - [SSH bootstrap](#ssh-bootstrap)
   - [Direct connection](#direct-connection)
 - [Running the server](#running-the-server)
+  - [Running noisshd under systemd](#running-noisshd-under-systemd)
 - [Keys & trust](#keys--trust)
+  - [Generating your key with noissh-keygen](#generating-your-key-with-noissh-keygen)
 - [Configuration & file layout](#configuration--file-layout)
+  - [Config file](#config-file)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
 
@@ -106,6 +109,27 @@ You normally do not run this by hand; the client invokes it over SSH:
 noisshd --one-shot --authorize <base64 client pubkey> [--bind 0.0.0.0:0] [--command ...]
 ```
 
+### Running noisshd under systemd
+
+A ready-to-use unit ships in [`contrib/noisshd.service`](../contrib/noisshd.service).
+It runs `noisshd --listen 0.0.0.0:51820` as a dedicated unprivileged user with
+sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, `Restart=on-failure`,
+and friends).
+
+```sh
+cargo build --release
+sudo install -m 0755 target/release/noisshd /usr/local/bin/noisshd
+sudo useradd --system --create-home --shell /bin/bash noissh
+sudo install -m 0644 contrib/noisshd.service /etc/systemd/system/noisshd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now noisshd
+```
+
+The daemon serves the login shell of the user it runs as, so set `User=` to the
+account you intend to expose (never root). See
+[`contrib/README.md`](../contrib/README.md) for full notes plus
+Homebrew/deb packaging placeholders.
+
 ## Keys & trust
 
 - **Your identity (client):** `~/.config/noissh/id` — a static X25519 keypair,
@@ -117,6 +141,27 @@ noisshd --one-shot --authorize <base64 client pubkey> [--bind 0.0.0.0:0] [--comm
 This mirrors SSH's `known_hosts` / `authorized_keys` model, but with Noise static
 keys.
 
+### Generating your key with noissh-keygen
+
+`noissh-keygen` ensures your static keypair exists and prints its public key line
+so you can paste it into a server's `authorized_keys`:
+
+```sh
+noissh-keygen
+# -> noissh-x25519 <base64-public-key>
+```
+
+On first run it creates the keypair (default `~/.config/noissh/id`, stored
+`0600`); on later runs it just prints the existing public key without
+regenerating. Use `--key PATH` for a non-default location, or `--help` for usage:
+
+```sh
+noissh-keygen --key /etc/noissh/id
+```
+
+(The client also generates `id` automatically on first connect; `noissh-keygen`
+just lets you obtain the public key ahead of time.)
+
 ## Configuration & file layout
 
 Files live under `$XDG_CONFIG_HOME/noissh` (or `~/.config/noissh`):
@@ -127,6 +172,27 @@ Files live under `$XDG_CONFIG_HOME/noissh` (or `~/.config/noissh`):
 | `known_hosts` | client | pinned server public keys |
 | `noisshd_key` | server | server static keypair |
 | `authorized_keys` | server | allowed client public keys |
+| `config` | both | optional settings file (see below) |
+
+### Config file
+
+An optional `config` file in the config directory holds simple defaults. Each
+line is a setting written as `key = value` or `key value`. Blank lines and lines
+starting with `#` are ignored, as are unknown keys and malformed lines (so a
+typo never prevents startup). A missing file just means "all defaults".
+
+```
+# ~/.config/noissh/config
+port = 51820
+term = xterm-256color
+```
+
+Recognized keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `port` | number | default UDP port for direct connections |
+| `term` | string | `$TERM` value to advertise to the remote shell |
 
 ## Command reference
 
@@ -158,6 +224,17 @@ noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
   --authorize <b64>    the single client key to trust in one-shot mode
   --bind ADDR          bind address in one-shot mode (default 0.0.0.0:0)
 ```
+
+### `noissh-keygen`
+
+```
+noissh-keygen [--key PATH]
+  --key PATH   keypair file to ensure/print (default <config>/id)
+  --help       print usage
+```
+
+Ensures the keypair exists (creating it `0600` if missing) and prints its public
+key line `noissh-x25519 <base64>` to stdout.
 
 ## Troubleshooting
 

@@ -16,6 +16,10 @@ use wire::{Frame, StreamKind};
 /// Default per-stream receive window (bytes the peer may have in flight).
 pub const DEFAULT_WINDOW: u32 = 256 * 1024;
 
+/// Max payload of a single `StreamData` frame, chosen so the resulting UDP
+/// datagram stays within a conservative path MTU (no IP fragmentation).
+pub const MAX_STREAM_CHUNK: usize = 1024;
+
 /// Events surfaced to the application as frames are processed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -223,22 +227,28 @@ impl StreamState {
             });
             self.needs_open = false;
         }
-        // Retransmit all unacked data within the flow window.
+        // Retransmit all unacked data within the flow window, split into
+        // MTU-safe chunks so a single StreamData frame never produces an
+        // oversized UDP datagram.
         let in_flight_cap = self.send_base + self.peer_window as u64;
         if !self.send_buf.is_empty() {
             let send_end = self.send_next.min(in_flight_cap);
-            if send_end > self.send_base {
-                let len = (send_end - self.send_base) as usize;
-                let fin = self.send_fin && send_end == self.send_next && !self.fin_sent;
+            let mut off = self.send_base;
+            while off < send_end {
+                let chunk_end = (off + MAX_STREAM_CHUNK as u64).min(send_end);
+                let lo = (off - self.send_base) as usize;
+                let hi = (chunk_end - self.send_base) as usize;
+                let fin = self.send_fin && chunk_end == self.send_next && !self.fin_sent;
                 out.push(Frame::StreamData {
                     id: self.id,
-                    offset: self.send_base,
-                    data: self.send_buf[..len].to_vec(),
+                    offset: off,
+                    data: self.send_buf[lo..hi].to_vec(),
                     fin,
                 });
                 if fin {
                     self.fin_sent = true;
                 }
+                off = chunk_end;
             }
         } else if self.send_fin && !self.fin_sent {
             // Empty FIN (no payload).

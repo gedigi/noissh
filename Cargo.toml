@@ -55,6 +55,10 @@ path = "src/bin/noissh.rs"
 name = "noisshd"
 path = "src/bin/noisshd.rs"
 
+[[bin]]
+name = "noissh-keygen"
+path = "src/bin/noissh-keygen.rs"
+
 [dependencies]
 noise-core = { workspace = true }
 wire = { workspace = true }

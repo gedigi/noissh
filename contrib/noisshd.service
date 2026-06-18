@@ -1,0 +1,42 @@
+[Unit]
+Description=noissh server daemon (resilient Noise/UDP remote shell)
+Documentation=https://github.com/gedigi/noissh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated, unprivileged user. noisshd serves the login shell of the
+# user it runs as; do NOT run it as root. Create the user first, e.g.:
+#   sudo useradd --system --create-home --shell /usr/sbin/nologin noissh
+# (or point User= at an existing interactive account you want to expose).
+User=noissh
+Group=noissh
+
+# Adjust the path if noisshd is not installed in /usr/local/bin.
+ExecStart=/usr/local/bin/noisshd --listen 0.0.0.0:51820
+
+Restart=on-failure
+RestartSec=2
+
+# --- Hardening -----------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# Limit to the address families noisshd actually uses (UDP over IPv4/IPv6).
+RestrictAddressFamilies=AF_INET AF_INET6
+# noisshd persists its static key + authorized_keys under the user's config dir;
+# allow writes there even though ProtectSystem=strict makes the rest read-only.
+ReadWritePaths=%h/.config/noissh
+
+[Install]
+WantedBy=multi-user.target

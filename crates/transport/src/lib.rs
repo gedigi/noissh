@@ -29,6 +29,10 @@ pub type SessionId = [u8; 8];
 const PKT_HANDSHAKE: u8 = 0;
 const PKT_TRANSPORT: u8 = 1;
 
+/// Conservative per-datagram plaintext budget for [`Session::seal_many`], chosen
+/// to keep datagrams within a typical path MTU (avoiding IP fragmentation).
+pub const MAX_DATAGRAM_PLAINTEXT: usize = 1200;
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("packet too short")]
@@ -151,6 +155,33 @@ impl Session {
         out.extend_from_slice(&nonce.to_be_bytes());
         out.extend_from_slice(&ct);
         Ok(out)
+    }
+
+    /// Seal `frames` into one or more datagrams, each whose plaintext stays at or
+    /// below `max_plaintext` bytes, so no datagram exceeds a safe UDP/MTU size.
+    /// A single frame larger than `max_plaintext` is sent alone (best effort).
+    pub fn seal_many(
+        &mut self,
+        frames: &[Frame],
+        max_plaintext: usize,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let mut packets = Vec::new();
+        let mut group: Vec<Frame> = Vec::new();
+        let mut group_len = 0usize;
+        for f in frames {
+            let flen = encode_frames(std::slice::from_ref(f)).len();
+            if !group.is_empty() && group_len + flen > max_plaintext {
+                packets.push(self.seal(&group)?);
+                group.clear();
+                group_len = 0;
+            }
+            group.push(f.clone());
+            group_len += flen;
+        }
+        if !group.is_empty() {
+            packets.push(self.seal(&group)?);
+        }
+        Ok(packets)
     }
 
     /// Authenticate and decode an incoming transport packet from `src`.
