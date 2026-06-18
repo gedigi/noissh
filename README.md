@@ -8,12 +8,12 @@ no lost work. noissh gives you that mosh-like resilience with the everyday feel
 of SSH, secured end-to-end by the modern [Noise Protocol](https://noiseprotocol.org/).
 
 ```sh
-# If you can already SSH to a box, you can noissh to it:
+# Once noisshd is installed on the server, connect over your existing SSH access:
 noissh --ssh you@server
 ```
 
-That's it. You get a normal shell — except it shrugs off flaky links and survives
-your laptop going to sleep.
+You get a normal shell — except it shrugs off flaky links and survives your
+laptop going to sleep.
 
 ## Why you'll like it
 
@@ -24,8 +24,9 @@ your laptop going to sleep.
 - **It's secure by design.** Every connection is mutually authenticated and
   encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
   authorized keys can connect.
-- **It's easy to start.** Already have SSH access? One command and you're in — no
-  server setup, no extra keys to copy around.
+- **It's easy to start.** Install `noisshd` on the server once (like mosh needs
+  `mosh-server`), and from then on a single command connects over your existing
+  SSH access — no daemon to keep running, no keys to copy around.
 - **It's safe code.** Written in 100% safe Rust (`#![forbid(unsafe_code)]`),
   thoroughly tested, with zero compiler/linter warnings.
 
