@@ -13,7 +13,8 @@ normal shell, secured end-to-end by the modern
 [Noise Protocol](https://noiseprotocol.org/).
 
 ```sh
-# Once noisshd is installed on the server, connect over your existing SSH access:
+# Connect over your existing SSH access — the server component installs itself
+# automatically on first use if it isn't there yet:
 noissh --ssh you@server
 ```
 
@@ -36,9 +37,9 @@ laptop going to sleep.
 - **It's secure by design.** Every connection is mutually authenticated and
   encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
   authorized keys can connect.
-- **It's easy to start.** Install the server component once, and from then on a
-  single command connects over your existing SSH access — no daemon to keep
-  running, no keys to copy around.
+- **It's easy to start.** A single command connects over your existing SSH
+  access — and installs the server component for you on first use if it's
+  missing. No daemon to keep running, no keys to copy around.
 - **It's safe code.** Written in 100% safe Rust (`#![forbid(unsafe_code)]`),
   thoroughly tested, with zero compiler/linter warnings.
 
@@ -87,8 +88,10 @@ noissh --ssh you@server
 ```
 
 noissh uses your existing SSH access to start the server for you and then runs
-the session over its own resilient, encrypted channel. (The server just needs
-the `noisshd` binary installed.)
+the session over its own resilient, encrypted channel. **If `noisshd` isn't on
+the server yet, the first connect installs it for you** over the same SSH session
+(fetching the matching, checksum-verified release into `~/.local/bin`). Pass
+`--no-install` to opt out.
 
 **Running your own always-on server:**
 

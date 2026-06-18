@@ -50,18 +50,47 @@ pub struct Bootstrap {
     pub server_pubkey: Vec<u8>,
 }
 
-/// Run `ssh <target> <remote_server_cmd> --one-shot --authorize <client_pub>`
-/// and parse the connect line. `remote_server_cmd` is e.g. `["noisshd"]`.
-pub fn bootstrap(
+/// Outcome of a single bootstrap attempt.
+enum Attempt {
+    /// Parsed a connect line; the server is up.
+    Connected(Bootstrap),
+    /// The remote `noisshd` command was not found (likely not installed).
+    NotFound,
+    /// Some other failure (no connect line, but not a missing-command signal).
+    Failed,
+}
+
+/// The `ssh` program, overridable via `$NOISSH_SSH` (tests / custom transports).
+fn ssh_prog() -> String {
+    std::env::var("NOISSH_SSH").unwrap_or_else(|_| "ssh".to_string())
+}
+
+/// Heuristic: did the remote command fail because it isn't installed? `ssh`
+/// exits 127 when the remote command is not found; also match the shell's
+/// "command not found" / "No such file" text as a fallback.
+fn looks_like_missing_command(output: &std::process::Output) -> bool {
+    if output.status.code() == Some(127) {
+        return true;
+    }
+    let mut s = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    s.push_str(&String::from_utf8_lossy(&output.stdout).to_lowercase());
+    s.contains("command not found") || s.contains("not found") || s.contains("no such file")
+}
+
+/// Whether `remote_server_cmd` is the default (unconfigured) `noisshd` — we only
+/// auto-install when the user hasn't pointed us at a custom server command.
+fn is_default_server_cmd(remote_server_cmd: &[String]) -> bool {
+    remote_server_cmd.len() == 1 && remote_server_cmd[0] == "noisshd"
+}
+
+/// Run one bootstrap attempt against `remote_server_cmd`.
+fn attempt(
     target: &str,
     remote_server_cmd: &[String],
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
-) -> Result<Bootstrap, RuntimeError> {
-    // The ssh program is overridable via $NOISSH_SSH (used by tests and for
-    // custom transports).
-    let ssh_prog = std::env::var("NOISSH_SSH").unwrap_or_else(|_| "ssh".to_string());
-    let mut cmd = Command::new(ssh_prog);
+) -> Result<Attempt, RuntimeError> {
+    let mut cmd = Command::new(ssh_prog());
     cmd.args(extra_ssh_args);
     cmd.arg(target);
     for part in remote_server_cmd {
@@ -77,23 +106,97 @@ pub fn bootstrap(
     // last thing it does (after any SSH banner / MOTD), so this prevents a
     // server-controlled banner from injecting a forged connect line earlier in
     // the stream.
-    let (port, server_pubkey) = stdout
-        .lines()
-        .rev()
-        .find_map(parse_connect_line)
-        .ok_or(RuntimeError::SshBootstrap)?;
+    if let Some((port, server_pubkey)) = stdout.lines().rev().find_map(parse_connect_line) {
+        let host = host_of(target);
+        let server_addr = (host, port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or(RuntimeError::SshBootstrap)?;
+        return Ok(Attempt::Connected(Bootstrap {
+            server_addr,
+            server_pubkey,
+        }));
+    }
+    if looks_like_missing_command(&output) {
+        Ok(Attempt::NotFound)
+    } else {
+        Ok(Attempt::Failed)
+    }
+}
 
-    // Resolve the SSH host to a UDP socket address on the negotiated port.
-    let host = host_of(target);
-    let server_addr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or(RuntimeError::SshBootstrap)?;
+/// Install `noisshd` on the remote over SSH by running the published installer
+/// (which detects the remote platform, fetches the matching release binary, and
+/// verifies its checksum). Installs into `~/.local/bin` so the retry can invoke
+/// it by an absolute path regardless of the non-interactive `PATH`. Installer
+/// output streams to the user's terminal.
+fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), RuntimeError> {
+    const INSTALLER: &str = "https://raw.githubusercontent.com/gedigi/noissh/main/install.sh";
+    // One self-contained shell command: prefer curl, fall back to wget, error if
+    // neither is available. `$HOME` is expanded by the remote shell.
+    let remote = format!(
+        "if command -v curl >/dev/null 2>&1; then \
+           curl -fsSL {INSTALLER} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
+         elif command -v wget >/dev/null 2>&1; then \
+           wget -qO- {INSTALLER} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
+         else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi"
+    );
+    let mut cmd = Command::new(ssh_prog());
+    cmd.args(extra_ssh_args);
+    cmd.arg(target);
+    cmd.arg(remote);
+    // Inherit stdio so the user sees the installer's progress.
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(RuntimeError::SshBootstrap)
+    }
+}
 
-    Ok(Bootstrap {
-        server_addr,
-        server_pubkey,
-    })
+/// The remote `noisshd` path to invoke after an auto-install. Overridable via
+/// `$NOISSH_REMOTE_NOISSHD` (tests / custom install locations).
+fn installed_noisshd_cmd() -> Vec<String> {
+    vec![
+        std::env::var("NOISSH_REMOTE_NOISSHD")
+            .unwrap_or_else(|_| "$HOME/.local/bin/noisshd".to_string()),
+    ]
+}
+
+/// Run `ssh <target> <remote_server_cmd> --one-shot --authorize <client_pub>`
+/// and parse the connect line. `remote_server_cmd` is e.g. `["noisshd"]`.
+///
+/// When `auto_install` is set and the remote `noisshd` is missing (and the
+/// server command is the default), install it over SSH and retry once.
+pub fn bootstrap(
+    target: &str,
+    remote_server_cmd: &[String],
+    client_pubkey: &[u8],
+    extra_ssh_args: &[String],
+    auto_install: bool,
+) -> Result<Bootstrap, RuntimeError> {
+    match attempt(target, remote_server_cmd, client_pubkey, extra_ssh_args)? {
+        Attempt::Connected(b) => Ok(b),
+        Attempt::NotFound if auto_install && is_default_server_cmd(remote_server_cmd) => {
+            eprintln!(
+                "noissh: noisshd is not installed on {}; installing it over SSH…",
+                host_of(target)
+            );
+            install_remote(target, extra_ssh_args)?;
+            match attempt(
+                target,
+                &installed_noisshd_cmd(),
+                client_pubkey,
+                extra_ssh_args,
+            )? {
+                Attempt::Connected(b) => {
+                    eprintln!("noissh: noisshd installed; connecting…");
+                    Ok(b)
+                }
+                _ => Err(RuntimeError::SshBootstrap),
+            }
+        }
+        _ => Err(RuntimeError::SshBootstrap),
+    }
 }
 
 /// Detach from the controlling SSH session so the server survives `ssh`
@@ -130,6 +233,17 @@ mod tests {
     fn parse_rejects_wrong_key_length() {
         let line = format!("{CONNECT_PREFIX} 5 {}", STANDARD.encode([1u8; 16]));
         assert!(parse_connect_line(&line).is_none());
+    }
+
+    #[test]
+    fn default_server_cmd_detection() {
+        assert!(is_default_server_cmd(&["noisshd".to_string()]));
+        assert!(!is_default_server_cmd(&["/opt/noisshd".to_string()]));
+        assert!(!is_default_server_cmd(&[
+            "noisshd".to_string(),
+            "--x".to_string()
+        ]));
+        assert!(!is_default_server_cmd(&[]));
     }
 
     #[test]

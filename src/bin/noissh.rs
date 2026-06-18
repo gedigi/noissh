@@ -42,6 +42,8 @@ struct Args {
     transfer: Option<(proto::XferRequest, String)>,
     /// Forward the local SSH agent (`-A`).
     forward_agent: bool,
+    /// Disable auto-installing noisshd on the remote during `--ssh` bootstrap.
+    no_install: bool,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -65,11 +67,13 @@ fn parse_args() -> Args {
         remote_forwards: Vec::new(),
         transfer: None,
         forward_agent: false,
+        no_install: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ssh" => a.ssh = true,
+            "--no-install" => a.no_install = true,
             "-A" | "--forward-agent" => a.forward_agent = true,
             "--port" => {
                 if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
@@ -148,6 +152,7 @@ fn run() -> Result<(), RuntimeError> {
             std::slice::from_ref(&args.server_cmd),
             &keypair.public,
             &args.ssh_args,
+            !args.no_install,
         )?;
         // The server key arrived over the authenticated SSH channel: pin it
         // directly under the host:port label so the UDP handshake validates.

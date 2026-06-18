@@ -43,8 +43,14 @@ fn ssh_bootstrap_then_session() {
     let client_kp = generate_keypair().unwrap();
 
     // Bootstrap: the fake ssh launches noisshd --one-shot locally.
-    let boot = ssh::bootstrap("127.0.0.1", &[noisshd.to_string()], &client_kp.public, &[])
-        .expect("bootstrap");
+    let boot = ssh::bootstrap(
+        "127.0.0.1",
+        &[noisshd.to_string()],
+        &client_kp.public,
+        &[],
+        false,
+    )
+    .expect("bootstrap");
 
     // Pin the server key (delivered over the trusted SSH channel).
     let mut known = KnownHosts::new();
