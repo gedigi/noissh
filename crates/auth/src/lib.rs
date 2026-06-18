@@ -161,20 +161,25 @@ impl KnownHosts {
     }
 
     /// Parse `known_hosts` contents: `<host> noissh-x25519 <base64>` per line.
-    pub fn parse(contents: &str) -> Result<Self, AuthError> {
+    ///
+    /// Malformed lines are skipped (not fatal), matching how SSH treats its
+    /// `known_hosts`: a single hand-edited or truncated line must not lock the
+    /// user out of every other pinned host.
+    pub fn parse(contents: &str) -> Self {
         let mut hosts = BTreeMap::new();
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (host, rest) = line
-                .split_once(char::is_whitespace)
-                .ok_or(AuthError::MalformedLine)?;
-            let key = PublicKey::from_text(rest.trim())?;
-            hosts.insert(host.to_string(), key);
+            let Some((host, rest)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if let Ok(key) = PublicKey::from_text(rest.trim()) {
+                hosts.insert(host.to_string(), key);
+            }
         }
-        Ok(KnownHosts { hosts })
+        KnownHosts { hosts }
     }
 
     /// Serialize back to `known_hosts` text form.
@@ -283,16 +288,18 @@ mod tests {
         kh.check_or_add("a.example", &key(1));
         kh.check_or_add("b.example:9999", &key(2));
         let text = kh.to_text();
-        let parsed = KnownHosts::parse(&text).unwrap();
+        let parsed = KnownHosts::parse(&text);
         assert_eq!(parsed.get("a.example"), Some(&key(1)));
         assert_eq!(parsed.get("b.example:9999"), Some(&key(2)));
     }
 
     #[test]
-    fn known_hosts_parse_rejects_malformed() {
-        assert!(matches!(
-            KnownHosts::parse("onlyhost"),
-            Err(AuthError::MalformedLine)
-        ));
+    fn known_hosts_parse_skips_malformed_lines() {
+        // A malformed line is skipped, but valid lines around it still load
+        // (so one bad line can't lock the user out of every pinned host).
+        let text = format!("onlyhost\ngood.example {}\n", key(3).to_text());
+        let parsed = KnownHosts::parse(&text);
+        assert_eq!(parsed.get("good.example"), Some(&key(3)));
+        assert_eq!(parsed.get("onlyhost"), None);
     }
 }

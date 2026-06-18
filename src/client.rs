@@ -871,6 +871,10 @@ impl Client {
                 if self.core.stream_recv_finished(id) {
                     self.core.stream_close(id);
                     self.flush()?;
+                    // Atomically move the completed download into place. (On an
+                    // error return below, the sink is dropped and the temp file
+                    // is discarded — the destination is never clobbered.)
+                    sink.take().unwrap().finalize()?;
                     return Ok(());
                 }
             }

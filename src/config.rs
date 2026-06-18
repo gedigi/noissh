@@ -74,6 +74,7 @@ fn write_private(path: &Path, body: &[u8]) -> Result<(), RuntimeError> {
         .mode(0o600)
         .open(path)?;
     f.write_all(body)?;
+    f.sync_all()?; // durably persist the key before returning
     Ok(())
 }
 
@@ -101,18 +102,30 @@ fn tighten_if_loose(_path: &Path) {}
 /// Load known_hosts (empty if the file does not exist).
 pub fn load_known_hosts(path: &Path) -> Result<KnownHosts, RuntimeError> {
     if path.exists() {
-        Ok(KnownHosts::parse(&fs::read_to_string(path)?)?)
+        Ok(KnownHosts::parse(&fs::read_to_string(path)?))
     } else {
         Ok(KnownHosts::new())
     }
 }
 
-/// Persist known_hosts.
+/// Persist known_hosts atomically: write a sibling temp file, fsync it, then
+/// rename it into place. A crash mid-write can therefore never truncate or
+/// corrupt the existing pin file (which would silently re-enable TOFU and weaken
+/// the man-in-the-middle protection).
 pub fn save_known_hosts(path: &Path, kh: &KnownHosts) -> Result<(), RuntimeError> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, kh.to_text())?;
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(kh.to_text().as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 

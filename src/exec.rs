@@ -135,6 +135,11 @@ impl ExecProc {
         }
     }
 
+    /// Bytes staged for the child's stdin but not yet written to the pipe.
+    pub fn stdin_buffered(&self) -> usize {
+        self.stdin_buf.len()
+    }
+
     /// Close the child's stdin (send EOF), flushing any remainder first.
     pub fn close_stdin(&mut self) {
         self.flush_stdin();

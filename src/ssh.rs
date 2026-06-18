@@ -147,11 +147,13 @@ fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), Runtime
     );
     // One self-contained shell command: prefer curl, fall back to wget, error if
     // neither is available. `$HOME` is expanded by the remote shell.
+    // Single-quote the URL in the remote command (defence in depth: the version
+    // is a numeric compile-time constant, but quoting keeps it inert regardless).
     let remote = format!(
         "if command -v curl >/dev/null 2>&1; then \
-           curl -fsSL {installer} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
+           curl -fsSL '{installer}' | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
          elif command -v wget >/dev/null 2>&1; then \
-           wget -qO- {installer} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
+           wget -qO- '{installer}' | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
          else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi"
     );
     let mut cmd = Command::new(ssh_prog());

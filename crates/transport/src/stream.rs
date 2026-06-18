@@ -16,6 +16,10 @@ use wire::{Frame, StreamKind};
 /// Default per-stream receive window (bytes the peer may have in flight).
 pub const DEFAULT_WINDOW: u32 = 256 * 1024;
 
+/// Maximum concurrent peer-opened streams, bounding memory against a peer that
+/// floods `StreamOpen` frames with distinct ids.
+const MAX_STREAMS: usize = 1024;
+
 /// Max payload of a single `StreamData` frame, chosen so the resulting UDP
 /// datagram stays within a conservative path MTU (no IP fragmentation).
 pub const MAX_STREAM_CHUNK: usize = 1024;
@@ -249,6 +253,12 @@ impl StreamState {
     }
 
     fn on_ack(&mut self, ack: u64, window: u32, now: u64) {
+        // Ignore an ack for data we never sent: a peer acking past `send_next`
+        // would otherwise drain our buffer and falsely mark the FIN acked,
+        // abandoning genuinely in-flight data.
+        if ack > self.send_next {
+            return;
+        }
         self.peer_window = window;
         if ack > self.send_base {
             let advance = (ack - self.send_base).min(self.send_buf.len() as u64);
@@ -440,6 +450,9 @@ pub struct StreamMux {
     /// Streams we initiate use ids with this parity (client=0, server=1).
     next_local_id: u64,
     id_step: u64,
+    /// Parity of locally-initiated stream ids (0 = client/even, 1 = server/odd);
+    /// peer-opened streams must use the opposite parity.
+    local_parity: u64,
     streams: BTreeMap<u64, StreamState>,
     events: Vec<StreamEvent>,
     /// Monotonic tick counter (incremented per `poll_transmit`); the clock for
@@ -456,6 +469,7 @@ impl StreamMux {
         StreamMux {
             next_local_id: if is_client { 0 } else { 1 },
             id_step: 2,
+            local_parity: if is_client { 0 } else { 1 },
             streams: BTreeMap::new(),
             events: Vec::new(),
             now: 0,
@@ -521,6 +535,11 @@ impl StreamMux {
     pub fn on_frame(&mut self, frame: Frame) {
         match frame {
             Frame::StreamOpen { id, kind, meta } => {
+                // Peer-opened ids must have the opposite parity from ours, and we
+                // bound the total to resist a flood of distinct-id opens.
+                if id % 2 == self.local_parity || self.streams.len() >= MAX_STREAMS {
+                    return;
+                }
                 if let std::collections::btree_map::Entry::Vacant(e) = self.streams.entry(id) {
                     e.insert(StreamState::new(id, kind, meta.clone(), false));
                     self.events.push(StreamEvent::Opened { id, kind, meta });
@@ -533,9 +552,21 @@ impl StreamMux {
                 fin,
             } => {
                 if let Some(s) = self.streams.get_mut(&id) {
+                    // Drop frames that overflow or fall outside the advertised
+                    // receive window — a misbehaving/malicious peer must not be
+                    // able to force a huge allocation or unbounded buffering.
+                    let Some(end) = offset.checked_add(data.len() as u64) else {
+                        return;
+                    };
+                    if offset > s.recv.delivered.saturating_add(DEFAULT_WINDOW as u64) {
+                        return;
+                    }
                     let had = s.recv.ack_point();
-                    if fin {
-                        s.peer_fin = HalfState::Finished(offset + data.len() as u64);
+                    // Record the FIN offset only once: a second FIN at a different
+                    // offset would otherwise corrupt the end-of-stream point
+                    // (premature reclaim / data loss, or a permanent stall).
+                    if fin && s.peer_fin == HalfState::Open {
+                        s.peer_fin = HalfState::Finished(end);
                     }
                     s.recv.insert(offset, data);
                     if s.recv.ack_point() > had {
@@ -904,6 +935,63 @@ mod tests {
         got.extend_from_slice(&drain(&mut server, id));
         assert_eq!(got.len(), payload.len(), "not all bytes arrived");
         assert_eq!(got, payload, "payload corrupted in transit");
+    }
+
+    #[test]
+    fn malicious_frames_are_rejected_safely() {
+        // A peer-opened stream (server view) must not be corrupted or made to
+        // over-allocate by hostile frames.
+        let mut server = StreamMux::new(false);
+        // Open a peer (client, even-id) stream.
+        server.on_frame(Frame::StreamOpen {
+            id: 0,
+            kind: StreamKind::Forward,
+            meta: vec![],
+        });
+
+        // A wrong-parity peer open is rejected (server's own ids are odd).
+        server.on_frame(Frame::StreamOpen {
+            id: 1,
+            kind: StreamKind::Forward,
+            meta: vec![],
+        });
+        // An offset+len overflow must not panic; the frame is dropped.
+        server.on_frame(Frame::StreamData {
+            id: 0,
+            offset: u64::MAX - 4,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            fin: false,
+        });
+        // An offset far beyond the receive window is dropped (no buffering).
+        server.on_frame(Frame::StreamData {
+            id: 0,
+            offset: DEFAULT_WINDOW as u64 + 1_000_000,
+            data: vec![9; 100],
+            fin: false,
+        });
+        assert_eq!(
+            server.recv_buffered(0),
+            0,
+            "out-of-window data was buffered"
+        );
+
+        // A FIN, then a second FIN at a smaller offset, must not move the close
+        // point backward (which would drop data / reclaim early).
+        server.on_frame(Frame::StreamData {
+            id: 0,
+            offset: 0,
+            data: vec![1, 2, 3, 4, 5],
+            fin: true,
+        });
+        server.on_frame(Frame::StreamData {
+            id: 0,
+            offset: 0,
+            data: vec![1],
+            fin: true,
+        });
+        let _ = drain(&mut server, 0);
+        // Only the genuine FIN at offset 5 finishes the stream once 5 bytes read.
+        assert!(server.is_recv_finished(0));
     }
 
     #[test]

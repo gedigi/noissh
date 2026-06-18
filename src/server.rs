@@ -924,6 +924,20 @@ impl Server {
         }
         // Pump both directions, with caps, propagate half-close, reap.
         const SEND_CAP: u64 = 512 * 1024;
+        // Drop forwards/xfers whose session has gone away (e.g. idle-reaped or
+        // replaced by a reattach): otherwise their TCP fds / file handles leak,
+        // and an interrupted upload would be wrongly finalized as complete.
+        let dead: Vec<(SessionId, u64)> = self
+            .forwards
+            .keys()
+            .chain(self.xfers.keys())
+            .copied()
+            .filter(|(sid, _)| !self.core.has_session(*sid))
+            .collect();
+        for k in dead {
+            self.forwards.remove(&k);
+            self.xfers.remove(&k);
+        }
         let keys: Vec<(SessionId, u64)> = self.forwards.keys().copied().collect();
         for k in keys {
             if let Some(c) = self.forwards.get_mut(&k) {
@@ -997,10 +1011,19 @@ impl Server {
                     // Signal failure so the client doesn't treat a partial
                     // transfer as success.
                     self.core.stream_reset(k.0, k.1);
+                    self.xfers.remove(&k); // drop sink → temp file discarded
                 } else {
                     self.core.stream_close(k.0, k.1);
+                    // On a successful upload, atomically move the temp file into
+                    // place; on download there is no local sink to finalize.
+                    if let Some(XferState::Put(sink)) = self.xfers.remove(&k)
+                        && sink.finalize().is_err()
+                    {
+                        // Rename failed after the bytes arrived: tell the client
+                        // the transfer didn't land.
+                        self.core.stream_reset(k.0, k.1);
+                    }
                 }
-                self.xfers.remove(&k);
             }
         }
 
@@ -1055,8 +1078,11 @@ impl Server {
             let Some(e) = self.execs.get_mut(&k) else {
                 continue;
             };
-            // Feed any client stdin into the command.
-            loop {
+            // Feed any client stdin into the command, but stop once the staging
+            // buffer is large (the child isn't draining stdin) so a fast client
+            // can't grow it without bound — the stream's flow control then
+            // backpressures the client.
+            while e.proc.stdin_buffered() < SEND_CAP as usize {
                 let d = self.core.stream_read(k.0, k.1);
                 if d.is_empty() {
                     break;
