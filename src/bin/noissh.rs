@@ -46,6 +46,8 @@ struct Args {
     forward_agent: bool,
     /// Disable auto-installing noisshd on the remote during `--ssh` bootstrap.
     no_install: bool,
+    /// Run a non-interactive remote command instead of an interactive shell.
+    exec: Option<String>,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -81,12 +83,20 @@ fn parse_args() -> Args {
         transfer: None,
         forward_agent: false,
         no_install: false,
+        exec: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ssh" => a.ssh = true,
             "--no-install" => a.no_install = true,
+            "--exec" => {
+                if let Some(c) = it.next() {
+                    a.exec = Some(c);
+                } else {
+                    eprintln!("noissh: --exec wants a command string");
+                }
+            }
             "-A" | "--forward-agent" => a.forward_agent = true,
             "--port" => {
                 if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
@@ -195,7 +205,7 @@ fn run() -> Result<(), RuntimeError> {
     let forward_only = !args.local_forwards.is_empty()
         || !args.remote_forwards.is_empty()
         || !args.dynamic_forwards.is_empty();
-    let want_shell = !forward_only && args.transfer.is_none();
+    let want_shell = !forward_only && args.transfer.is_none() && args.exec.is_none();
     // Agent forwarding only applies to an interactive shell; it needs a local
     // agent ($SSH_AUTH_SOCK) to bridge to.
     let agent_sock = if args.forward_agent && want_shell {
@@ -226,7 +236,10 @@ fn run() -> Result<(), RuntimeError> {
         save_known_hosts(&kh_path, client.core().known_hosts())?;
     }
 
-    if let Some((req, local)) = args.transfer {
+    if let Some(cmd) = args.exec {
+        let code = client.run_exec(&cmd)?;
+        exit(code);
+    } else if let Some((req, local)) = args.transfer {
         client.run_transfer(&req, &local)?;
         eprintln!("noissh: transfer complete");
         Ok(())

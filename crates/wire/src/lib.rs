@@ -32,6 +32,8 @@ pub enum StreamKind {
     FileTransfer = 2,
     /// Agent-forwarding socket proxy.
     Agent = 3,
+    /// Non-interactive remote command (raw stdin/stdout/stderr, exit status).
+    Exec = 4,
 }
 
 impl StreamKind {
@@ -41,6 +43,7 @@ impl StreamKind {
             1 => StreamKind::Forward,
             2 => StreamKind::FileTransfer,
             3 => StreamKind::Agent,
+            4 => StreamKind::Exec,
             other => return Err(WireError::UnknownFrame(other)),
         })
     }

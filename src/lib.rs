@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod config;
+pub mod exec;
 pub mod forward;
 pub mod server;
 pub mod socks;
@@ -44,4 +45,6 @@ pub enum RuntimeError {
     SshBootstrap,
     #[error("file transfer failed: {0}")]
     Transfer(String),
+    #[error("remote command failed: {0}")]
+    Exec(String),
 }

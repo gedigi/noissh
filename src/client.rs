@@ -265,6 +265,11 @@ impl ClientCore {
         self.mux.open(StreamKind::FileTransfer, req.encode())
     }
 
+    /// Open an exec stream running `cmd` on the server. Returns the stream id.
+    pub fn open_exec(&mut self, cmd: &str) -> u64 {
+        self.mux.open(StreamKind::Exec, cmd.as_bytes().to_vec())
+    }
+
     /// Queue bytes to send on a stream.
     pub fn stream_write(&mut self, id: u64, data: &[u8]) {
         self.mux.write(id, data);
@@ -878,6 +883,121 @@ impl Client {
         }
     }
 
+    /// Run a non-interactive remote command to completion, streaming its stdout
+    /// and stderr to ours and returning its exit code. stdin is forwarded from
+    /// our stdin until EOF.
+    pub fn run_exec(&mut self, cmd: &str) -> Result<i32, RuntimeError> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::io::{Read, Write};
+        use std::os::fd::AsFd;
+        use std::time::Instant;
+
+        self.socket.set_nonblocking(true)?;
+        let stdin = std::io::stdin();
+        set_fd_nonblocking(stdin.as_fd());
+
+        let e = self.core.open_exec(cmd);
+        let mut err_id: Option<u64> = None;
+        let mut exit_code: Option<i32> = None;
+        let mut stdin_eof = false;
+
+        let mut stdout = std::io::stdout();
+        let mut stderr = std::io::stderr();
+        let keepalive = Duration::from_secs(3);
+        let mut next_keepalive = Instant::now() + keepalive;
+        let mut inbuf = [0u8; 16384];
+
+        loop {
+            let timeout = if self.core.has_outgoing() {
+                Duration::from_millis(20)
+            } else {
+                next_keepalive
+                    .saturating_duration_since(Instant::now())
+                    .min(keepalive)
+            };
+            {
+                let sock = self.socket.as_fd();
+                let inp = stdin.as_fd();
+                let mut fds = vec![PollFd::new(sock, PollFlags::POLLIN)];
+                if !stdin_eof {
+                    fds.push(PollFd::new(inp, PollFlags::POLLIN));
+                }
+                let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
+                let _ = poll(&mut fds, PollTimeout::from(ms));
+            }
+
+            while self.recv_and_handle()? {}
+
+            for ev in self.core.take_stream_events() {
+                match ev {
+                    // The server opens one Exec stream back to us: it's stderr.
+                    StreamEvent::Opened {
+                        id,
+                        kind: StreamKind::Exec,
+                        ..
+                    } => err_id = Some(id),
+                    // The server reset our exec stream: it couldn't run the
+                    // command (spawn failure, or refused under a privsep drop).
+                    StreamEvent::Reset { id } if id == e => {
+                        return Err(RuntimeError::Exec(
+                            "remote refused or could not start the command".into(),
+                        ));
+                    }
+                    StreamEvent::Closed { id, status } if id == e => exit_code = Some(status),
+                    _ => {}
+                }
+            }
+
+            // command stdout / stderr → our stdout / stderr.
+            let out = self.core.stream_read(e);
+            if !out.is_empty() {
+                stdout.write_all(&out).ok();
+                stdout.flush().ok();
+            }
+            if let Some(s) = err_id {
+                let er = self.core.stream_read(s);
+                if !er.is_empty() {
+                    stderr.write_all(&er).ok();
+                    stderr.flush().ok();
+                }
+            }
+
+            // our stdin → command stdin, until EOF.
+            if !stdin_eof {
+                match stdin.lock().read(&mut inbuf) {
+                    Ok(0) => {
+                        stdin_eof = true;
+                        self.core.stream_close(e); // EOF to the command's stdin
+                    }
+                    Ok(n) => self.core.stream_write(e, &inbuf[..n]),
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        stdin_eof = true;
+                        self.core.stream_close(e);
+                    }
+                }
+            }
+
+            self.flush()?;
+            if Instant::now() >= next_keepalive {
+                self.send_keepalive()?;
+                next_keepalive = Instant::now() + keepalive;
+            }
+
+            // Done once the command exited and all of stdout/stderr is drained.
+            let stdout_done = self.core.stream_recv_finished(e);
+            let stderr_done = err_id
+                .map(|s| self.core.stream_recv_finished(s))
+                .unwrap_or(true);
+            if let Some(code) = exit_code
+                && stdout_done
+                && stderr_done
+            {
+                return Ok(code);
+            }
+        }
+    }
+
     /// Drain a single ready datagram (non-blocking) and send any replies.
     /// Returns true if a datagram was processed.
     pub fn recv_and_handle(&mut self) -> Result<bool, RuntimeError> {
@@ -920,5 +1040,15 @@ impl Client {
     pub fn pump_once(&mut self) -> Result<(), RuntimeError> {
         self.recv_and_handle()?;
         self.flush()
+    }
+}
+
+/// Put a file descriptor into non-blocking mode (safe `nix` fcntl).
+fn set_fd_nonblocking<Fd: std::os::fd::AsFd>(fd: Fd) {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    if let Ok(cur) = fcntl(fd.as_fd(), FcntlArg::F_GETFL) {
+        let mut flags = OFlag::from_bits_truncate(cur);
+        flags.insert(OFlag::O_NONBLOCK);
+        let _ = fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags));
     }
 }

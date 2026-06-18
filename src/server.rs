@@ -514,6 +514,21 @@ impl ServerCore {
             .map(|s| s.mux.open(StreamKind::Agent, Vec::new()))
     }
 
+    /// Open an exec stream from the server side (used for a command's stderr);
+    /// returns its id.
+    pub fn open_exec(&mut self, sid: SessionId) -> Option<u64> {
+        self.sessions
+            .get_mut(&sid)
+            .map(|s| s.mux.open(StreamKind::Exec, Vec::new()))
+    }
+
+    /// Close our send half of a stream with an explicit status (exec exit code).
+    pub fn stream_close_status(&mut self, sid: SessionId, id: u64, status: i32) {
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            s.mux.close(id, status);
+        }
+    }
+
     /// Read available contiguous bytes from a stream within a session.
     pub fn stream_read(&mut self, sid: SessionId, id: u64) -> Vec<u8> {
         self.sessions
@@ -594,12 +609,21 @@ pub struct Server {
     /// (session, stream id).
     agent_conns:
         HashMap<(SessionId, u64), crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
+    /// Running `--exec` commands, keyed by (session, stdin/stdout stream id).
+    execs: HashMap<(SessionId, u64), ExecState>,
 }
 
 /// Server side of a file transfer: writing an upload, or reading a download.
 enum XferState {
     Put(crate::xfer::FileSink),
     Get(crate::xfer::FileSource),
+}
+
+/// Server side of a running `--exec` command. `err_id` is the separate stream
+/// carrying the command's stderr to the client.
+struct ExecState {
+    proc: crate::exec::ExecProc,
+    err_id: u64,
 }
 
 impl Server {
@@ -614,6 +638,7 @@ impl Server {
             xfers: HashMap::new(),
             agent_listeners: Vec::new(),
             agent_conns: HashMap::new(),
+            execs: HashMap::new(),
         })
     }
 
@@ -818,6 +843,33 @@ impl Server {
                     }
                     None => self.core.stream_reset(sid, id),
                 },
+                // Exec under a privsep drop would run as the driver's (possibly
+                // root) identity — refuse, like file transfer.
+                StreamEvent::Opened {
+                    id,
+                    kind: StreamKind::Exec,
+                    ..
+                } if self.core.privsep_active() => {
+                    self.core.stream_reset(sid, id);
+                }
+                StreamEvent::Opened {
+                    id,
+                    kind: StreamKind::Exec,
+                    meta,
+                } => {
+                    let cmd = String::from_utf8_lossy(&meta).into_owned();
+                    match crate::exec::ExecProc::spawn(&cmd) {
+                        Ok(proc) => match self.core.open_exec(sid) {
+                            Some(err_id) => {
+                                self.execs.insert((sid, id), ExecState { proc, err_id });
+                            }
+                            // Session vanished between events: nothing to attach.
+                            None => self.core.stream_reset(sid, id),
+                        },
+                        // Couldn't spawn the command: signal failure to the client.
+                        Err(_) => self.core.stream_reset(sid, id),
+                    }
+                }
                 // Draining happens in the bounded pump loop below.
                 StreamEvent::Readable { .. } => {}
                 StreamEvent::Closed { id, .. } => {
@@ -827,6 +879,10 @@ impl Server {
                     if let Some(c) = self.agent_conns.get_mut(&(sid, id)) {
                         c.mark_peer_closed();
                     }
+                    // Client closed its stdin half: send EOF to the command.
+                    if let Some(e) = self.execs.get_mut(&(sid, id)) {
+                        e.proc.close_stdin();
+                    }
                     // Upload completion is detected in the pump loop once every
                     // buffered byte has been drained into the sink (the Closed
                     // event can precede the final data segments).
@@ -835,6 +891,10 @@ impl Server {
                     self.forwards.remove(&(sid, id));
                     self.xfers.remove(&(sid, id));
                     self.agent_conns.remove(&(sid, id));
+                    if let Some(mut e) = self.execs.remove(&(sid, id)) {
+                        e.proc.kill();
+                        self.core.stream_reset(sid, e.err_id);
+                    }
                 }
                 _ => {}
             }
@@ -955,6 +1015,55 @@ impl Server {
                 if c.is_finished() {
                     self.agent_conns.remove(&k);
                 }
+            }
+        }
+
+        // Pump `--exec` commands: command stdout → its stream, stderr → the
+        // sibling stream, client stream → command stdin, exit code on close.
+        // Drop any whose session has gone away (kill the child first).
+        let ekeys: Vec<(SessionId, u64)> = self.execs.keys().copied().collect();
+        for k in ekeys {
+            if !self.core.has_session(k.0) {
+                if let Some(mut e) = self.execs.remove(&k) {
+                    e.proc.kill();
+                }
+                continue;
+            }
+            let Some(e) = self.execs.get_mut(&k) else {
+                continue;
+            };
+            // Feed any client stdin into the command.
+            loop {
+                let d = self.core.stream_read(k.0, k.1);
+                if d.is_empty() {
+                    break;
+                }
+                e.proc.write_stdin(&d);
+            }
+            e.proc.flush_stdin();
+            // command stdout → the exec stream (bounded by unacked bytes).
+            if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
+                let out = e.proc.read_stdout();
+                if !out.is_empty() {
+                    self.core.stream_write(k.0, k.1, &out);
+                }
+            }
+            // command stderr → the sibling stream.
+            let err_id = e.err_id;
+            if self.core.stream_in_flight(k.0, err_id) < SEND_CAP {
+                let err = e.proc.read_stderr();
+                if !err.is_empty() {
+                    self.core.stream_write(k.0, err_id, &err);
+                }
+            }
+            e.proc.poll_exit();
+            // Finished once the process exited and both pipes drained; close the
+            // streams, carrying the exit code on the stdout stream.
+            if e.proc.finished() {
+                let code = e.proc.exit_code();
+                self.core.stream_close_status(k.0, k.1, code);
+                self.core.stream_close(k.0, err_id);
+                self.execs.remove(&k);
             }
         }
     }
