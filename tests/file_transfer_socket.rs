@@ -167,6 +167,72 @@ fn put_to_uncreatable_destination_is_reported_as_an_error() {
 }
 
 #[test]
+fn file_transfer_is_refused_when_privsep_user_is_configured() {
+    // With a privsep target user, the driver can't confine file I/O to that
+    // user, so transfers must be refused rather than run as the driver's
+    // identity. (No real privilege drop happens here — the gate is the presence
+    // of a configured user — so this needs no root and never spawns a shell.)
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "t");
+    let server_pub = server_kp.public.clone();
+
+    let core = ServerCore::new(server_kp, authorized, Box::new(LocalLogin), None)
+        .with_user(Some("some-other-user".to_string()));
+    let mut server = Server::bind("127.0.0.1:0".parse().unwrap(), core).unwrap();
+    let addr = server.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let handle = thread::spawn(move || {
+        while !stop2.load(Ordering::SeqCst) {
+            if !server.poll_once() {
+                break;
+            }
+        }
+    });
+
+    let remote = temp_path("privsep-src");
+    let local = temp_path("privsep-dst");
+    std::fs::write(&remote, b"secret").unwrap();
+    let _ = std::fs::remove_file(&local);
+
+    let label = format!("127.0.0.1:{}", addr.port());
+    let mut kh = KnownHosts::new();
+    kh.check_or_add(&label, &PublicKey::from_bytes(&server_pub).unwrap());
+    let mut client = Client::connect_with(
+        &client_kp,
+        kh,
+        label,
+        addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+        false,
+        None,
+    )
+    .unwrap();
+
+    let req = XferRequest::Get {
+        path: remote.to_string_lossy().into_owned(),
+    };
+    let result = client.run_transfer(&req, &local.to_string_lossy());
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+
+    assert!(result.is_err(), "transfer must be refused under privsep");
+    // The destination must not have been created with the server's identity.
+    assert!(
+        !std::path::Path::new(&local).exists() || std::fs::read(&local).unwrap().is_empty(),
+        "no data should have been written under privsep"
+    );
+
+    let _ = std::fs::remove_file(&remote);
+    let _ = std::fs::remove_file(&local);
+}
+
+#[test]
 fn get_of_missing_file_is_reported_as_an_error() {
     let server = start_server();
     let mut client = server.connect();

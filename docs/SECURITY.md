@@ -86,6 +86,25 @@ it minimal:
   not initialise supplementary groups; for full fidelity prefer the SSH-bootstrap
   model or run the daemon already as the target user (e.g. via a systemd unit).
 
+### File transfer & agent forwarding identity
+
+File transfer (`--put`/`--get`) and SSH agent forwarding (`-A`) perform their I/O
+in the session process — i.e. **as the same identity the session runs as**. In
+the supported models (SSH bootstrap, the portable backend, or a daemon already
+running as the target user) that identity *is* the authenticated user, so these
+features can touch exactly what the user's own shell could touch — no more. File
+paths are therefore not restricted to a sandbox or home directory, matching the
+reach the user already has interactively.
+
+The one case where the process identity would differ from the session identity
+is a standalone daemon started as **root with a `--user` privilege drop**: there
+the shell drops to the target user at exec, but the daemon process itself stays
+root and cannot confine file/agent I/O to that user without in-process `setuid`
+(deliberately avoided; see above). To prevent the daemon from acting with root
+privileges on a client's behalf, **file transfer and agent forwarding are
+refused whenever a `--user` drop is configured.** Use the SSH-bootstrap model or
+run the daemon as the target user to use these features.
+
 ## Cryptographic key storage
 
 - Private keys are stored in the config directory with `0600` permissions.

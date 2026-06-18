@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1]
+
+### Security
+
+- **Refuse file transfer (`--put`/`--get`) and agent forwarding (`-A`) when a
+  `--user` privilege drop is configured.** In that mode the daemon process stays
+  root while the shell drops to the target user, so the driver could otherwise
+  perform file/agent I/O as root on a client's behalf. The supported models (SSH
+  bootstrap, the portable backend, or a daemon already running as the target
+  user) have process identity == session identity and are unaffected.
+
 ## [0.3.0]
 
 ### Added

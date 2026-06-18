@@ -119,6 +119,17 @@ impl ServerCore {
         self
     }
 
+    /// Whether a privsep target user is configured. When set, the shell drops to
+    /// that user at exec (in the child), but the driver process does NOT — so it
+    /// cannot safely perform file-transfer / agent I/O confined to that user.
+    /// Those features are refused in this mode to avoid acting with the driver's
+    /// (possibly root) privileges on the client's behalf. The supported
+    /// multi-user model (SSH bootstrap, or a daemon already running as the target
+    /// user) has process identity == session identity and is unaffected.
+    pub fn privsep_active(&self) -> bool {
+        self.user.is_some()
+    }
+
     /// One-shot lifecycle: true once a session existed and all sessions have
     /// since reported their shell's exit.
     pub fn all_done(&self) -> bool {
@@ -334,9 +345,12 @@ impl ServerCore {
                 }
                 // Agent forwarding: expose a Unix socket and point SSH_AUTH_SOCK
                 // at it. The driver binds the actual listener (I/O); connections
-                // to it are tunnelled back to the client's local agent.
+                // to it are tunnelled back to the client's local agent. Refused
+                // under privsep: the driver (not the dropped shell user) would
+                // own the socket and accept its connections. (`self.user` field
+                // access avoids borrowing all of `self` while `sess` is held.)
                 let mut env = Vec::new();
-                let agent_path = if agent {
+                let agent_path = if agent && self.user.is_none() {
                     let path = agent_socket_path(sid);
                     env.push(("SSH_AUTH_SOCK".to_string(), path.clone()));
                     Some(path)
@@ -768,6 +782,16 @@ impl Server {
                         }
                         None => self.core.stream_close(sid, id), // unreachable target
                     }
+                }
+                StreamEvent::Opened {
+                    id,
+                    kind: StreamKind::FileTransfer,
+                    ..
+                } if self.core.privsep_active() => {
+                    // The driver can't confine file I/O to the dropped session
+                    // user, so refuse rather than read/write as the driver's
+                    // (possibly root) identity. See ServerCore::privsep_active.
+                    self.core.stream_reset(sid, id);
                 }
                 StreamEvent::Opened {
                     id,
