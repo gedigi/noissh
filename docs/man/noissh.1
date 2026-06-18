@@ -1,0 +1,79 @@
+.TH NOISSH 1 "2026-06-18" "noissh 0.1.0" "User Commands"
+.SH NAME
+noissh \- resilient remote shell over the Noise Protocol Framework (client)
+.SH SYNOPSIS
+.B noissh
+.RB [ \-\-ssh ]
+.RB [ \-\-port
+.IR N ]
+.RB [ \-\-server\-cmd
+.IR CMD ]
+.RI [ user @] host
+.RB [ \-\-
+.IR "ssh args" ...]
+.SH DESCRIPTION
+.B noissh
+connects to a
+.BR noisshd (1)
+server and runs an interactive login shell that survives packet loss, high
+latency, IP changes, NAT rebinding, and laptop sleep/resume without
+reconnecting. All cryptography uses the Noise Protocol Framework
+.RB ( Noise_XX_25519_ChaChaPoly_BLAKE2s ).
+The interactive shell rides unreliable latest\-wins datagrams and a client\-side
+predictive\-echo engine, giving an instant feel even on poor links.
+.SH OPTIONS
+.TP
+.B \-\-ssh
+Bootstrap the server over SSH (mosh\-style): run
+.B ssh
+.I host noisshd --one-shot
+to obtain the UDP port and the server's ephemeral public key, then connect over
+Noise/UDP. No pre\-shared
+.I authorized_keys
+entry is required.
+.TP
+.BI \-\-port " N"
+UDP port for a direct connection to a standalone server (default 51820).
+.TP
+.BI \-\-server\-cmd " CMD"
+Remote server command used with
+.BR \-\-ssh
+(default
+.IR noisshd ).
+.TP
+.BI \-\- " ssh args"
+With
+.BR \-\-ssh ,
+pass all remaining arguments verbatim to
+.BR ssh (1).
+.SH AUTHENTICATION
+On first contact the server's static public key is pinned (trust on first use)
+in
+.IR ~/.config/noissh/known_hosts ;
+a later key change aborts the connection. The client's own static key lives in
+.IR ~/.config/noissh/id
+and must appear in the server's
+.I authorized_keys
+for direct connections.
+.SH FILES
+.TP
+.I ~/.config/noissh/id
+Client static X25519 keypair (mode 0600).
+.TP
+.I ~/.config/noissh/known_hosts
+Pinned server public keys.
+.SH EXIT STATUS
+Exits with the remote shell's exit status, or non\-zero on connection failure.
+.SH EXAMPLES
+.TP
+Connect via SSH bootstrap:
+.B noissh --ssh user@server
+.TP
+Direct connection on a custom port:
+.B noissh --port 51820 user@server
+.SH SEE ALSO
+.BR noisshd (1),
+.BR ssh (1),
+.BR mosh (1)
+.SH AUTHOR
+Gerardo Di Giacomo.

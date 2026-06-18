@@ -1,0 +1,90 @@
+.TH NOISSHD 1 "2026-06-18" "noissh 0.1.0" "System Administration"
+.SH NAME
+noisshd \- resilient remote shell over the Noise Protocol Framework (server)
+.SH SYNOPSIS
+.B noisshd
+.RB [ \-\-listen
+.IR ADDR ]
+.RB [ \-\-key
+.IR PATH ]
+.RB [ \-\-authorized\-keys
+.IR PATH ]
+.RB [ \-\-command
+.IR "CMD ..." ]
+.br
+.B noisshd \-\-one\-shot \-\-authorize
+.I B64PUB
+.RB [ \-\-bind
+.IR ADDR ]
+.RB [ \-\-command
+.IR "CMD ..." ]
+.SH DESCRIPTION
+.B noisshd
+is the noissh server daemon. It accepts Noise\-encrypted UDP sessions, demultiplexes
+them by a cryptographic session id (independent of source IP, which is what
+enables roaming), authenticates the client's static key against
+.IR authorized_keys ,
+allocates a PTY, and runs the user's login shell.
+.SH MODES
+.SS Standalone
+A persistent daemon using a persistent static key and
+.I authorized_keys
+file. This is the default mode.
+.SS One\-shot
+Used by the
+.B noissh --ssh
+bootstrap. Generates an ephemeral key, trusts only the single client key given
+with
+.BR \-\-authorize ,
+binds an ephemeral UDP port, prints a line of the form
+.RS
+.B NOISSH CONNECT <port> <base64 server pubkey>
+.RE
+on standard output, detaches from the controlling terminal, and serves one
+session.
+.SH OPTIONS
+.TP
+.BI \-\-listen " ADDR"
+Bind address for standalone mode (default 0.0.0.0:51820).
+.TP
+.BI \-\-key " PATH"
+Static key file (default <config>/noisshd_key); generated on first use.
+.TP
+.BI \-\-authorized\-keys " PATH"
+Authorized client keys (default <config>/authorized_keys).
+.TP
+.BI \-\-command " CMD ..."
+Run this command instead of the login shell (the remaining arguments form the
+command). Useful for restricted or scripted sessions.
+.TP
+.B \-\-one\-shot
+Ephemeral key; serve a single session, then exit.
+.TP
+.BI \-\-authorize " B64PUB"
+In one\-shot mode, the single base64 client public key to trust.
+.TP
+.BI \-\-bind " ADDR"
+Bind address in one\-shot mode (default 0.0.0.0:0, an ephemeral port).
+.SH SECURITY
+An unauthorized client key is rejected at handshake completion, before any
+session or PTY/login work occurs. On Linux, when built with the
+.B pam
+feature and run as root, the privilege\-separated backend performs
+.BR setgid / initgroups / setuid
+and PAM account/session setup. The portable backend runs the shell as the
+current user and needs no root.
+.SH FILES
+.TP
+.I <config>/noisshd_key
+Server static keypair.
+.TP
+.I <config>/authorized_keys
+Allowed client public keys, one
+.I noissh-x25519 <base64>
+per line.
+.SH SEE ALSO
+.BR noissh (1),
+.BR sshd (8),
+.BR pam (8)
+.SH AUTHOR
+Gerardo Di Giacomo.

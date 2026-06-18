@@ -6,8 +6,17 @@ with no reconnect) and **as rich as SSH**, built entirely on the
 [Noise Protocol Framework](https://noiseprotocol.org/) for its cryptography —
 "Noise all the way down".
 
-See [`docs/specs/2026-06-18-noissh-design.md`](docs/specs/2026-06-18-noissh-design.md)
-for the full design.
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Install, connect, configure, troubleshoot |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate map, data flow, design rationale (diagrams) |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Wire format, handshake, frames, state-sync, streams |
+| [docs/SECURITY.md](docs/SECURITY.md) | Trust & threat model |
+| [docs/specs/2026-06-18-noissh-design.md](docs/specs/2026-06-18-noissh-design.md) | Original design spec |
+| [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) | Dev workflow · history |
+| man pages | [docs/man/noissh.1](docs/man/noissh.1) · [docs/man/noisshd.1](docs/man/noisshd.1) |
 
 ## Status
 
