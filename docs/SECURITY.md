@@ -25,12 +25,10 @@ noissh mirrors SSH's trust model with Noise static keys:
   client static public keys per user. The `XX` handshake proves the client holds
   the matching private key. **An unauthorized client key is rejected at handshake
   completion, before any session is created or any PTY/login work happens.**
-- **PAM split (sshd model).** The Noise static key *is* the cryptographic
-  authentication (PAM's `auth` stack is bypassed, like SSH pubkey auth). When the
-  Linux privsep backend with the `pam` feature is used, PAM still runs
-  `acct_mgmt` (account validity) and `open_session`/`close_session` (logind
-  registration, limits, env). An optional second factor over the control channel
-  is specified but not enabled by default.
+- **Key-based authentication.** The Noise static key *is* the cryptographic
+  authentication, analogous to SSH public-key auth. There is no password stack to
+  brute-force. (An optional second factor over the control channel is defined in
+  the protocol but not enabled by default.)
 
 ## What noissh protects against
 
@@ -53,7 +51,7 @@ noissh mirrors SSH's trust model with Noise static keys:
   each unknown session-id handshake allocates a small amount of state. This is a
   known area for hardening.
 - **Traffic analysis.** Packet sizes and timing are not padded; an observer can
-  infer activity (typing, screen updates), as with mosh.
+  infer activity (typing, screen updates).
 - **Compromised endpoints.** noissh secures the link, not the machines. A
   compromised client or server is out of scope.
 - **0-RTT / forward-secrecy edge cases for resumption.** v1 always performs a
@@ -78,7 +76,7 @@ it minimal:
   input — see the `security` and `wire` tests).
 - The portable login backend allocates a real PTY and runs the shell as the
   **current user** with **no root** required.
-- **Multi-user deployments use the mosh model:** the SSH bootstrap
+- **Multi-user deployments use the SSH-bootstrap model:** the SSH bootstrap
   (`noissh --ssh`) launches the server *as the already-authenticated user* over
   SSH, so the session process is the right user from the start — no in-process
   `setuid` is performed, avoiding the well-known supplementary-group pitfalls of

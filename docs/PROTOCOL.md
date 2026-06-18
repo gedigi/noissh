@@ -185,7 +185,7 @@ Streams roam with the session exactly like the v1 datagram path.
 
 ## 9. SSH bootstrap (optional)
 
-A mosh-style bootstrap: `ssh <host> noisshd --one-shot --authorize <client pub>`.
+An SSH bootstrap: `ssh <host> noisshd --one-shot --authorize <client pub>`.
 The one-shot server binds an ephemeral UDP port, prints
 
 ```

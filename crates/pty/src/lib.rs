@@ -6,7 +6,7 @@
 //! The portable [`LocalLogin`] backend allocates a real PTY and execs the login
 //! shell. It runs as the current user by default; if a target user is given it
 //! drops to that user's uid/gid before exec (requires root). For full multi-user
-//! deployments use the mosh-style SSH bootstrap, where the server is already
+//! deployments use the SSH bootstrap, where the server is already
 //! launched as the authenticated user by SSH — so no in-process setuid (and its
 //! supplementary-group subtleties) is involved.
 

@@ -5,7 +5,7 @@
 //!   noissh [--port N] [user@]host
 //!       Direct connect to a standalone noisshd (known_hosts TOFU pinning).
 //!   noissh --ssh [user@]host [--server-cmd noisshd] [-- <ssh args>...]
-//!       mosh-style: bootstrap the server over SSH, then run over Noise/UDP.
+//!       bootstrap the server over SSH, then run the session over Noise/UDP.
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
@@ -80,7 +80,7 @@ fn run() -> Result<(), RuntimeError> {
     let (cols, rows) = terminal_size();
 
     let (server_addr, host_label) = if args.ssh {
-        // mosh-style bootstrap over SSH.
+        // Bootstrap the server over SSH.
         let boot = ssh::bootstrap(
             &target,
             std::slice::from_ref(&args.server_cmd),

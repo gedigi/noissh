@@ -7,7 +7,7 @@ details see [PROTOCOL.md](PROTOCOL.md); for the trust/threat model see
 
 ## Goals
 
-noissh aims to be **as resilient as mosh** and **as rich as SSH**, with all
+noissh aims to be **highly resilient** and **as rich as SSH**, with all
 cryptography provided by the [Noise Protocol Framework](https://noiseprotocol.org/)
 ("Noise all the way down"). The novel engineering is the **hybrid resilient
 transport + predictive TTY overlay**; account/login/privilege machinery reuses
@@ -153,7 +153,7 @@ built on the safe `pty-process` crate (no `unsafe`):
 
 - It allocates a real PTY and execs the login shell as the **current user** — no
   root required. This is the tested, default path.
-- For multi-user use, the **mosh model** applies: the SSH bootstrap launches the
+- For multi-user use, the **SSH-bootstrap model** applies: the SSH bootstrap launches the
   server already running as the authenticated user, so no in-process `setuid` is
   needed.
 - A standalone root daemon may optionally drop to a target user's `uid`/`gid`

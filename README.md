@@ -4,8 +4,9 @@
 
 Close your laptop, hop from Wi-Fi to cellular, change networks, walk through a
 dead spot — your session is still right there when you come back. No reconnect,
-no lost work. noissh gives you that mosh-like resilience with the everyday feel
-of SSH, secured end-to-end by the modern [Noise Protocol](https://noiseprotocol.org/).
+no lost work. noissh gives you a resilient session with the everyday feel of a
+normal shell, secured end-to-end by the modern
+[Noise Protocol](https://noiseprotocol.org/).
 
 ```sh
 # Once noisshd is installed on the server, connect over your existing SSH access:
@@ -24,9 +25,9 @@ laptop going to sleep.
 - **It's secure by design.** Every connection is mutually authenticated and
   encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
   authorized keys can connect.
-- **It's easy to start.** Install `noisshd` on the server once (like mosh needs
-  `mosh-server`), and from then on a single command connects over your existing
-  SSH access — no daemon to keep running, no keys to copy around.
+- **It's easy to start.** Install the server component once, and from then on a
+  single command connects over your existing SSH access — no daemon to keep
+  running, no keys to copy around.
 - **It's safe code.** Written in 100% safe Rust (`#![forbid(unsafe_code)]`),
   thoroughly tested, with zero compiler/linter warnings.
 
@@ -59,7 +60,7 @@ noissh --ssh you@server
 
 noissh uses your existing SSH access to start the server for you and then runs
 the session over its own resilient, encrypted channel. (The server just needs
-`noisshd` installed — same idea as mosh needing `mosh-server`.)
+the `noisshd` binary installed.)
 
 **Running your own always-on server:**
 

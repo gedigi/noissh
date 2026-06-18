@@ -5,7 +5,7 @@
 //!   noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--command CMD ...]
 //!       Standalone daemon: persistent key, persistent authorized_keys.
 //!   noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
-//!       mosh-style: ephemeral key, trust the one given client key, bind an
+//!       one-shot: ephemeral key, trust the one given client key, bind an
 //!       ephemeral UDP port, print the connect line, detach, serve one session.
 
 use std::net::SocketAddr;

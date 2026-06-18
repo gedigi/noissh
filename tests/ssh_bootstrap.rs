@@ -1,4 +1,4 @@
-//! End-to-end test of the mosh-style SSH bootstrap.
+//! End-to-end test of the SSH bootstrap.
 //!
 //! A fake `ssh` program (a shell script) stands in for the real one: instead of
 //! connecting to a remote host, it drops the target argument and runs the rest

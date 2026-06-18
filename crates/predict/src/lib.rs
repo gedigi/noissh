@@ -6,7 +6,7 @@
 //! (the [`term::flags::PREDICTED`] flag, rendered e.g. underlined), and
 //! reconciles or abandons predictions as authoritative screen diffs arrive.
 //!
-//! Clean-room reimplementation of mosh's idea, not its code.
+//! Clean-room implementation.
 
 use term::cell::flags;
 use term::{Cell, Color, Grid};

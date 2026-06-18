@@ -2,7 +2,7 @@
 
 ## Context
 
-`noissh` is a remote-shell utility that aims to be **as resilient as mosh** (instant feel
+`noissh` is a remote-shell utility that aims to be **exceptionally resilient** (instant feel
 on lossy/high-latency links, survives IP changes, NAT rebinding, and laptop sleep, no
 reconnect) and **as rich as SSH** (port forwarding, file transfer, agent forwarding),
 built entirely on the **Noise Protocol Framework** for its cryptography rather than
@@ -28,7 +28,7 @@ TTY overlay** — not reinventing sshd's privilege/login machinery, which we reu
 | Language | **Rust** (`snow`, `nix`, `pam`) |
 | Transport substrate | **mini-QUIC-with-Noise** — lean Noise-native layer mirroring QUIC's frame model |
 | Crypto framework | **Noise is non-negotiable** — QUIC-with-TLS rejected |
-| TTY for v1 | **Full mosh-parity**: state-sync **and** client-side predictive echo |
+| TTY for v1 | **Full predictive TTY**: state-sync **and** client-side predictive echo |
 
 ## Architecture
 
@@ -70,7 +70,7 @@ TTY overlay** — not reinventing sshd's privilege/login machinery, which we reu
    (update peer address on any authenticated packet). Sits *above* the Noise core (Noise
    encrypts each datagram; transport sees plaintext frames).
 3. **Terminal model** (`term/`) — server-side authoritative emulator + screen-state
-   representation + latest-wins diff encoder/decoder. Clean-room (no GPL mosh code).
+   representation + latest-wins diff encoder/decoder. Clean-room (no third-party GPL code).
 4. **Predictive echo engine** (`predict/`) — client-side only. Echo-safety heuristics,
    cursor prediction, abandon-bad-guess reconciliation against authoritative diffs.
 5. **Auth & PAM** (`auth/`) — `authorized_keys`-equivalent parsing, Noise static-key
@@ -110,11 +110,11 @@ TTY overlay** — not reinventing sshd's privilege/login machinery, which we reu
   with no reconnect.
 - The interactive shell rides **unreliable, latest-wins datagrams** (state-sync), so packet
   loss never stalls a byte stream — only the newest screen state matters. This is the same
-  property that makes mosh feel alive on terrible links.
+  property that keeps an interactive session feeling alive on terrible links.
 - Anti-replay: per-direction nonce window (Noise gives strictly increasing nonces); the
   transport layer additionally tracks a sliding window to drop replayed/very-old datagrams.
 
-## TTY / predictive echo (v1, full mosh-parity)
+## TTY / predictive echo (v1, full predictive echo)
 
 - **Server** runs the authoritative terminal emulator, owns the true screen, and emits
   latest-wins diffs of (screen grid, cursor, modes) toward the client.
@@ -126,7 +126,7 @@ TTY overlay** — not reinventing sshd's privilege/login machinery, which we reu
 
 ## Scope — both v1 and v2 are committed deliverables
 
-This plan covers the full path to a mosh-resilient, SSH-rich tool. v1 ships the resilient
+This plan covers the full path to a highly resilient, SSH-rich tool. v1 ships the resilient
 interactive shell; v2 builds the reliable-stream layer on the **same session core** to
 deliver SSH's richness. Both are in scope; v1 simply lands first because it de-risks v2.
 
@@ -135,7 +135,7 @@ deliver SSH's richness. Both are in scope; v1 simply lands first because it de-r
 - `XX` Noise handshake, known-hosts TOFU, `authorized_keys` client auth, PAM acct/session.
 - Noise/UDP session layer with session-id roaming and unreliable latest-wins datagrams.
 - Server authoritative terminal emulator + state-sync.
-- Client predictive-echo engine (mosh-parity feel).
+- Client predictive-echo engine (instant local echo).
 - Window-resize propagation, UTF-8, basic `noissh user@host` CLI, config + known_hosts files.
 
 **v2 — SSH richness (reliable multiplexed streams):**

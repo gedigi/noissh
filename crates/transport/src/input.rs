@@ -3,7 +3,7 @@
 //! User keystrokes are an append-only byte stream. The client sends the
 //! unacknowledged suffix (retransmitting until acked); the server reconstructs
 //! the exact contiguous stream regardless of loss, reorder, or duplication —
-//! the same idea mosh uses for its user-input state.
+//! the same approach used for resilient user-input streams.
 
 use wire::Frame;
 

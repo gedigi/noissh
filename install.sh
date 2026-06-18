@@ -187,7 +187,7 @@ esac
 echo
 ok "noissh installed."
 printf '\n%sGet started%s\n' "$BOLD" "$RST"
-info "Connect to a host you can already SSH into (mosh-style, recommended):"
+info "Connect to a host you can already SSH into (recommended):"
 info "  ${BOLD}noissh --ssh user@host${RST}"
 info "  ${DIM}(requires noisshd installed on the remote host)${RST}"
 echo

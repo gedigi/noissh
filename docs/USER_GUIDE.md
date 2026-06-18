@@ -1,8 +1,8 @@
 # noissh User Guide
 
 noissh is a remote shell that feels instant on bad links and survives network
-changes (Wi-Fi↔cellular, NAT rebind, laptop sleep) without reconnecting — like
-mosh — while using the Noise Protocol Framework for all cryptography.
+changes (Wi-Fi↔cellular, NAT rebind, laptop sleep) without reconnecting, using
+the Noise Protocol Framework for all cryptography.
 
 This guide covers installing, connecting, configuring, and troubleshooting.
 
@@ -11,7 +11,7 @@ This guide covers installing, connecting, configuring, and troubleshooting.
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Connecting](#connecting)
-  - [mosh-style SSH bootstrap](#mosh-style-ssh-bootstrap)
+  - [SSH bootstrap](#ssh-bootstrap)
   - [Direct connection](#direct-connection)
 - [Running the server](#running-the-server)
 - [Keys & trust](#keys--trust)
@@ -47,7 +47,7 @@ see [Troubleshooting](#troubleshooting).)
 
 ## Connecting
 
-### mosh-style SSH bootstrap
+### SSH bootstrap
 
 ```sh
 noissh --ssh [user@]host [--server-cmd noisshd] [--port N] [-- <extra ssh args>]
@@ -134,7 +134,7 @@ Files live under `$XDG_CONFIG_HOME/noissh` (or `~/.config/noissh`):
 
 ```
 noissh [--ssh] [--port N] [--server-cmd CMD] [user@]host [-- <ssh args>]
-  --ssh           bootstrap the server over SSH (mosh-style)
+  --ssh           bootstrap the server over SSH
   --port N        UDP port for direct connection (default 51820)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   -- <args>       pass remaining args to ssh (only with --ssh)

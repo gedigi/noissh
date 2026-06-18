@@ -17,14 +17,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`term`).
   - Client-side predictive-echo engine with adaptive safety (`predict`).
   - `known_hosts` TOFU + `authorized_keys` trust model (`auth`).
-  - Portable PTY/login backend; Linux PAM/setuid privilege separation, `cfg`-gated
-    with PAM behind an opt-in feature (`pty`).
+  - PTY/login backend built on the safe `pty-process` crate (`pty`); the whole
+    workspace is `#![forbid(unsafe_code)]`.
   - `noissh` client and `noisshd` server binaries; config & key management.
   - Raw-mode interactive client with an incremental ANSI renderer.
 - **v2 — reliable stream multiplexer** (`transport::StreamMux`): ordered,
   flow-controlled byte streams with ARQ over the same roaming session — the
   substrate for forthcoming port forwarding, file transfer, and agent forwarding.
-- **mosh-style SSH bootstrap** (`noissh --ssh`, `noisshd --one-shot`): use SSH
+- **SSH bootstrap** (`noissh --ssh`, `noisshd --one-shot`): use SSH
   only to launch the server and exchange the UDP port + ephemeral key, then run
   over Noise/UDP.
 - Test suite: unit tests per crate, an in-process resilience harness

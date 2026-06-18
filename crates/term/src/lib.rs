@@ -2,7 +2,7 @@
 //! Terminal model for noissh.
 //!
 //! A clean-room, server-side authoritative terminal emulator plus a latest-wins
-//! screen-state diff encoder/decoder. No GPL mosh code. Pure model: no I/O.
+//! screen-state diff encoder/decoder. No third-party GPL code. Pure model: no I/O.
 
 pub mod cell;
 pub mod diff;

@@ -1,10 +1,10 @@
-//! mosh-style SSH bootstrap.
+//! SSH bootstrap.
 //!
 //! `ssh` is used only to launch the remote server and hand back its UDP port +
 //! ephemeral public key over the already-authenticated SSH channel; the actual
 //! session then runs over the Noise/UDP transport. The SSH connection is not
-//! kept open — the one-shot server detaches (daemonizes) and survives it,
-//! exactly like `mosh-server`.
+//! kept open — the one-shot server detaches (daemonizes) and keeps serving
+//! after `ssh` exits.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Command;
@@ -98,7 +98,7 @@ pub fn bootstrap(
 
 /// Detach from the controlling SSH session so the server survives `ssh`
 /// returning. Uses the `daemonize` crate (double fork + `setsid` + stdio
-/// redirected to `/dev/null`), exactly like `mosh-server`. Call AFTER the
+/// redirected to `/dev/null`). Call AFTER the
 /// connect line has been printed and flushed.
 pub fn daemonize() -> Result<(), RuntimeError> {
     daemonize::Daemonize::new()
