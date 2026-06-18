@@ -34,10 +34,6 @@ pub enum ControlMsg {
     Resize { cols: u16, rows: u16 },
     /// Server → client: the shell exited with this status.
     Exit { status: i32 },
-    /// Optional second-factor prompt (server → client), like keyboard-interactive.
-    AuthPrompt { echo: bool, prompt: String },
-    /// Optional second-factor response (client → server).
-    AuthResponse { data: String },
     /// Client → server: please listen on `bind_port` and forward accepted
     /// connections back to the client, which connects them to `target` (`-R`).
     RemoteForward { bind_port: u16, target: String },
@@ -46,8 +42,7 @@ pub enum ControlMsg {
 const M_OPEN_SHELL: u8 = 1;
 const M_RESIZE: u8 = 2;
 const M_EXIT: u8 = 3;
-const M_AUTH_PROMPT: u8 = 4;
-const M_AUTH_RESPONSE: u8 = 5;
+// Tags 4 and 5 were a never-wired second-factor prompt/response; left reserved.
 const M_REMOTE_FORWARD: u8 = 6;
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -100,15 +95,6 @@ impl ControlMsg {
                 out.push(M_EXIT);
                 put_varint(&mut out, zigzag(*status as i64));
             }
-            ControlMsg::AuthPrompt { echo, prompt } => {
-                out.push(M_AUTH_PROMPT);
-                out.push(*echo as u8);
-                put_str(&mut out, prompt);
-            }
-            ControlMsg::AuthResponse { data } => {
-                out.push(M_AUTH_RESPONSE);
-                put_str(&mut out, data);
-            }
             ControlMsg::RemoteForward { bind_port, target } => {
                 out.push(M_REMOTE_FORWARD);
                 put_varint(&mut out, *bind_port as u64);
@@ -143,15 +129,6 @@ impl ControlMsg {
             }
             M_EXIT => ControlMsg::Exit {
                 status: unzigzag(get_varint(buf, &mut pos)?) as i32,
-            },
-            M_AUTH_PROMPT => {
-                let echo = *buf.get(pos).ok_or(ControlError::Eof)? != 0;
-                pos += 1;
-                let prompt = get_str(buf, &mut pos)?;
-                ControlMsg::AuthPrompt { echo, prompt }
-            }
-            M_AUTH_RESPONSE => ControlMsg::AuthResponse {
-                data: get_str(buf, &mut pos)?,
             },
             M_REMOTE_FORWARD => {
                 let bind_port = get_varint(buf, &mut pos)? as u16;
@@ -192,13 +169,6 @@ mod tests {
         roundtrip(ControlMsg::Exit { status: 0 });
         roundtrip(ControlMsg::Exit { status: 137 });
         roundtrip(ControlMsg::Exit { status: -1 });
-        roundtrip(ControlMsg::AuthPrompt {
-            echo: false,
-            prompt: "Password: ".into(),
-        });
-        roundtrip(ControlMsg::AuthResponse {
-            data: "secret".into(),
-        });
         roundtrip(ControlMsg::RemoteForward {
             bind_port: 8080,
             target: "127.0.0.1:80".into(),
