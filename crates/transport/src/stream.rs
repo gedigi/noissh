@@ -191,20 +191,22 @@ impl StreamState {
 
     /// Both directions are closed and all received data has been read.
     fn fully_done(&self) -> bool {
-        if !self.send_fin || !self.fin_acked {
+        // Our send side must at least have closed.
+        if !self.send_fin {
             return false;
         }
-        // Primary path: the peer's FIN-bearing StreamData arrived and all data
-        // up to the FIN offset has been delivered and read.
-        if matches!(self.peer_fin, HalfState::Finished(at)
-            if self.recv.delivered >= at && self.recv.unread() == 0)
+        // Primary path: our FIN was acked AND the peer's FIN-bearing StreamData
+        // arrived with all data up to the FIN offset delivered and read.
+        if self.fin_acked
+            && matches!(self.peer_fin, HalfState::Finished(at)
+                if self.recv.delivered >= at && self.recv.unread() == 0)
         {
             return true;
         }
         // Fallback: the peer sent a graceful StreamClose (surfaced to the app)
-        // but the FIN-bearing StreamData never arrived and the peer has gone
-        // silent for the grace window — reclaim so a dead peer can't leak the
-        // stream forever. An alive peer would have resent the FIN by now.
+        // but has since gone silent for the grace window — reclaim so a dead peer
+        // can't leak the stream forever, even if our FIN or its FIN-bearing data
+        // were never acked/delivered. An alive peer would still be chattering.
         self.close_received && self.close_ticks >= CLOSE_GRACE_TICKS
     }
 
@@ -224,7 +226,11 @@ impl StreamState {
         }
         // The receiver acks up to the data end; once it covers all our bytes,
         // our FIN is acknowledged (there is no extra FIN byte in the sequence).
-        if self.send_fin && ack >= self.send_next {
+        // This only holds once the FIN bit has actually gone out on a frame: if
+        // `send_fin` is set after all data is already acked, no frame carried the
+        // FIN yet, so the peer hasn't seen the close — `transmit` must still emit
+        // an explicit empty FIN.
+        if self.send_fin && self.fin_sent && ack >= self.send_next {
             self.fin_acked = true;
         }
     }
@@ -238,6 +244,9 @@ impl StreamState {
             let lo = (off - self.send_base) as usize;
             let hi = (chunk_end - self.send_base) as usize;
             let fin = self.send_fin && chunk_end == self.send_next && !self.fin_acked;
+            if fin {
+                self.fin_sent = true;
+            }
             out.push(Frame::StreamData {
                 id: self.id,
                 offset: off,
@@ -313,13 +322,11 @@ impl StreamState {
                 status,
             });
         }
-        // Count down the close grace window while we're settled on our side but
-        // still missing the peer's FIN (see `fully_done`).
-        if self.close_received
-            && self.send_fin
-            && self.fin_acked
-            && matches!(self.peer_fin, HalfState::Open)
-        {
+        // Count down the close grace window once the peer has gracefully closed
+        // (StreamClose surfaced) but we're still missing its FIN-bearing data
+        // (see `fully_done`). We don't require our own FIN to be acked here: a
+        // silent peer would otherwise leak the stream forever.
+        if self.close_received && self.send_fin && matches!(self.peer_fin, HalfState::Open) {
             self.close_ticks = self.close_ticks.saturating_add(1);
         }
     }
@@ -540,6 +547,32 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         out
+    }
+
+    #[test]
+    fn fin_set_after_data_is_acked_still_reaches_peer() {
+        // Regression: if the sender closes its half AFTER all data has already
+        // been sent and acked, the FIN bit must still be transmitted explicitly.
+        // Otherwise the receiver never learns the stream ended (it sees the data
+        // but no FIN), and a transfer waiting on end-of-stream hangs forever.
+        let mut a = StreamMux::new(true);
+        let mut b = StreamMux::new(false);
+        let id = a.open(StreamKind::FileTransfer, b"PUT 5 /tmp/x".to_vec());
+        a.write(id, b"hello");
+        // Round-trip until every data byte is acked (no close yet).
+        pump(&mut a, &mut b, 6, |_| false);
+        assert_eq!(drain(&mut b, id), b"hello");
+        assert!(
+            !b.is_recv_finished(id),
+            "receiver must not see EOF before the sender closes"
+        );
+        // Now close the send half — data is already fully acked.
+        a.close(id, 0);
+        pump(&mut a, &mut b, 6, |_| false);
+        assert!(
+            b.is_recv_finished(id),
+            "receiver never observed the late FIN"
+        );
     }
 
     #[test]

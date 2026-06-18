@@ -9,10 +9,12 @@
 pub mod control;
 pub mod handshake;
 pub mod shell;
+pub mod xfer;
 
 pub use control::{ControlError, ControlMsg};
 pub use handshake::{HandshakeError, Handshaker, HsOutcome};
 pub use shell::{ClientShell, ServerShell};
+pub use xfer::XferRequest;
 
 use auth::{AuthorizedKeys, KnownHosts, PublicKey, Tofu};
 

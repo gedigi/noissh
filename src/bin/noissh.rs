@@ -18,6 +18,7 @@ use noissh::config::{config_dir, load_known_hosts, load_or_generate_keypair, sav
 use noissh::tty::{RawMode, Renderer, terminal_size};
 use noissh::{RuntimeError, ssh};
 use predict::DisplayMode;
+use proto::XferRequest;
 
 fn main() {
     if let Err(e) = run() {
@@ -36,6 +37,9 @@ struct Args {
     local_forwards: Vec<(u16, String)>,
     /// Remote port forwards: (remote_port, "host:port").
     remote_forwards: Vec<(u16, String)>,
+    /// A one-shot file transfer: (request, local path). Mutually exclusive with
+    /// an interactive shell and port forwarding.
+    transfer: Option<(proto::XferRequest, String)>,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -57,6 +61,7 @@ fn parse_args() -> Args {
         ssh_args: Vec::new(),
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
+        transfer: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -86,6 +91,30 @@ fn parse_args() -> Args {
                     eprintln!("noissh: ignoring malformed -R spec (want RPORT:HOST:PORT)");
                 }
             }
+            "--put" => match it.next().as_deref().and_then(|s| s.split_once(':')) {
+                Some((local, remote)) if !local.is_empty() && !remote.is_empty() => {
+                    let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+                    a.transfer = Some((
+                        XferRequest::Put {
+                            path: remote.to_string(),
+                            size,
+                        },
+                        local.to_string(),
+                    ));
+                }
+                _ => eprintln!("noissh: --put wants LOCAL:REMOTE"),
+            },
+            "--get" => match it.next().as_deref().and_then(|s| s.split_once(':')) {
+                Some((remote, local)) if !remote.is_empty() && !local.is_empty() => {
+                    a.transfer = Some((
+                        XferRequest::Get {
+                            path: remote.to_string(),
+                        },
+                        local.to_string(),
+                    ));
+                }
+                _ => eprintln!("noissh: --get wants REMOTE:LOCAL"),
+            },
             "--" => a.ssh_args = it.by_ref().collect(),
             other => {
                 if a.target.is_none() {
@@ -132,8 +161,10 @@ fn run() -> Result<(), RuntimeError> {
         (addr, format!("{host}:{}", args.port))
     };
 
-    // Forward-only when `-L`/`-R` is given (no interactive shell), like `ssh -N`.
+    // No interactive shell for a one-shot transfer or when `-L`/`-R` is given
+    // (the latter behaves like `ssh -N`).
     let forward_only = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
+    let want_shell = !forward_only && args.transfer.is_none();
     let mut client = Client::connect_with(
         &keypair,
         known,
@@ -142,7 +173,7 @@ fn run() -> Result<(), RuntimeError> {
         rows,
         cols,
         DisplayMode::Adaptive,
-        !forward_only,
+        want_shell,
     )?;
 
     // Persist any newly-pinned host key (direct-mode TOFU).
@@ -150,7 +181,11 @@ fn run() -> Result<(), RuntimeError> {
         save_known_hosts(&kh_path, client.core().known_hosts())?;
     }
 
-    if forward_only {
+    if let Some((req, local)) = args.transfer {
+        client.run_transfer(&req, &local)?;
+        eprintln!("noissh: transfer complete");
+        Ok(())
+    } else if forward_only {
         client.run_forwards(&args.local_forwards, &args.remote_forwards)
     } else {
         interactive_loop(&mut client)

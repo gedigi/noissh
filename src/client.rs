@@ -252,6 +252,11 @@ impl ClientCore {
             .open(StreamKind::Forward, target.as_bytes().to_vec())
     }
 
+    /// Open a file-transfer stream carrying `req`. Returns the stream id.
+    pub fn open_xfer(&mut self, req: &proto::XferRequest) -> u64 {
+        self.mux.open(StreamKind::FileTransfer, req.encode())
+    }
+
     /// Queue bytes to send on a stream.
     pub fn stream_write(&mut self, id: u64, data: &[u8]) {
         self.mux.write(id, data);
@@ -279,6 +284,11 @@ impl ClientCore {
     /// Bytes written to a stream but not yet acked (for driver backpressure).
     pub fn stream_in_flight(&self, id: u64) -> u64 {
         self.mux.in_flight(id)
+    }
+
+    /// True once the peer closed its send half and we've read every byte.
+    pub fn stream_recv_finished(&self, id: u64) -> bool {
+        self.mux.is_recv_finished(id)
     }
 
     /// Drain stream lifecycle events (Opened/Readable/Closed/Reset).
@@ -591,6 +601,111 @@ impl Client {
                     if c.is_finished() {
                         conns.remove(&id);
                     }
+                }
+            }
+
+            self.flush()?;
+            if Instant::now() >= next_keepalive {
+                self.send_keepalive()?;
+                next_keepalive = Instant::now() + keepalive;
+            }
+        }
+    }
+
+    /// Run a single file transfer to completion.
+    ///
+    /// For [`proto::XferRequest::Put`], `local` is the source file read and sent
+    /// to the server's `path`. For [`proto::XferRequest::Get`], `local` is the
+    /// destination file written from the bytes the server sends back. Returns an
+    /// error if the server aborts the stream (e.g. missing/unwritable path).
+    pub fn run_transfer(
+        &mut self,
+        req: &proto::XferRequest,
+        local: &str,
+    ) -> Result<(), RuntimeError> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd;
+        use std::time::Instant;
+
+        // poll()-driven loop, so the UDP socket must be non-blocking.
+        self.socket.set_nonblocking(true)?;
+
+        const SEND_CAP: u64 = 512 * 1024;
+        const CHUNK: usize = 64 * 1024;
+
+        let id = self.core.open_xfer(req);
+        let mut source = match req {
+            proto::XferRequest::Put { .. } => Some(crate::xfer::FileSource::open(local)?),
+            proto::XferRequest::Get { .. } => None,
+        };
+        let mut sink = match req {
+            proto::XferRequest::Get { .. } => Some(crate::xfer::FileSink::create(local)?),
+            proto::XferRequest::Put { .. } => None,
+        };
+        let mut sent_fin = false;
+
+        let keepalive = Duration::from_secs(3);
+        let mut next_keepalive = Instant::now() + keepalive;
+
+        loop {
+            let timeout = if self.core.has_outgoing() {
+                Duration::from_millis(20)
+            } else {
+                next_keepalive
+                    .saturating_duration_since(Instant::now())
+                    .min(keepalive)
+            };
+            {
+                let sock = self.socket.as_fd();
+                let mut fds = [PollFd::new(sock, PollFlags::POLLIN)];
+                let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
+                let _ = poll(&mut fds, PollTimeout::from(ms));
+            }
+
+            while self.recv_and_handle()? {}
+
+            // The server aborts the stream on a path error.
+            for ev in self.core.take_stream_events() {
+                if let StreamEvent::Reset { id: eid } = ev
+                    && eid == id
+                {
+                    return Err(RuntimeError::Transfer(
+                        "remote rejected the transfer (no such file or permission denied)".into(),
+                    ));
+                }
+            }
+
+            // Upload: stream the local file, then close to signal EOF.
+            if let Some(src) = source.as_mut() {
+                if !sent_fin && self.core.stream_in_flight(id) < SEND_CAP {
+                    let chunk = src.read_chunk(CHUNK)?;
+                    if chunk.is_empty() {
+                        self.core.stream_close(id);
+                        sent_fin = true;
+                    } else {
+                        self.core.stream_write(id, &chunk);
+                    }
+                }
+                // Done once the server acknowledges by closing its half back.
+                if sent_fin && self.core.stream_recv_finished(id) {
+                    self.flush()?;
+                    return Ok(());
+                }
+            }
+
+            // Download: drain stream bytes into the local file.
+            if let Some(snk) = sink.as_mut() {
+                loop {
+                    let d = self.core.stream_read(id);
+                    if d.is_empty() {
+                        break;
+                    }
+                    snk.write(&d)?;
+                }
+                if self.core.stream_recv_finished(id) {
+                    self.core.stream_close(id);
+                    self.flush()?;
+                    return Ok(());
                 }
             }
 

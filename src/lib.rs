@@ -12,6 +12,7 @@ pub mod forward;
 pub mod server;
 pub mod ssh;
 pub mod tty;
+pub mod xfer;
 
 use thiserror::Error;
 
@@ -40,4 +41,6 @@ pub enum RuntimeError {
     Timeout,
     #[error("SSH bootstrap failed: no connect line from remote noisshd")]
     SshBootstrap,
+    #[error("file transfer failed: {0}")]
+    Transfer(String),
 }

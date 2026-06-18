@@ -466,6 +466,13 @@ impl ServerCore {
         }
     }
 
+    /// Abort a stream within a session (signals failure to the peer).
+    pub fn stream_reset(&mut self, sid: SessionId, id: u64) {
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            s.mux.reset(id);
+        }
+    }
+
     /// Open a forward stream from the server side (used by remote `-R`
     /// forwarding); returns the new stream id.
     pub fn open_forward(&mut self, sid: SessionId, target: &str) -> Option<u64> {
@@ -486,6 +493,14 @@ impl ServerCore {
             .map(|s| s.mux.in_flight(id))
             .unwrap_or(0)
     }
+
+    /// True once the peer closed its send half and we've read every byte.
+    pub fn stream_recv_finished(&self, sid: SessionId, id: u64) -> bool {
+        self.sessions
+            .get(&sid)
+            .map(|s| s.mux.is_recv_finished(id))
+            .unwrap_or(true)
+    }
 }
 
 /// UDP driver around [`ServerCore`] for the `noisshd` binary.
@@ -497,6 +512,14 @@ pub struct Server {
     forwards: HashMap<(SessionId, u64), crate::forward::ForwardConn>,
     /// Remote-forward (`-R`) listeners: (listener, session, target).
     remote_listeners: Vec<(std::net::TcpListener, SessionId, String)>,
+    /// In-progress file transfers keyed by (session, stream id).
+    xfers: HashMap<(SessionId, u64), XferState>,
+}
+
+/// Server side of a file transfer: writing an upload, or reading a download.
+enum XferState {
+    Put(crate::xfer::FileSink),
+    Get(crate::xfer::FileSource),
 }
 
 impl Server {
@@ -508,6 +531,7 @@ impl Server {
             socket,
             forwards: HashMap::new(),
             remote_listeners: Vec::new(),
+            xfers: HashMap::new(),
         })
     }
 
@@ -572,15 +596,44 @@ impl Server {
                         None => self.core.stream_close(sid, id), // unreachable target
                     }
                 }
+                StreamEvent::Opened {
+                    id,
+                    kind: StreamKind::FileTransfer,
+                    meta,
+                } => match proto::XferRequest::parse(&meta) {
+                    Some(proto::XferRequest::Put { path, .. }) => {
+                        match crate::xfer::FileSink::create(&path) {
+                            Ok(sink) => {
+                                self.xfers.insert((sid, id), XferState::Put(sink));
+                            }
+                            // Can't create the destination: signal failure.
+                            Err(_) => self.core.stream_reset(sid, id),
+                        }
+                    }
+                    Some(proto::XferRequest::Get { path }) => {
+                        match crate::xfer::FileSource::open(&path) {
+                            Ok(src) => {
+                                self.xfers.insert((sid, id), XferState::Get(src));
+                            }
+                            // No such file (or unreadable): signal failure.
+                            Err(_) => self.core.stream_reset(sid, id),
+                        }
+                    }
+                    None => self.core.stream_reset(sid, id),
+                },
                 // Draining happens in the bounded pump loop below.
                 StreamEvent::Readable { .. } => {}
                 StreamEvent::Closed { id, .. } => {
                     if let Some(c) = self.forwards.get_mut(&(sid, id)) {
                         c.mark_peer_closed();
                     }
+                    // Upload completion is detected in the pump loop once every
+                    // buffered byte has been drained into the sink (the Closed
+                    // event can precede the final data segments).
                 }
                 StreamEvent::Reset { id } => {
                     self.forwards.remove(&(sid, id));
+                    self.xfers.remove(&(sid, id));
                 }
                 _ => {}
             }
@@ -612,6 +665,47 @@ impl Server {
                 if c.is_finished() {
                     self.forwards.remove(&k);
                 }
+            }
+        }
+
+        // Pump file transfers: drain uploads into their sinks, feed downloads
+        // from their sources, and finalize each when complete.
+        let xkeys: Vec<(SessionId, u64)> = self.xfers.keys().copied().collect();
+        for k in xkeys {
+            // Whether the download stream has room for another chunk (bounded by
+            // unacked in-flight bytes); computed before the borrow below.
+            let get_has_window = self.core.stream_in_flight(k.0, k.1) < SEND_CAP;
+            let done = match self.xfers.get_mut(&k) {
+                Some(XferState::Put(sink)) => {
+                    let mut err = false;
+                    loop {
+                        let d = self.core.stream_read(k.0, k.1);
+                        if d.is_empty() {
+                            break;
+                        }
+                        if sink.write(&d).is_err() {
+                            err = true;
+                            break;
+                        }
+                    }
+                    // Finished once the client closed its half and all bytes are
+                    // written; or aborted on a write error.
+                    err || self.core.stream_recv_finished(k.0, k.1)
+                }
+                Some(XferState::Get(src)) if get_has_window => match src.read_chunk(64 * 1024) {
+                    Ok(d) if !d.is_empty() => {
+                        self.core.stream_write(k.0, k.1, &d);
+                        false
+                    }
+                    // EOF or read error: nothing more to send.
+                    _ => true,
+                },
+                // Window full (or no such transfer): wait for the next pump.
+                Some(XferState::Get(_)) | None => false,
+            };
+            if done {
+                self.core.stream_close(k.0, k.1);
+                self.xfers.remove(&k);
             }
         }
     }
