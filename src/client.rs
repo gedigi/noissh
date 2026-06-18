@@ -40,12 +40,19 @@ pub struct ClientCore {
     /// Whether to request an interactive shell on connect (false for `-N`-style
     /// forward-only sessions).
     want_shell: bool,
+    /// Pending remote-forward (`-R`) requests, retransmitted for a bounded
+    /// number of ticks (there is no ack, so we resend to survive packet loss).
+    remote_forwards: Vec<(u16, String)>,
+    remote_forward_ticks: u32,
     known_hosts_dirty: bool,
 }
 
 /// Bound on OpenShell retransmissions, so a shell that produces no screen output
 /// does not cause the request to be resent for the whole session.
 const OPEN_SHELL_MAX_TICKS: u32 = 300;
+
+/// Bound on RemoteForward retransmissions (best-effort reliability over UDP).
+const REMOTE_FORWARD_MAX_TICKS: u32 = 300;
 
 impl ClientCore {
     /// Begin a connection. Returns the core and the first handshake packet.
@@ -80,6 +87,8 @@ impl ClientCore {
             mux: StreamMux::new(true),
             stream_events: Vec::new(),
             want_shell: true,
+            remote_forwards: Vec::new(),
+            remote_forward_ticks: 0,
             known_hosts_dirty: false,
         };
         Ok((core, first))
@@ -229,7 +238,9 @@ impl ClientCore {
                 || !self.pending_control.is_empty()
                 || self.need_ack
                 || self.shell.has_pending_input()
-                || self.mux.has_traffic())
+                || self.mux.has_traffic()
+                || (!self.remote_forwards.is_empty()
+                    && self.remote_forward_ticks < REMOTE_FORWARD_MAX_TICKS))
     }
 
     // --- reliable streams (port forwarding) ---
@@ -257,15 +268,17 @@ impl ClientCore {
     }
 
     /// Request a remote forward (`-R`): ask the server to listen on `bind_port`
-    /// and tunnel accepted connections back to us for delivery to `target`.
+    /// and tunnel accepted connections back to us for delivery to `target`. The
+    /// request is retransmitted for a bounded window (no ack exists, so we resend
+    /// to survive packet loss).
     pub fn request_remote_forward(&mut self, bind_port: u16, target: &str) {
-        self.pending_control.push(Frame::Control {
-            data: ControlMsg::RemoteForward {
-                bind_port,
-                target: target.to_string(),
-            }
-            .encode(),
-        });
+        self.remote_forwards.push((bind_port, target.to_string()));
+        self.remote_forward_ticks = 0;
+    }
+
+    /// Bytes written to a stream but not yet acked (for driver backpressure).
+    pub fn stream_in_flight(&self, id: u64) -> u64 {
+        self.mux.in_flight(id)
     }
 
     /// Drain stream lifecycle events (Opened/Readable/Closed/Reset).
@@ -299,15 +312,26 @@ impl ClientCore {
                 self.open_shell_pending = false;
             }
         }
+        // Retransmit remote-forward (`-R`) requests for a bounded window.
+        if !self.remote_forwards.is_empty() && self.remote_forward_ticks < REMOTE_FORWARD_MAX_TICKS {
+            for (bind_port, target) in &self.remote_forwards {
+                frames.push(Frame::Control {
+                    data: ControlMsg::RemoteForward { bind_port: *bind_port, target: target.clone() }
+                        .encode(),
+                });
+            }
+            self.remote_forward_ticks += 1;
+        }
         frames.append(&mut self.pending_control);
         frames.extend(self.shell.poll_frames());
         frames.extend(self.mux.poll_transmit());
         self.stream_events.extend(self.mux.take_events());
-        self.need_ack = false;
         if frames.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(vec![session.seal(&frames)?])
+        let pkt = session.seal(&frames)?;
+        self.need_ack = false; // only clear once the ack is actually sealed
+        Ok(vec![pkt])
     }
 }
 
@@ -454,19 +478,29 @@ impl Client {
         let keepalive = Duration::from_secs(3);
         let mut next_keepalive = Instant::now() + keepalive;
 
+        // Cap unacked per-stream bytes so a fast TCP producer can't grow the
+        // mux send buffer without bound (the mux has receive-side flow control;
+        // this is the matching send-side check).
+        const SEND_CAP: u64 = 512 * 1024;
+
         loop {
-            let timeout = if conns.is_empty() && !self.core.has_outgoing() {
+            let timeout = if self.core.has_outgoing() || conns.values().any(|c| c.wants_write()) {
+                Duration::from_millis(20)
+            } else {
                 next_keepalive
                     .saturating_duration_since(Instant::now())
                     .min(keepalive)
-            } else {
-                Duration::from_millis(5)
             };
             {
                 let sock = self.socket.as_fd();
                 let mut fds = vec![PollFd::new(sock, PollFlags::POLLIN)];
                 for (l, _) in &listeners {
                     fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
+                }
+                // Wait on each forwarded socket too (no busy-spin while connected).
+                let conn_fds: Vec<_> = conns.values().map(|c| c.as_fd()).collect();
+                for fd in &conn_fds {
+                    fds.push(PollFd::new(*fd, PollFlags::POLLIN));
                 }
                 let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
                 let _ = poll(&mut fds, PollTimeout::from(ms));
@@ -494,11 +528,7 @@ impl Client {
             // React to stream events (incl. inbound `-R` opens → dial out).
             for ev in self.core.take_stream_events() {
                 match ev {
-                    StreamEvent::Opened {
-                        id,
-                        kind: StreamKind::Forward,
-                        meta,
-                    } => {
+                    StreamEvent::Opened { id, kind: StreamKind::Forward, meta } => {
                         match std::str::from_utf8(&meta)
                             .ok()
                             .and_then(|t| ForwardConn::connect(t).ok())
@@ -520,27 +550,36 @@ impl Client {
                             }
                         }
                     }
-                    StreamEvent::Closed { id, .. } | StreamEvent::Reset { id } => {
+                    // Peer closed its send half: keep flushing what we have, but
+                    // stop expecting more session data. Reset aborts immediately.
+                    StreamEvent::Closed { id, .. } => {
+                        if let Some(c) = conns.get_mut(&id) {
+                            c.mark_peer_closed();
+                        }
+                    }
+                    StreamEvent::Reset { id } => {
                         conns.remove(&id);
                     }
                     _ => {}
                 }
             }
 
-            // TCP → session, and reap finished connections.
+            // TCP → session, flush, propagate half-close, and reap when finished.
             let ids: Vec<u64> = conns.keys().copied().collect();
             for id in ids {
                 if let Some(c) = conns.get_mut(&id) {
-                    let data = c.read_tcp();
-                    if !data.is_empty() {
-                        self.core.stream_write(id, &data);
+                    if self.core.stream_in_flight(id) < SEND_CAP {
+                        let data = c.read_tcp();
+                        if !data.is_empty() {
+                            self.core.stream_write(id, &data);
+                        }
                     }
                     c.flush();
-                    if c.tcp_closed() {
+                    if c.needs_fin() {
                         self.core.stream_close(id);
-                        if c.is_done() {
-                            conns.remove(&id);
-                        }
+                    }
+                    if c.is_finished() {
+                        conns.remove(&id);
                     }
                 }
             }

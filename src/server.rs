@@ -176,8 +176,13 @@ impl ServerCore {
             // previous connection went silent but the shell is still running),
             // move that running shell/pty onto the new transport session and
             // resend the screen as a full snapshot.
+            // Only reattach to a session that actually has a running shell/pty;
+            // never steal another still-establishing session for the same key.
             let existing = self.sessions.iter().find_map(|(k, s)| {
-                (s.client_key == client_static && s.exit_status.is_none()).then_some(*k)
+                (s.client_key == client_static
+                    && s.exit_status.is_none()
+                    && (s.shell.is_some() || s.pty.is_some()))
+                .then_some(*k)
             });
 
             let mut new_sess = ServerSession {
@@ -459,6 +464,16 @@ impl ServerCore {
             .get_mut(&sid)
             .map(|s| s.mux.open(StreamKind::Forward, target.as_bytes().to_vec()))
     }
+
+    /// Whether a session still exists (for the driver to prune `-R` listeners).
+    pub fn has_session(&self, sid: SessionId) -> bool {
+        self.sessions.contains_key(&sid)
+    }
+
+    /// Bytes written to a stream but not yet acked (driver backpressure).
+    pub fn stream_in_flight(&self, sid: SessionId, id: u64) -> u64 {
+        self.sessions.get(&sid).map(|s| s.mux.in_flight(id)).unwrap_or(0)
+    }
 }
 
 /// UDP driver around [`ServerCore`] for the `noisshd` binary.
@@ -490,12 +505,25 @@ impl Server {
         use crate::forward::ForwardConn;
 
         // Honour remote-forward (`-R`) requests: open a TCP listener per request.
+        // Bind to loopback by default (do NOT expose the forwarded port to the
+        // network — that would be an SSH "GatewayPorts yes" behaviour, which is
+        // off by default). Skip duplicates for the same (session, port).
         for (sid, bind_port, target) in self.core.take_remote_forward_requests() {
-            if let Ok(l) = std::net::TcpListener::bind(("0.0.0.0", bind_port)) {
+            let already = self
+                .remote_listeners
+                .iter()
+                .any(|(l, s, _)| *s == sid && l.local_addr().map(|a| a.port()).ok() == Some(bind_port));
+            if already {
+                continue;
+            }
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", bind_port)) {
                 let _ = l.set_nonblocking(true);
                 self.remote_listeners.push((l, sid, target));
             }
         }
+        // Drop listeners whose session is gone (avoids port squatting + leak).
+        self.remote_listeners.retain(|(_, sid, _)| self.core.has_session(*sid));
+
         // Accept on remote listeners: open a forward stream toward the client.
         let mut accepted: Vec<(SessionId, String, std::net::TcpStream)> = Vec::new();
         for (l, sid, target) in &self.remote_listeners {
@@ -543,26 +571,34 @@ impl Server {
                         }
                     }
                 }
-                StreamEvent::Closed { id, .. } | StreamEvent::Reset { id } => {
+                StreamEvent::Closed { id, .. } => {
+                    if let Some(c) = self.forwards.get_mut(&(sid, id)) {
+                        c.mark_peer_closed();
+                    }
+                }
+                StreamEvent::Reset { id } => {
                     self.forwards.remove(&(sid, id));
                 }
                 _ => {}
             }
         }
-        // TCP → session, and reap finished connections.
+        // TCP → session, flush, propagate half-close, reap when finished.
+        const SEND_CAP: u64 = 512 * 1024;
         let keys: Vec<(SessionId, u64)> = self.forwards.keys().copied().collect();
         for k in keys {
             if let Some(c) = self.forwards.get_mut(&k) {
-                let d = c.read_tcp();
-                if !d.is_empty() {
-                    self.core.stream_write(k.0, k.1, &d);
+                if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
+                    let d = c.read_tcp();
+                    if !d.is_empty() {
+                        self.core.stream_write(k.0, k.1, &d);
+                    }
                 }
                 c.flush();
-                if c.tcp_closed() {
+                if c.needs_fin() {
                     self.core.stream_close(k.0, k.1);
-                    if c.is_done() {
-                        self.forwards.remove(&k);
-                    }
+                }
+                if c.is_finished() {
+                    self.forwards.remove(&k);
                 }
             }
         }

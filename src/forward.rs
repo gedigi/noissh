@@ -1,18 +1,26 @@
 //! TCP plumbing for port forwarding: pairs a non-blocking [`TcpStream`] with a
-//! reliable session stream, buffering each direction so neither side blocks.
+//! reliable session stream, buffering each direction so neither side blocks and
+//! handling half-close without dropping buffered data.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::{AsFd, BorrowedFd, RawFd};
 
-/// One forwarded TCP connection. The session-stream side is driven by the
-/// caller (read via the mux, write via the mux); this type owns the TCP socket
-/// and an outbound buffer for bytes arriving from the session.
+/// One forwarded TCP connection. The session-stream side is driven by the caller
+/// (read via the mux, write via the mux); this type owns the TCP socket plus an
+/// outbound buffer for bytes arriving from the session.
 pub struct ForwardConn {
     stream: TcpStream,
     /// Bytes received from the session, waiting to be written to TCP.
     out: Vec<u8>,
-    /// The TCP peer closed its side (read returned EOF) or errored.
-    tcp_closed: bool,
+    /// TCP read side hit EOF (the TCP peer won't send more).
+    read_closed: bool,
+    /// The session peer closed its half (we won't receive more session data).
+    peer_closed: bool,
+    /// We've already sent our FIN (stream close) to the session peer.
+    fin_sent: bool,
+    /// The TCP socket errored and is unusable.
+    dead: bool,
 }
 
 impl ForwardConn {
@@ -21,32 +29,37 @@ impl ForwardConn {
         Ok(ForwardConn {
             stream,
             out: Vec::new(),
-            tcp_closed: false,
+            read_closed: false,
+            peer_closed: false,
+            fin_sent: false,
+            dead: false,
         })
     }
 
     /// Connect out to `target` ("host:port"), returning a non-blocking conn.
     pub fn connect(target: &str) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(target)?;
-        ForwardConn::new(stream)
+        ForwardConn::new(TcpStream::connect(target)?)
     }
 
-    /// Drain all currently-available bytes from the TCP socket (to forward into
-    /// the session). Sets `tcp_closed` on EOF/error.
+    /// Drain currently-available bytes from the TCP socket (to forward into the
+    /// session). Sets `read_closed` on EOF, `dead` on error.
     pub fn read_tcp(&mut self) -> Vec<u8> {
         let mut got = Vec::new();
+        if self.read_closed || self.dead {
+            return got;
+        }
         let mut buf = [0u8; 16384];
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => {
-                    self.tcp_closed = true;
+                    self.read_closed = true;
                     break;
                 }
                 Ok(n) => got.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    self.tcp_closed = true;
+                    self.dead = true;
                     break;
                 }
             }
@@ -54,7 +67,7 @@ impl ForwardConn {
         got
     }
 
-    /// Queue bytes (from the session) to be written to TCP, then try to flush.
+    /// Queue bytes (from the session) to write to TCP, then try to flush.
     pub fn queue_to_tcp(&mut self, data: &[u8]) {
         self.out.extend_from_slice(data);
         self.flush();
@@ -62,7 +75,7 @@ impl ForwardConn {
 
     /// Try to flush buffered bytes to the TCP socket (non-blocking).
     pub fn flush(&mut self) {
-        while !self.out.is_empty() {
+        while !self.out.is_empty() && !self.dead {
             match self.stream.write(&self.out) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -71,7 +84,7 @@ impl ForwardConn {
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    self.tcp_closed = true;
+                    self.dead = true;
                     self.out.clear();
                     break;
                 }
@@ -79,17 +92,38 @@ impl ForwardConn {
         }
     }
 
-    /// The TCP peer has closed and all buffered output has been written.
-    pub fn is_done(&self) -> bool {
-        self.tcp_closed && self.out.is_empty()
+    /// Record that the session peer closed its send half.
+    pub fn mark_peer_closed(&mut self) {
+        self.peer_closed = true;
     }
 
-    pub fn tcp_closed(&self) -> bool {
-        self.tcp_closed
+    /// True when our TCP read side closed and we still owe the peer a FIN.
+    pub fn needs_fin(&mut self) -> bool {
+        if self.read_closed && !self.fin_sent {
+            self.fin_sent = true;
+            true
+        } else {
+            false
+        }
     }
 
-    /// Raw fd for poll registration.
-    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+    /// The connection is fully finished and can be reclaimed: either the TCP
+    /// socket errored, or both directions closed and all buffered output has
+    /// been written to TCP.
+    pub fn is_finished(&self) -> bool {
+        self.dead || (self.read_closed && self.peer_closed && self.out.is_empty())
+    }
+
+    /// Whether buffered output is waiting to be written (for POLLOUT interest).
+    pub fn wants_write(&self) -> bool {
+        !self.out.is_empty()
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+
+    pub fn as_raw_fd(&self) -> RawFd {
         use std::os::fd::AsRawFd;
         self.stream.as_raw_fd()
     }
