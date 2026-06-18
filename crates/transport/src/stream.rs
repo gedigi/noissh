@@ -20,12 +20,23 @@ pub const DEFAULT_WINDOW: u32 = 256 * 1024;
 /// datagram stays within a conservative path MTU (no IP fragmentation).
 pub const MAX_STREAM_CHUNK: usize = 1024;
 
-/// Retransmit timeout, expressed in `poll_transmit` rounds: unacked data is
-/// resent only after this many rounds without an acknowledgement (instead of
-/// every round). At the drivers' active cadence (~tens of ms/round) this is a
-/// few hundred milliseconds — a coarse RTO without a wall clock in this
-/// (deterministic) core.
-const RETX_TICKS: u32 = 16;
+/// Maximum segment size: one `StreamData` chunk's worth of bytes. Used as the
+/// unit for the congestion window.
+const MSS: u32 = MAX_STREAM_CHUNK as u32;
+
+/// Initial congestion window (~RFC 6928's 10·MSS), in bytes.
+const INIT_CWND: u32 = 10 * MSS;
+
+/// Congestion-window ceiling — no point exceeding the receiver's window.
+const MAX_CWND: u32 = DEFAULT_WINDOW;
+
+/// Retransmit timeout bounds, expressed in `poll_transmit` rounds (the core has
+/// no wall clock; a round is the drivers' active cadence, ~tens of ms). `INIT`
+/// applies until the first RTT sample; the live RTO is then derived from the
+/// smoothed RTT (Jacobson/Karels) and clamped to `[MIN, MAX]`.
+const INIT_RTO: u32 = 8;
+const MIN_RTO: u32 = 2;
+const MAX_RTO: u32 = 240;
 
 /// Events surfaced to the application as frames are processed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,10 +154,26 @@ struct StreamState {
     send_fin: bool,    // app closed our send side
     fin_sent: bool,    // an (empty) FIN has been emitted at least once
     fin_acked: bool,
-    /// `poll_transmit` rounds since the oldest unacked byte was last sent;
-    /// gates retransmission so we don't resend the whole window every poll.
-    idle_retx: u32,
     close_status: Option<i32>,
+
+    // --- retransmit timer + RTT estimation (ticks = poll_transmit rounds) ---
+    /// Tick the RTO countdown started from (oldest unacked data), or None when
+    /// nothing is outstanding.
+    rto_start: Option<u64>,
+    /// Current retransmit timeout in ticks.
+    rto: u32,
+    /// Smoothed RTT and its variation (0 = no sample yet).
+    srtt: u32,
+    rttvar: u32,
+    /// In-flight RTT probe: (sequence end it covers, tick it was sent). Cleared
+    /// on sample or on retransmit (Karn's algorithm).
+    timed: Option<(u64, u64)>,
+
+    // --- congestion control ---
+    /// Congestion window in bytes (bounds in-flight alongside the peer window).
+    cwnd: u32,
+    /// Slow-start threshold in bytes.
+    ssthresh: u32,
 
     // --- recv side ---
     recv: Reassembler,
@@ -178,8 +205,14 @@ impl StreamState {
             send_fin: false,
             fin_sent: false,
             fin_acked: false,
-            idle_retx: 0,
             close_status: None,
+            rto_start: None,
+            rto: INIT_RTO,
+            srtt: 0,
+            rttvar: 0,
+            timed: None,
+            cwnd: INIT_CWND,
+            ssthresh: MAX_CWND,
             recv: Reassembler::default(),
             recv_window: DEFAULT_WINDOW,
             peer_fin: HalfState::Open,
@@ -215,14 +248,31 @@ impl StreamState {
         self.send_next += data.len() as u64;
     }
 
-    fn on_ack(&mut self, ack: u64, window: u32) {
+    fn on_ack(&mut self, ack: u64, window: u32, now: u64) {
         self.peer_window = window;
         if ack > self.send_base {
-            let advance = (ack - self.send_base).min(self.send_buf.len() as u64) as usize;
-            self.send_buf.drain(0..advance);
-            self.send_base += advance as u64;
+            let advance = (ack - self.send_base).min(self.send_buf.len() as u64);
+            self.send_buf.drain(0..advance as usize);
+            self.send_base += advance;
             self.send_high = self.send_high.max(self.send_base);
-            self.idle_retx = 0; // forward progress resets the retransmit timer
+            // Congestion control: this ack made forward progress.
+            self.grow_cwnd(advance);
+            // Restart the RTO timer if data is still outstanding, else stop it;
+            // and clear any backoff (RFC 6298: a new ack recomputes the RTO).
+            self.rto_start = if self.send_base < self.send_high {
+                Some(now)
+            } else {
+                None
+            };
+            self.recompute_rto();
+        }
+        // RTT sample (Karn): only if the probed range is now acked and wasn't
+        // retransmitted (a retransmit clears `timed`).
+        if let Some((seq, sent)) = self.timed
+            && ack >= seq
+        {
+            self.update_rtt(now.saturating_sub(sent).max(1) as u32);
+            self.timed = None;
         }
         // The receiver acks up to the data end; once it covers all our bytes,
         // our FIN is acknowledged (there is no extra FIN byte in the sequence).
@@ -233,6 +283,50 @@ impl StreamState {
         if self.send_fin && self.fin_sent && ack >= self.send_next {
             self.fin_acked = true;
         }
+    }
+
+    /// Fold a new RTT sample (in ticks) into the smoothed estimate and RTO
+    /// (Jacobson/Karels).
+    fn update_rtt(&mut self, r: u32) {
+        if self.srtt == 0 {
+            self.srtt = r;
+            self.rttvar = r / 2;
+        } else {
+            let delta = self.srtt.abs_diff(r);
+            self.rttvar = (3 * self.rttvar + delta) / 4;
+            self.srtt = (7 * self.srtt + r) / 8;
+        }
+        self.recompute_rto();
+    }
+
+    /// Derive the RTO from the smoothed RTT, or the initial value if unsampled.
+    fn recompute_rto(&mut self) {
+        self.rto = if self.srtt > 0 {
+            (self.srtt + (4 * self.rttvar).max(1)).clamp(MIN_RTO, MAX_RTO)
+        } else {
+            INIT_RTO
+        };
+    }
+
+    /// Grow the congestion window for `acked` newly-acknowledged bytes: slow
+    /// start (≈ +MSS per ack) below ssthresh, congestion avoidance (≈ +MSS per
+    /// RTT) above it.
+    fn grow_cwnd(&mut self, acked: u64) {
+        let inc = if self.cwnd < self.ssthresh {
+            (acked as u32).min(MSS)
+        } else {
+            ((MSS as u64 * MSS as u64) / self.cwnd.max(1) as u64).max(1) as u32
+        };
+        self.cwnd = self.cwnd.saturating_add(inc).min(MAX_CWND);
+    }
+
+    /// React to a retransmit timeout: halve ssthresh, collapse the window to one
+    /// MSS (re-enter slow start), back off the RTO, and invalidate the RTT probe.
+    fn on_rto(&mut self) {
+        self.ssthresh = (self.cwnd / 2).max(2 * MSS);
+        self.cwnd = MSS;
+        self.rto = (self.rto.saturating_mul(2)).min(MAX_RTO);
+        self.timed = None; // Karn: don't sample retransmitted data
     }
 
     /// Emit `[from, to)` as MTU-sized StreamData chunks, flagging FIN on the
@@ -257,8 +351,9 @@ impl StreamState {
         }
     }
 
-    /// Frames to (re)transmit now, respecting the peer's flow window.
-    fn transmit(&mut self, out: &mut Vec<Frame>) {
+    /// Frames to (re)transmit at tick `now`, respecting flow control and the
+    /// congestion window.
+    fn transmit(&mut self, now: u64, out: &mut Vec<Frame>) {
         if self.reset {
             return;
         }
@@ -270,29 +365,37 @@ impl StreamState {
             });
             self.needs_open = false;
         }
-        // Send new data immediately; retransmit unacked data only after a
-        // retransmit timeout — so we don't resend the whole window every poll.
-        // Everything stays within the peer's advertised flow-control window and
-        // is split into MTU-safe chunks by `emit_range`.
-        let in_flight_cap = self.send_base + self.peer_window as u64;
-        let send_end = self.send_next.min(in_flight_cap);
+        // In-flight is bounded by BOTH the peer's flow-control window and our
+        // congestion window. New data goes out immediately (up to that bound);
+        // unacked data is retransmitted only after the RTO elapses, so we don't
+        // resend the whole window every poll. `emit_range` splits into MTU chunks.
+        let cap = self.peer_window.min(self.cwnd) as u64;
+        let send_end = self.send_next.min(self.send_base + cap);
+        let rto_due = |start: Option<u64>, rto: u32| match start {
+            Some(t) => now.saturating_sub(t) >= rto as u64,
+            None => true,
+        };
         if self.send_high < send_end {
-            // Never-sent data: send it now.
+            // Never-sent data: send it now and start an RTT probe if none is open.
             let from = self.send_high.max(self.send_base);
             self.emit_range(out, from, send_end);
+            if self.timed.is_none() {
+                self.timed = Some((send_end, now));
+            }
             self.send_high = send_end;
-            self.idle_retx = 0;
+            if self.rto_start.is_none() {
+                self.rto_start = Some(now);
+            }
         } else if self.send_base < self.send_high {
-            // Outstanding unacked data: retransmit after the RTO.
-            self.idle_retx = self.idle_retx.saturating_add(1);
-            if self.idle_retx >= RETX_TICKS {
+            // Outstanding unacked data: retransmit once the RTO has elapsed.
+            if rto_due(self.rto_start, self.rto) {
                 self.emit_range(out, self.send_base, self.send_high);
-                self.idle_retx = 0;
+                self.rto_start = Some(now);
+                self.on_rto();
             }
         } else if self.send_fin && !self.fin_acked && self.send_next == self.send_base {
-            // Zero-byte stream closed: (re)send an empty FIN promptly, then on RTO.
-            self.idle_retx = self.idle_retx.saturating_add(1);
-            if !self.fin_sent || self.idle_retx >= RETX_TICKS {
+            // Zero-byte stream closed: send an empty FIN promptly, then on RTO.
+            if !self.fin_sent || rto_due(self.rto_start, self.rto) {
                 out.push(Frame::StreamData {
                     id: self.id,
                     offset: self.send_next,
@@ -300,7 +403,7 @@ impl StreamState {
                     fin: true,
                 });
                 self.fin_sent = true;
-                self.idle_retx = 0;
+                self.rto_start = Some(now);
             }
         }
         // Always advertise our current receive window via an ack (saturating
@@ -339,6 +442,9 @@ pub struct StreamMux {
     id_step: u64,
     streams: BTreeMap<u64, StreamState>,
     events: Vec<StreamEvent>,
+    /// Monotonic tick counter (incremented per `poll_transmit`); the clock for
+    /// RTT estimation and the retransmit timer.
+    now: u64,
 }
 
 /// A read handle returned to callers (just the id; data via `StreamMux::read`).
@@ -352,6 +458,7 @@ impl StreamMux {
             id_step: 2,
             streams: BTreeMap::new(),
             events: Vec::new(),
+            now: 0,
         }
     }
 
@@ -437,8 +544,9 @@ impl StreamMux {
                 }
             }
             Frame::StreamAck { id, ack, window } => {
+                let now = self.now;
                 if let Some(s) = self.streams.get_mut(&id) {
-                    s.on_ack(ack, window);
+                    s.on_ack(ack, window, now);
                 }
             }
             Frame::StreamClose { id, status } => {
@@ -466,6 +574,8 @@ impl StreamMux {
 
     /// Collect all frames that should be sent now.
     pub fn poll_transmit(&mut self) -> Vec<Frame> {
+        self.now += 1; // advance the RTT/RTO clock one tick per poll
+        let now = self.now;
         let mut out = Vec::new();
         let mut retire_ids = Vec::new();
         for (id, s) in self.streams.iter_mut() {
@@ -474,7 +584,7 @@ impl StreamMux {
                 retire_ids.push(*id);
                 continue;
             }
-            s.transmit(&mut out);
+            s.transmit(now, &mut out);
             // Reclaim streams that are fully closed in both directions.
             if s.fully_done() {
                 retire_ids.push(*id);
@@ -734,9 +844,9 @@ mod tests {
 
         // First poll sends the data.
         assert_eq!(count_data(&a.poll_transmit()), 1);
-        // The next RETX_TICKS-1 polls send NO data (no spurious retransmits).
+        // The next INIT_RTO-1 polls send NO data (no spurious retransmits).
         let mut retx = 0;
-        for _ in 0..(RETX_TICKS - 1) {
+        for _ in 0..(INIT_RTO - 1) {
             retx += count_data(&a.poll_transmit());
         }
         assert_eq!(retx, 0, "data was retransmitted before the RTO elapsed");
@@ -746,6 +856,54 @@ mod tests {
             after += count_data(&a.poll_transmit());
         }
         assert!(after >= 1, "data was never retransmitted after the RTO");
+    }
+
+    #[test]
+    fn congestion_window_limits_initial_burst() {
+        // A fresh stream must not dump its whole flow-control window at once: the
+        // first burst is bounded by the initial congestion window.
+        let mut a = StreamMux::new(true);
+        let id = a.open(StreamKind::Forward, vec![]);
+        a.write(id, &vec![0u8; 100 * 1024]);
+        let frames = a.poll_transmit();
+        let sent: usize = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::StreamData { data, .. } => Some(data.len()),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            sent <= INIT_CWND as usize,
+            "initial burst {sent} exceeded the initial congestion window"
+        );
+        assert!(
+            sent >= MSS as usize,
+            "should have sent at least one segment"
+        );
+    }
+
+    #[test]
+    fn large_transfer_completes_under_loss_with_congestion_control() {
+        // 100 KiB through 25%-loss, exercising RTO-driven retransmission, the
+        // congestion-window collapse on loss, and slow-start recovery.
+        let mut client = StreamMux::new(true);
+        let mut server = StreamMux::new(false);
+        let id = client.open(StreamKind::Forward, vec![]);
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        client.write(id, &payload);
+        let mut got = Vec::new();
+        for _ in 0..6000 {
+            pump(&mut client, &mut server, 1, |s| s % 4 == 0);
+            got.extend_from_slice(&drain(&mut server, id));
+            if got.len() >= payload.len() {
+                break;
+            }
+        }
+        pump(&mut client, &mut server, 100, |_| false);
+        got.extend_from_slice(&drain(&mut server, id));
+        assert_eq!(got.len(), payload.len(), "not all bytes arrived");
+        assert_eq!(got, payload, "payload corrupted in transit");
     }
 
     #[test]
