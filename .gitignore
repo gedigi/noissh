@@ -9,3 +9,6 @@
 # Claude/superpowers working notes (not part of the project)
 /docs/superpowers
 /.claude-local
+
+# Local release packaging output
+/dist
