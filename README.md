@@ -45,6 +45,21 @@ curl -fsSL https://raw.githubusercontent.com/gedigi/noissh/main/install.sh | sh
 ```
 
 Prebuilt binaries are on the [releases page](https://github.com/gedigi/noissh/releases/latest).
+The installer verifies each download's SHA-256 checksum before installing.
+
+### Verifying a download
+
+Every release archive ships a `.sha256` checksum and a Sigstore **build
+provenance attestation** (proving it was built by this repo's release workflow).
+To verify a manual download:
+
+```sh
+# checksum
+shasum -a 256 -c noissh-<target>.tar.gz.sha256
+
+# provenance (requires the GitHub CLI)
+gh attestation verify noissh-<target>.tar.gz --repo gedigi/noissh
+```
 
 Prefer something else?
 

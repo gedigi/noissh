@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write # required for build-provenance attestation (Sigstore)
+  attestations: write
 
 jobs:
   build:
@@ -56,8 +58,17 @@ jobs:
         run: |
           tar -C "target/${{ matrix.target }}/release" -czf \
             "noissh-${{ matrix.target }}.tar.gz" noissh noisshd
-          shasum -a 256 "noissh-${{ matrix.target }}.tar.gz" > \
-            "noissh-${{ matrix.target }}.tar.gz.sha256"
+          # Portable sha256 (Linux has sha256sum, macOS has shasum).
+          if command -v sha256sum >/dev/null; then
+            sha256sum "noissh-${{ matrix.target }}.tar.gz" > "noissh-${{ matrix.target }}.tar.gz.sha256"
+          else
+            shasum -a 256 "noissh-${{ matrix.target }}.tar.gz" > "noissh-${{ matrix.target }}.tar.gz.sha256"
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: noissh-${{ matrix.target }}.tar.gz
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

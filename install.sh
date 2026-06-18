@@ -112,11 +112,31 @@ install_prebuilt() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   step "Looking for a prebuilt release (${TARGET})"
-  if have curl; then
-    curl -fsSL "$url" -o "$tmp/$asset" 2>/dev/null || return 1
+  fetch() { # fetch URL -> FILE ; returns nonzero on failure
+    if have curl; then curl -fsSL "$1" -o "$2" 2>/dev/null
+    else wget -qO "$2" "$1" 2>/dev/null; fi
+  }
+  fetch "$url" "$tmp/$asset" || return 1
+
+  # Verify the published SHA-256 checksum before trusting the archive.
+  if fetch "$url.sha256" "$tmp/$asset.sha256"; then
+    expected=$(awk '{print $1}' "$tmp/$asset.sha256" 2>/dev/null)
+    actual=""
+    if have sha256sum; then actual=$(sha256sum "$tmp/$asset" | awk '{print $1}')
+    elif have shasum; then actual=$(shasum -a 256 "$tmp/$asset" | awk '{print $1}'); fi
+    if [ -z "$actual" ]; then
+      warn "no sha256 tool available to verify the download; falling back to a source build."
+      return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+      err "checksum mismatch for ${asset}! expected ${expected}, got ${actual}. Aborting."
+    fi
+    ok "Checksum verified (sha256)"
   else
-    wget -qO "$tmp/$asset" "$url" 2>/dev/null || return 1
+    warn "No checksum published for ${asset}; falling back to a source build."
+    return 1
   fi
+
   tar -xzf "$tmp/$asset" -C "$tmp" 2>/dev/null || return 1
   mkdir -p "$BIN_DIR"
   for b in $BINS; do

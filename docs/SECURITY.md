@@ -92,6 +92,28 @@ it minimal:
 - Keys are generated with the system CSPRNG (`getrandom`) via `snow`.
 - Session ids are random 64-bit values; they are demux labels, not secrets.
 
+## Release integrity (supply chain)
+
+Prebuilt binaries are built only by the GitHub Actions release workflow, never
+uploaded by hand. Each release archive carries:
+
+- a **SHA-256 checksum** (`.sha256`) — the installer verifies it before
+  installing, and aborts on mismatch; and
+- a **Sigstore build-provenance attestation** (via `actions/attest-build-provenance`),
+  which cryptographically ties the artifact to the exact repository, commit, and
+  workflow that produced it. Verify it with
+  `gh attestation verify <file> --repo gedigi/noissh`.
+
+Caveats and remaining trust assumptions:
+
+- The `curl … | sh` convenience installer trusts TLS for the initial fetch of
+  the script and binaries. The checksum protects against corruption/MITM of the
+  archive specifically; for the strongest guarantee, verify the provenance
+  attestation (above) or build from source (`cargo install --git`).
+- A co-located `.sha256` alone does not defend against a fully compromised
+  release (an attacker who can replace the binary could replace its checksum) —
+  that is what the provenance attestation is for.
+
 ## Reporting
 
 Please report suspected vulnerabilities privately to the maintainer rather than
