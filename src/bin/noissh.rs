@@ -40,6 +40,8 @@ struct Args {
     /// A one-shot file transfer: (request, local path). Mutually exclusive with
     /// an interactive shell and port forwarding.
     transfer: Option<(proto::XferRequest, String)>,
+    /// Forward the local SSH agent (`-A`).
+    forward_agent: bool,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -62,11 +64,13 @@ fn parse_args() -> Args {
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
         transfer: None,
+        forward_agent: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ssh" => a.ssh = true,
+            "-A" | "--forward-agent" => a.forward_agent = true,
             "--port" => {
                 if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
                     a.port = p;
@@ -165,6 +169,19 @@ fn run() -> Result<(), RuntimeError> {
     // (the latter behaves like `ssh -N`).
     let forward_only = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
     let want_shell = !forward_only && args.transfer.is_none();
+    // Agent forwarding only applies to an interactive shell; it needs a local
+    // agent ($SSH_AUTH_SOCK) to bridge to.
+    let agent_sock = if args.forward_agent && want_shell {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(s) if !s.is_empty() => Some(s),
+            _ => {
+                eprintln!("noissh: -A requested but SSH_AUTH_SOCK is not set; ignoring");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut client = Client::connect_with(
         &keypair,
         known,
@@ -174,6 +191,7 @@ fn run() -> Result<(), RuntimeError> {
         cols,
         DisplayMode::Adaptive,
         want_shell,
+        agent_sock,
     )?;
 
     // Persist any newly-pinned host key (direct-mode TOFU).
@@ -242,16 +260,26 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
         {
             let sock = client.socket().as_fd();
             let inp = stdin.as_fd();
-            let mut fds = [
+            let mut fds = vec![
                 PollFd::new(sock, PollFlags::POLLIN),
                 PollFd::new(inp, PollFlags::POLLIN),
             ];
+            // Also wait on any forwarded agent connections (no busy-spin).
+            let agent_fds = client.agent_fds();
+            for fd in &agent_fds {
+                fds.push(PollFd::new(*fd, PollFlags::POLLIN));
+            }
             let ms: u16 = timeout.as_millis().min(u16::MAX as u128) as u16;
             let _ = poll(&mut fds, PollTimeout::from(ms));
         }
 
         // Network: drain everything ready.
         while client.recv_and_handle()? {}
+
+        // Service SSH agent forwarding (open/bridge/pump), if enabled.
+        if client.agent_enabled() {
+            client.pump_agent();
+        }
 
         // Local keystrokes.
         loop {

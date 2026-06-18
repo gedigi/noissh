@@ -73,6 +73,7 @@ impl TestServer {
             40,
             DisplayMode::Adaptive,
             false,
+            None,
         )
         .unwrap()
     }

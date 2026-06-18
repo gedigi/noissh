@@ -22,7 +22,14 @@ pub enum ControlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMsg {
     /// Client → server: request a login shell with this geometry/term.
-    OpenShell { cols: u16, rows: u16, term: String },
+    /// `agent` asks the server to expose an SSH agent socket (`SSH_AUTH_SOCK`)
+    /// whose connections are tunnelled back to the client's local agent.
+    OpenShell {
+        cols: u16,
+        rows: u16,
+        term: String,
+        agent: bool,
+    },
     /// Either direction: window resize.
     Resize { cols: u16, rows: u16 },
     /// Server → client: the shell exited with this status.
@@ -72,11 +79,17 @@ impl ControlMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            ControlMsg::OpenShell { cols, rows, term } => {
+            ControlMsg::OpenShell {
+                cols,
+                rows,
+                term,
+                agent,
+            } => {
                 out.push(M_OPEN_SHELL);
                 put_varint(&mut out, *cols as u64);
                 put_varint(&mut out, *rows as u64);
                 put_str(&mut out, term);
+                out.push(*agent as u8);
             }
             ControlMsg::Resize { cols, rows } => {
                 out.push(M_RESIZE);
@@ -113,7 +126,13 @@ impl ControlMsg {
                 let cols = get_varint(buf, &mut pos)? as u16;
                 let rows = get_varint(buf, &mut pos)? as u16;
                 let term = get_str(buf, &mut pos)?;
-                ControlMsg::OpenShell { cols, rows, term }
+                let agent = *buf.get(pos).ok_or(ControlError::Eof)? != 0;
+                ControlMsg::OpenShell {
+                    cols,
+                    rows,
+                    term,
+                    agent,
+                }
             }
             M_RESIZE => {
                 let cols = get_varint(buf, &mut pos)? as u16;
@@ -156,6 +175,13 @@ mod tests {
             cols: 80,
             rows: 24,
             term: "xterm-256color".into(),
+            agent: false,
+        });
+        roundtrip(ControlMsg::OpenShell {
+            cols: 80,
+            rows: 24,
+            term: "xterm-256color".into(),
+            agent: true,
         });
         roundtrip(ControlMsg::Resize {
             cols: 120,

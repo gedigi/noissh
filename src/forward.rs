@@ -1,39 +1,68 @@
-//! TCP plumbing for port forwarding: pairs a non-blocking [`TcpStream`] with a
-//! reliable session stream, buffering each direction so neither side blocks and
-//! handling half-close without dropping buffered data.
+//! Socket plumbing for forwarding: pairs a non-blocking byte stream (TCP for
+//! port forwarding, Unix for agent forwarding) with a reliable session stream,
+//! buffering each direction so neither side blocks and handling half-close
+//! without dropping buffered data.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
+use std::os::unix::net::UnixStream;
 
-/// One forwarded TCP connection. The session-stream side is driven by the caller
-/// (read via the mux, write via the mux); this type owns the TCP socket plus an
-/// outbound buffer for bytes arriving from the session.
-pub struct ForwardConn {
-    stream: TcpStream,
-    /// Bytes received from the session, waiting to be written to TCP.
+/// One forwarded connection over a byte stream `S`. The session-stream side is
+/// driven by the caller (read/write via the mux); this type owns the local
+/// socket plus an outbound buffer for bytes arriving from the session.
+///
+/// `S` is [`TcpStream`] for `-L`/`-R` port forwarding and [`UnixStream`] for
+/// agent forwarding; both implement [`Read`] + [`Write`] + [`AsFd`].
+pub struct ForwardConn<S = TcpStream> {
+    stream: S,
+    /// Bytes received from the session, waiting to be written to the socket.
     out: Vec<u8>,
-    /// TCP read side hit EOF (the TCP peer won't send more).
+    /// Socket read side hit EOF (the local peer won't send more).
     read_closed: bool,
     /// The session peer closed its half (we won't receive more session data).
     peer_closed: bool,
     /// We've already sent our FIN (stream close) to the session peer.
     fin_sent: bool,
-    /// The TCP socket errored and is unusable.
+    /// The socket errored and is unusable.
     dead: bool,
-    /// Consecutive flush attempts that made no progress (TCP peer not draining).
+    /// Consecutive flush attempts that made no progress (peer not draining).
     flush_stall: u32,
 }
 
-/// Reap a connection whose TCP peer makes no write progress for this many flush
+/// Reap a connection whose peer makes no write progress for this many flush
 /// attempts (a permanently-stuck local app). At the driver cadence this is on
 /// the order of a minute, after which the connection is considered dead.
 const FLUSH_STALL_LIMIT: u32 = 3000;
 
-impl ForwardConn {
+impl ForwardConn<TcpStream> {
     pub fn new(stream: TcpStream) -> std::io::Result<Self> {
         stream.set_nonblocking(true)?;
-        Ok(ForwardConn {
+        Ok(Self::from_stream(stream))
+    }
+
+    /// Connect out to `target` ("host:port"), returning a non-blocking conn.
+    pub fn connect(target: &str) -> std::io::Result<Self> {
+        ForwardConn::new(TcpStream::connect(target)?)
+    }
+}
+
+impl ForwardConn<UnixStream> {
+    pub fn new_unix(stream: UnixStream) -> std::io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Self::from_stream(stream))
+    }
+
+    /// Connect out to a Unix-domain socket `path` (e.g. an SSH agent socket).
+    pub fn connect_unix(path: &str) -> std::io::Result<Self> {
+        ForwardConn::new_unix(UnixStream::connect(path)?)
+    }
+}
+
+impl<S: Read + Write + AsFd> ForwardConn<S> {
+    /// Wrap an already-non-blocking stream.
+    fn from_stream(stream: S) -> Self {
+        ForwardConn {
             stream,
             out: Vec::new(),
             read_closed: false,
@@ -41,15 +70,10 @@ impl ForwardConn {
             fin_sent: false,
             dead: false,
             flush_stall: 0,
-        })
+        }
     }
 
-    /// Connect out to `target` ("host:port"), returning a non-blocking conn.
-    pub fn connect(target: &str) -> std::io::Result<Self> {
-        ForwardConn::new(TcpStream::connect(target)?)
-    }
-
-    /// Drain currently-available bytes from the TCP socket (to forward into the
+    /// Drain currently-available bytes from the socket (to forward into the
     /// session). Sets `read_closed` on EOF, `dead` on error.
     pub fn read_tcp(&mut self) -> Vec<u8> {
         let mut got = Vec::new();
@@ -138,7 +162,7 @@ impl ForwardConn {
         !self.out.is_empty()
     }
 
-    /// Bytes buffered toward TCP (so the driver can bound it and apply
+    /// Bytes buffered toward the socket (so the driver can bound it and apply
     /// receive-side backpressure to the session peer).
     pub fn out_len(&self) -> usize {
         self.out.len()
@@ -150,6 +174,6 @@ impl ForwardConn {
 
     pub fn as_raw_fd(&self) -> RawFd {
         use std::os::fd::AsRawFd;
-        self.stream.as_raw_fd()
+        self.stream.as_fd().as_raw_fd()
     }
 }

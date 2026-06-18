@@ -48,6 +48,16 @@ const IDLE_REAP_TICKS: u32 = 20_000;
 /// against a flood of fresh session-ids from a spoofed source.
 const MAX_PENDING_HANDSHAKES: usize = 512;
 
+/// Filesystem path for a session's forwarded SSH agent socket. Unique per
+/// process and session so concurrent sessions never collide.
+fn agent_socket_path(sid: SessionId) -> String {
+    let hex: String = sid.iter().map(|b| format!("{b:02x}")).collect();
+    std::env::temp_dir()
+        .join(format!("noissh-agent-{}-{hex}.sock", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Per-session, socket-free server logic. Consumes raw packets and returns raw
 /// packets to send, so it can be driven directly by an in-memory shim.
 pub struct ServerCore {
@@ -64,6 +74,10 @@ pub struct ServerCore {
     /// Remote-forward (`-R`) listen requests surfaced to the driver:
     /// (session, bind_port, target).
     remote_forward_requests: Vec<(SessionId, u16, String)>,
+    /// Agent-forwarding socket requests surfaced to the driver: (session, path).
+    /// The driver binds a Unix listener at `path`; the spawned shell already has
+    /// `SSH_AUTH_SOCK=path` in its environment.
+    agent_socket_requests: Vec<(SessionId, String)>,
 }
 
 impl ServerCore {
@@ -86,6 +100,7 @@ impl ServerCore {
             ever_active: false,
             stream_events: Vec::new(),
             remote_forward_requests: Vec::new(),
+            agent_socket_requests: Vec::new(),
         }
     }
 
@@ -296,17 +311,33 @@ impl ServerCore {
 
     fn handle_control(&mut self, sid: SessionId, msg: ControlMsg) {
         match msg {
-            ControlMsg::OpenShell { cols, rows, term } => {
+            ControlMsg::OpenShell {
+                cols,
+                rows,
+                term,
+                agent,
+            } => {
                 let Some(sess) = self.sessions.get_mut(&sid) else {
                     return;
                 };
                 if sess.pty.is_some() {
                     return; // already open
                 }
+                // Agent forwarding: expose a Unix socket and point SSH_AUTH_SOCK
+                // at it. The driver binds the actual listener (I/O); connections
+                // to it are tunnelled back to the client's local agent.
+                let mut env = Vec::new();
+                let agent_path = if agent {
+                    let path = agent_socket_path(sid);
+                    env.push(("SSH_AUTH_SOCK".to_string(), path.clone()));
+                    Some(path)
+                } else {
+                    None
+                };
                 let req = SpawnRequest {
                     user: self.user.clone(),
                     command: self.command.clone(),
-                    env: Vec::new(),
+                    env,
                     term,
                     rows,
                     cols,
@@ -317,6 +348,9 @@ impl ServerCore {
                     sess.cols = cols;
                     sess.shell = Some(ServerShell::new(rows as usize, cols as usize));
                     sess.pty = Some(handle);
+                    if let Some(path) = agent_path {
+                        self.agent_socket_requests.push((sid, path));
+                    }
                 }
             }
             ControlMsg::Resize { cols, rows } => {
@@ -444,6 +478,19 @@ impl ServerCore {
         std::mem::take(&mut self.remote_forward_requests)
     }
 
+    /// Drain pending agent-forwarding socket requests for the driver to bind
+    /// Unix listeners for: (session, socket path).
+    pub fn take_agent_socket_requests(&mut self) -> Vec<(SessionId, String)> {
+        std::mem::take(&mut self.agent_socket_requests)
+    }
+
+    /// Open an agent-forwarding stream from the server side; returns its id.
+    pub fn open_agent(&mut self, sid: SessionId) -> Option<u64> {
+        self.sessions
+            .get_mut(&sid)
+            .map(|s| s.mux.open(StreamKind::Agent, Vec::new()))
+    }
+
     /// Read available contiguous bytes from a stream within a session.
     pub fn stream_read(&mut self, sid: SessionId, id: u64) -> Vec<u8> {
         self.sessions
@@ -514,6 +561,16 @@ pub struct Server {
     remote_listeners: Vec<(std::net::TcpListener, SessionId, String)>,
     /// In-progress file transfers keyed by (session, stream id).
     xfers: HashMap<(SessionId, u64), XferState>,
+    /// Agent-forwarding Unix listeners: (listener, session, socket path).
+    agent_listeners: Vec<(
+        std::os::unix::net::UnixListener,
+        SessionId,
+        std::path::PathBuf,
+    )>,
+    /// Live agent-forwarding connections (server side of the tunnel), keyed by
+    /// (session, stream id).
+    agent_conns:
+        HashMap<(SessionId, u64), crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
 }
 
 /// Server side of a file transfer: writing an upload, or reading a download.
@@ -532,6 +589,8 @@ impl Server {
             forwards: HashMap::new(),
             remote_listeners: Vec::new(),
             xfers: HashMap::new(),
+            agent_listeners: Vec::new(),
+            agent_conns: HashMap::new(),
         })
     }
 
@@ -576,6 +635,45 @@ impl Server {
                 (self.core.open_forward(sid, &target), ForwardConn::new(s))
             {
                 self.forwards.insert((sid, id), conn);
+            }
+        }
+
+        // Honour agent-forwarding requests: bind a Unix listener per request at
+        // the path the shell's SSH_AUTH_SOCK points to. Clear any stale socket
+        // file first (a crashed previous run could leave one behind).
+        use std::os::unix::net::{UnixListener, UnixStream};
+        for (sid, path) in self.core.take_agent_socket_requests() {
+            let p = std::path::PathBuf::from(&path);
+            let _ = std::fs::remove_file(&p);
+            if let Ok(l) = UnixListener::bind(&p) {
+                let _ = l.set_nonblocking(true);
+                self.agent_listeners.push((l, sid, p));
+            }
+        }
+        // Drop agent listeners whose session is gone, unlinking the socket file.
+        self.agent_listeners.retain(|(_, sid, path)| {
+            if self.core.has_session(*sid) {
+                true
+            } else {
+                let _ = std::fs::remove_file(path);
+                false
+            }
+        });
+        // Accept on agent listeners: each connection opens an Agent stream toward
+        // the client, which bridges it to the client's own SSH agent.
+        let mut agent_accepted: Vec<(SessionId, UnixStream)> = Vec::new();
+        for (l, sid, _) in &self.agent_listeners {
+            loop {
+                match l.accept() {
+                    Ok((s, _)) => agent_accepted.push((*sid, s)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        for (sid, s) in agent_accepted {
+            if let (Some(id), Ok(conn)) = (self.core.open_agent(sid), ForwardConn::new_unix(s)) {
+                self.agent_conns.insert((sid, id), conn);
             }
         }
 
@@ -627,6 +725,9 @@ impl Server {
                     if let Some(c) = self.forwards.get_mut(&(sid, id)) {
                         c.mark_peer_closed();
                     }
+                    if let Some(c) = self.agent_conns.get_mut(&(sid, id)) {
+                        c.mark_peer_closed();
+                    }
                     // Upload completion is detected in the pump loop once every
                     // buffered byte has been drained into the sink (the Closed
                     // event can precede the final data segments).
@@ -634,6 +735,7 @@ impl Server {
                 StreamEvent::Reset { id } => {
                     self.forwards.remove(&(sid, id));
                     self.xfers.remove(&(sid, id));
+                    self.agent_conns.remove(&(sid, id));
                 }
                 _ => {}
             }
@@ -706,6 +808,43 @@ impl Server {
             if done {
                 self.core.stream_close(k.0, k.1);
                 self.xfers.remove(&k);
+            }
+        }
+
+        // Pump agent-forwarding connections (same model as port forwards).
+        // Drop any whose session has gone away so their Unix fds don't leak.
+        let live_agents: Vec<(SessionId, u64)> = self
+            .agent_conns
+            .keys()
+            .copied()
+            .filter(|(sid, _)| !self.core.has_session(*sid))
+            .collect();
+        for k in live_agents {
+            self.agent_conns.remove(&k);
+        }
+        let akeys: Vec<(SessionId, u64)> = self.agent_conns.keys().copied().collect();
+        for k in akeys {
+            if let Some(c) = self.agent_conns.get_mut(&k) {
+                c.flush();
+                while c.out_len() < SEND_CAP as usize {
+                    let d = self.core.stream_read(k.0, k.1);
+                    if d.is_empty() {
+                        break;
+                    }
+                    c.queue_to_tcp(&d);
+                }
+                if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
+                    let d = c.read_tcp();
+                    if !d.is_empty() {
+                        self.core.stream_write(k.0, k.1, &d);
+                    }
+                }
+                if c.needs_fin() {
+                    self.core.stream_close(k.0, k.1);
+                }
+                if c.is_finished() {
+                    self.agent_conns.remove(&k);
+                }
             }
         }
     }

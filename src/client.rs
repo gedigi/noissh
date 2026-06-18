@@ -40,6 +40,8 @@ pub struct ClientCore {
     /// Whether to request an interactive shell on connect (false for `-N`-style
     /// forward-only sessions).
     want_shell: bool,
+    /// Whether to ask the server to forward our SSH agent (`-A`).
+    want_agent: bool,
     /// Pending remote-forward (`-R`) requests, retransmitted for a bounded
     /// number of ticks (there is no ack, so we resend to survive packet loss).
     remote_forwards: Vec<(u16, String)>,
@@ -87,6 +89,7 @@ impl ClientCore {
             mux: StreamMux::new(true),
             stream_events: Vec::new(),
             want_shell: true,
+            want_agent: false,
             remote_forwards: Vec::new(),
             remote_forward_ticks: 0,
             known_hosts_dirty: false,
@@ -102,6 +105,11 @@ impl ClientCore {
     /// be called before the handshake completes.
     pub fn set_want_shell(&mut self, want: bool) {
         self.want_shell = want;
+    }
+
+    /// Request SSH agent forwarding (`-A`). Must be set before the shell opens.
+    pub fn set_want_agent(&mut self, want: bool) {
+        self.want_agent = want;
     }
 
     pub fn exit_status(&self) -> Option<i32> {
@@ -314,6 +322,7 @@ impl ClientCore {
                     cols: self.cols,
                     rows: self.rows,
                     term: self.term.clone(),
+                    agent: self.want_agent,
                 }
                 .encode(),
             });
@@ -354,6 +363,12 @@ pub struct Client {
     core: ClientCore,
     socket: UdpSocket,
     server_addr: SocketAddr,
+    /// Local SSH agent socket path (`$SSH_AUTH_SOCK`) to bridge forwarded agent
+    /// streams to. `None` disables agent forwarding.
+    agent_sock: Option<String>,
+    /// Live agent-forwarding connections (client side), keyed by stream id.
+    agent_conns:
+        std::collections::HashMap<u64, crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
 }
 
 impl Client {
@@ -376,6 +391,7 @@ impl Client {
             cols,
             prediction,
             true,
+            None,
         )
     }
 
@@ -391,6 +407,7 @@ impl Client {
         cols: u16,
         prediction: DisplayMode,
         want_shell: bool,
+        agent_sock: Option<String>,
     ) -> Result<Self, RuntimeError> {
         let bind: SocketAddr = if server_addr.is_ipv6() {
             "[::]:0".parse().unwrap()
@@ -409,11 +426,16 @@ impl Client {
             prediction,
         )?;
         core.set_want_shell(want_shell);
+        // Agent forwarding must be requested before the handshake completes, as
+        // the OpenShell carrying the flag is sent the instant the session is up.
+        core.set_want_agent(agent_sock.is_some());
         socket.send_to(&first, server_addr)?;
         let mut client = Client {
             core,
             socket,
             server_addr,
+            agent_sock,
+            agent_conns: std::collections::HashMap::new(),
         };
         // Drive the handshake to completion.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -451,6 +473,80 @@ impl Client {
     /// Borrow the UDP socket (e.g. to register it with a poller).
     pub fn socket(&self) -> &UdpSocket {
         &self.socket
+    }
+
+    /// Whether agent forwarding is active (a local agent socket was provided).
+    pub fn agent_enabled(&self) -> bool {
+        self.agent_sock.is_some()
+    }
+
+    /// Borrowed fds of live agent-forwarding connections, for poll registration.
+    pub fn agent_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        self.agent_conns.values().map(|c| c.as_fd()).collect()
+    }
+
+    /// Service agent forwarding: connect newly-opened Agent streams to the local
+    /// agent socket, then move bytes both ways. Call once per loop iteration.
+    pub fn pump_agent(&mut self) {
+        use crate::forward::ForwardConn;
+        const SEND_CAP: u64 = 512 * 1024;
+
+        for ev in self.core.take_stream_events() {
+            match ev {
+                StreamEvent::Opened {
+                    id,
+                    kind: StreamKind::Agent,
+                    ..
+                } => {
+                    match self
+                        .agent_sock
+                        .as_deref()
+                        .and_then(|p| ForwardConn::connect_unix(p).ok())
+                    {
+                        Some(conn) => {
+                            self.agent_conns.insert(id, conn);
+                        }
+                        // No local agent reachable: refuse the stream.
+                        None => self.core.stream_close(id),
+                    }
+                }
+                StreamEvent::Closed { id, .. } => {
+                    if let Some(c) = self.agent_conns.get_mut(&id) {
+                        c.mark_peer_closed();
+                    }
+                }
+                StreamEvent::Reset { id } => {
+                    self.agent_conns.remove(&id);
+                }
+                _ => {}
+            }
+        }
+
+        let ids: Vec<u64> = self.agent_conns.keys().copied().collect();
+        for id in ids {
+            if let Some(c) = self.agent_conns.get_mut(&id) {
+                c.flush();
+                while c.out_len() < SEND_CAP as usize {
+                    let d = self.core.stream_read(id);
+                    if d.is_empty() {
+                        break;
+                    }
+                    c.queue_to_tcp(&d);
+                }
+                if self.core.stream_in_flight(id) < SEND_CAP {
+                    let d = c.read_tcp();
+                    if !d.is_empty() {
+                        self.core.stream_write(id, &d);
+                    }
+                }
+                if c.needs_fin() {
+                    self.core.stream_close(id);
+                }
+                if c.is_finished() {
+                    self.agent_conns.remove(&id);
+                }
+            }
+        }
     }
 
     /// Run port forwarding until interrupted.

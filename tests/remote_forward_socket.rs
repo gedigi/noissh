@@ -84,6 +84,7 @@ fn remote_forward_round_trips() {
         40,
         DisplayMode::Adaptive,
         false,
+        None,
     )
     .unwrap();
     let echo_str = echo_addr.to_string();
