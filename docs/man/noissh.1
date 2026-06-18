@@ -55,6 +55,37 @@ and tunnels accepted connections back to this client for delivery to
 .IR HOST:PORT .
 May be repeated. Implies forward\-only (no shell).
 .TP
+.BI \-\-put " LOCAL:REMOTE"
+Upload local file
+.I LOCAL
+to path
+.I REMOTE
+on the server, then exit. The spec is split on the first colon. Transfers run
+over the resilient session and are mutually exclusive with an interactive shell
+and with
+.BR \-L / \-R .
+.TP
+.BI \-\-get " REMOTE:LOCAL"
+Download server file
+.I REMOTE
+to local path
+.IR LOCAL ,
+then exit. The spec is split on the first colon. Transfers run over the
+resilient session and are mutually exclusive with an interactive shell and with
+.BR \-L / \-R .
+.TP
+.BR \-A ", " \-\-forward\-agent
+Forward your local authentication agent to the interactive session. The server
+exposes an
+.I SSH_AUTH_SOCK
+in the shell's environment whose connections tunnel back to your local agent, so
+remote
+.BR git / ssh
+can use your local keys without copying them to the server. Requires
+.I SSH_AUTH_SOCK
+to be set locally; if it is unset, noissh warns and continues without agent
+forwarding.
+.TP
 .BI \-\- " ssh args"
 With
 .BR \-\-ssh ,
@@ -85,6 +116,15 @@ Connect via SSH bootstrap:
 .TP
 Direct connection on a custom port:
 .B noissh --port 51820 user@server
+.TP
+Upload a file:
+.B noissh --ssh user@server --put ./report.pdf /home/user/report.pdf
+.TP
+Download a file:
+.B noissh --ssh user@server --get /var/log/app.log ./app.log
+.TP
+Interactive shell with agent forwarding:
+.B noissh --ssh user@server -A
 .SH SEE ALSO
 .BR noisshd (1),
 .BR ssh (1)

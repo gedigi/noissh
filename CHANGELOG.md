@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0]
+
+### Added
+
+- **File transfer** over the resilient session: one-shot upload
+  (`--put LOCAL:REMOTE`) and download (`--get REMOTE:LOCAL`). The spec is split
+  on the first colon; no shell is opened. Integrity comes from the reliable,
+  authenticated (AEAD) stream — no separate checksum step — and paths are
+  accessed as the server user.
+- **Agent forwarding** (`-A`, `--forward-agent`) for interactive sessions: the
+  server exposes an `SSH_AUTH_SOCK` whose connections tunnel back over a
+  dedicated session stream to your local agent, letting remote `git`/`ssh` use
+  your local keys without copying them to the server. Requires `SSH_AUTH_SOCK`
+  to be set locally; if it is unset, noissh warns and continues without it.
+- **MTU-safe datagram capping** so outbound datagrams stay within a safe size
+  and avoid IP fragmentation.
+- **RTO-based stream retransmission**: unacknowledged stream data is resent only
+  after a retransmission timeout, instead of on every poll.
+- **`noissh-keygen`**: a small tool to create/print the client keypair (ensures
+  it exists with `0600` perms and prints the `noissh-x25519 <base64>` public-key
+  line).
+- **Config file** (`~/.config/noissh/config`) supporting `port` and `term`
+  settings.
+- **systemd unit + packaging helpers**: a `noisshd.service` unit under
+  `contrib/`, plus Makefile/install support.
+
+### Fixed
+
+- A stream FIN set after all data was acknowledged is now reliably delivered, so
+  end-of-stream is no longer missed.
+- The forwarded agent socket is locked down to the owning user: its per-user
+  directory is created mode 0700 (rejecting a pre-existing path not owned by the
+  user) and the socket file is chmod 0600, so other local users on the server
+  cannot reach the forwarded agent.
+
 ## [0.2.0]
 
 ### Added

@@ -19,6 +19,8 @@ This guide covers installing, connecting, configuring, and troubleshooting.
   - [Generating your key with noissh-keygen](#generating-your-key-with-noissh-keygen)
 - [Configuration & file layout](#configuration--file-layout)
   - [Config file](#config-file)
+- [File transfer](#file-transfer)
+- [Agent forwarding](#agent-forwarding)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
 
@@ -194,17 +196,64 @@ Recognized keys:
 | `port` | number | default UDP port for direct connections |
 | `term` | string | `$TERM` value to advertise to the remote shell |
 
+## File transfer
+
+You can copy a single file over the resilient session without opening a shell.
+A transfer is forward-only (like a `-N`-style session) and cannot be combined
+with an interactive shell or with `-L`/`-R`.
+
+```sh
+# upload: local file -> remote path
+noissh --ssh user@server --put ./report.pdf /home/user/report.pdf
+
+# download: remote file -> local path
+noissh --ssh user@server --get /var/log/app.log ./app.log
+```
+
+The spec is split on the **first** colon. For `--put` the order is
+`LOCAL:REMOTE`; for `--get` it is `REMOTE:LOCAL`. Files on the server are read
+and written as the user you log in as, exactly like a normal login.
+
+Integrity is guaranteed by the reliable, authenticated (AEAD) stream the bytes
+ride on, so there is no separate checksum step. If the source cannot be read
+(for `--get`) or the destination cannot be created (for `--put`), the transfer
+aborts and noissh reports `remote rejected the transfer (no such file or
+permission denied)`.
+
+## Agent forwarding
+
+For an interactive session you can forward your local authentication agent so
+that remote `git`/`ssh` can use the keys on your machine without copying them to
+the server:
+
+```sh
+noissh --ssh user@server -A          # long form: --forward-agent
+```
+
+The server exposes an `SSH_AUTH_SOCK` in the shell's environment; connections to
+it tunnel back over a dedicated session stream to your local agent. Forwarding
+applies only to an interactive shell and requires `SSH_AUTH_SOCK` to be set
+locally — if `-A` is given but it is unset, noissh prints a warning and
+continues without agent forwarding.
+
+The server-side agent socket lives in a per-user directory created `0700`
+(noissh refuses a pre-existing path not owned by you) and the socket file itself
+is `0600`, so other local users on the server cannot reach your forwarded agent.
+
 ## Command reference
 
 ### `noissh`
 
 ```
-noissh [--ssh] [--port N] [--server-cmd CMD] [-L SPEC] [-R SPEC] [user@]host [-- <ssh args>]
+noissh [--ssh] [--port N] [--server-cmd CMD] [-L SPEC] [-R SPEC] [-A] [user@]host [-- <ssh args>]
   --ssh           bootstrap the server over SSH
   --port N        UDP port for direct connection (default 51820)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
   -R RPORT:HOST:PORT   remote forward (repeatable); implies forward-only
+  --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
+  --get REMOTE:LOCAL   download REMOTE to LOCAL, then exit (no shell)
+  -A, --forward-agent  forward your local auth agent to the shell session
   -- <args>       pass remaining args to ssh (only with --ssh)
 ```
 

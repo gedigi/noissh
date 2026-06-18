@@ -29,6 +29,10 @@ laptop going to sleep.
   lossy connection, instead of waiting for a round trip to the server.
 - **It tunnels too.** Local and remote **port forwarding** (`-L`/`-R`) ride the
   same resilient, encrypted session.
+- **It moves files.** Copy files to and from the server (`--put`/`--get`) over
+  the same authenticated channel — no second tool, no extra login.
+- **It forwards your keys.** **Agent forwarding** (`-A`) lets commands on the
+  server use the SSH keys on your laptop, without copying them anywhere.
 - **It's secure by design.** Every connection is mutually authenticated and
   encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
   authorized keys can connect.
@@ -114,6 +118,22 @@ noissh --ssh user@server -R 9000:localhost:3000
 
 Adding `-L`/`-R` makes the session forward-only (no shell), like `ssh -N`.
 
+**Copying files** rides the same session — no separate transfer tool:
+
+```sh
+# Upload local -> remote
+noissh --ssh user@server --put ./report.pdf:/home/user/report.pdf
+
+# Download remote -> local
+noissh --ssh user@server --get /var/log/app.log:./app.log
+```
+
+**Agent forwarding** (`-A`) lets remote `git`/`ssh` use your local keys:
+
+```sh
+noissh --ssh user@server -A
+```
+
 Full walkthrough, configuration, and troubleshooting:
 **[User Guide »](docs/USER_GUIDE.md)**
 
@@ -131,10 +151,11 @@ Want the details? See the **[Architecture](docs/ARCHITECTURE.md)** and
 ## Project status
 
 Working and tested end-to-end: the resilient interactive shell, predictive
-typing, roaming, and the reliable-stream layer that future SSH-style features
-(port forwarding, file transfer) build on. This is young software and hasn't had
-an independent security audit yet — see the **[Security model](docs/SECURITY.md)**
-before relying on it for anything sensitive.
+typing, roaming, local/remote port forwarding, file transfer (`--put`/`--get`),
+and SSH agent forwarding (`-A`) — all over the same reliable-stream layer. This
+is young software and hasn't had an independent security audit yet — see the
+**[Security model](docs/SECURITY.md)** before relying on it for anything
+sensitive.
 
 ## Documentation
 
