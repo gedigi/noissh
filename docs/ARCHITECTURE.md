@@ -11,7 +11,9 @@ noissh aims to be **as resilient as mosh** and **as rich as SSH**, with all
 cryptography provided by the [Noise Protocol Framework](https://noiseprotocol.org/)
 ("Noise all the way down"). The novel engineering is the **hybrid resilient
 transport + predictive TTY overlay**; account/login/privilege machinery reuses
-the operating system (PAM, setuid) rather than reinventing it.
+the operating system (the SSH bootstrap logs the user in) rather than reinventing
+it. The entire codebase is `#![forbid(unsafe_code)]` — there is no `unsafe` in any
+crate; OS primitives are reached through safe-API crates.
 
 ## High-level picture
 
@@ -52,7 +54,7 @@ crates/
   term/        authoritative terminal emulator + latest-wins screen diff
   predict/     client-side predictive-echo engine
   auth/        known_hosts (TOFU) + authorized_keys, X25519 key text format
-  pty/         portable PTY/login + Linux PAM/privsep (cfg-gated)
+  pty/         PTY allocation + login-shell launching (safe, via pty-process)
   proto/       handshake driver, control channel, state-sync data plane
 src/           runtime (client/server cores + UDP drivers), config, tty, ssh
 src/bin/       noissh (client) and noisshd (server) binaries
@@ -144,18 +146,23 @@ Noise/UDP session, which roams exactly like the v1 datagram path. This is the
 substrate SSH-style richness (port forwarding, file transfer, agent forwarding)
 builds on.
 
-## Privilege separation & login
+## Login & privilege model
 
-The `pty` crate exposes a `LoginSession` trait with two backends:
+The `pty` crate exposes a `LoginSession` trait with one backend, `LocalLogin`,
+built on the safe `pty-process` crate (no `unsafe`):
 
-- `LocalLogin` (all Unix): allocates a real PTY and execs the login shell as the
-  current user — no root required. This is the tested, default path.
-- `PrivsepLogin` (Linux, gated): `setgid`/`initgroups`/`setuid` to the target
-  user before exec, with optional PAM `acct_mgmt`/`open_session` behind the
-  `pty/pam` cargo feature. Requires running as root.
+- It allocates a real PTY and execs the login shell as the **current user** — no
+  root required. This is the tested, default path.
+- For multi-user use, the **mosh model** applies: the SSH bootstrap launches the
+  server already running as the authenticated user, so no in-process `setuid` is
+  needed.
+- A standalone root daemon may optionally drop to a target user's `uid`/`gid`
+  before exec (via `pty-process`'s safe API), with the supplementary-group
+  caveat noted in [SECURITY.md](SECURITY.md).
 
-Keeping the privileged surface minimal and isolating all parsing/crypto/protocol
-in unprivileged code is a deliberate security choice (see [SECURITY.md](SECURITY.md)).
+Keeping the privileged surface minimal, isolating all parsing/crypto/protocol in
+safe unprivileged code, and forbidding `unsafe` entirely are deliberate security
+choices (see [SECURITY.md](SECURITY.md)).
 
 ## Testing strategy
 

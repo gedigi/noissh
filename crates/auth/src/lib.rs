@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Authentication & trust model for noissh.
 //!
 //! - `authorized_keys`-equivalent: the set of client static public keys a

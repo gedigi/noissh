@@ -364,12 +364,11 @@ impl StreamMux {
             }
             Frame::StreamClose { id, status } => {
                 if let Some(s) = self.streams.get_mut(&id) {
-                    s.peer_fin = match s.peer_fin {
-                        HalfState::Finished(at) => HalfState::Finished(at),
-                        HalfState::Open => HalfState::Finished(s.recv.ack_point()),
-                    };
-                    // Surface Closed only once, even though the close frame is
-                    // retransmitted until acked.
+                    // Do NOT derive a FIN offset here: a StreamClose reordered
+                    // ahead of the FIN-bearing StreamData would otherwise fake a
+                    // FIN at offset 0 and let `fully_done` reclaim the stream
+                    // before the real data arrives (data loss). The authoritative
+                    // FIN offset always comes from StreamData{fin}.
                     if !s.close_received {
                         s.close_received = true;
                         self.events.push(StreamEvent::Closed { id, status });

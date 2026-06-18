@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! noissh runtime: wires the protocol crates into a UDP-driven client and
 //! server, plus configuration/key management.
 //!

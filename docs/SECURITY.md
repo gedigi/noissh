@@ -60,20 +60,33 @@ noissh mirrors SSH's trust model with Noise static keys:
   full `XX` handshake; resumption tickets / `IK` (a future optimization) are not
   implemented, so there is no 0-RTT attack surface yet.
 
-## Privilege separation
+## Memory safety
+
+The entire codebase is `#![forbid(unsafe_code)]` — there is **no `unsafe` in any
+noissh crate or binary**. The few operations that need OS primitives (PTY
+allocation, fork/exec, daemonization, terminal ioctls) are delegated to
+well-tested safe-API crates (`pty-process`, `daemonize`, `nix`, `terminal_size`),
+so the whole protocol and privilege surface is written in safe Rust.
+
+## Privilege model
 
 The scariest surface in any network shell daemon is privileged code. noissh keeps
 it minimal:
 
-- All parsing, crypto, and protocol handling run in **unprivileged** code paths
+- All parsing, crypto, and protocol handling run in **unprivileged**, safe code
   and are fuzzed (the frame parser and packet handler never panic on arbitrary
   input — see the `security` and `wire` tests).
-- The portable `LocalLogin` backend runs the shell as the **current user** and
-  needs **no root**.
-- The Linux `PrivsepLogin` backend performs `setgid` → `initgroups` → `setuid`
-  (in that order) before exec, with PAM session setup, only when run as root.
-  PAM is behind the `pty/pam` cargo feature so the default build pulls in no PAM
-  code at all.
+- The portable login backend allocates a real PTY and runs the shell as the
+  **current user** with **no root** required.
+- **Multi-user deployments use the mosh model:** the SSH bootstrap
+  (`noissh --ssh`) launches the server *as the already-authenticated user* over
+  SSH, so the session process is the right user from the start — no in-process
+  `setuid` is performed, avoiding the well-known supplementary-group pitfalls of
+  privilege dropping.
+- A standalone daemon running as root can optionally drop to a target user's
+  `uid`/`gid` before exec (via the safe `pty-process` API). This basic drop does
+  not initialise supplementary groups; for full fidelity prefer the SSH-bootstrap
+  model or run the daemon already as the target user (e.g. via a systemd unit).
 
 ## Cryptographic key storage
 

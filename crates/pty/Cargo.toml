@@ -4,18 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-nix.workspace = true
-libc = "0.2"
+nix = { workspace = true }
 thiserror.workspace = true
-
-[features]
-# Optional PAM account/session management (Linux). Off by default so the
-# default build does not require libpam headers; enable for production
-# deployments that want PAM acct_mgmt/open_session and the optional 2nd factor.
-pam = ["dep:pam-client"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-pam-client = { version = "0.5", optional = true }
+pty-process = "0.5"
 
 [lints]
 workspace = true

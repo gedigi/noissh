@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! noissh — the noissh client.
 //!
 //! Modes:
@@ -8,7 +9,7 @@
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::process::exit;
 use std::time::Duration;
 
@@ -134,7 +135,7 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     let mut renderer = Renderer::new();
 
     let stdin = std::io::stdin();
-    set_nonblocking(stdin.as_raw_fd());
+    set_nonblocking(stdin.as_fd());
 
     let mut stdout = std::io::stdout();
     stdout.write_all(b"\x1b[2J\x1b[H")?; // clear screen
@@ -177,12 +178,11 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     }
 }
 
-fn set_nonblocking(fd: i32) {
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return; // could not query flags; leave the fd as-is
-        }
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+fn set_nonblocking<Fd: std::os::fd::AsFd>(fd: Fd) {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    if let Ok(cur) = fcntl(fd.as_fd(), FcntlArg::F_GETFL) {
+        let mut flags = OFlag::from_bits_truncate(cur);
+        flags.insert(OFlag::O_NONBLOCK);
+        let _ = fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags));
     }
 }

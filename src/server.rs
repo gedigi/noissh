@@ -6,7 +6,6 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use auth::AuthorizedKeys;
-use nix::errno::Errno;
 use noise_core::Keypair;
 use proto::{ControlMsg, Handshaker, ServerShell, authorize_client};
 use pty::{LocalLogin, LoginSession, PtyError, PtyHandle, SpawnRequest};
@@ -276,7 +275,7 @@ impl ServerCore {
                 continue;
             };
             // Drain available PTY output.
-            if let Some(pty) = &sess.pty {
+            if let Some(pty) = &mut sess.pty {
                 let mut buf = [0u8; 8192];
                 loop {
                     match pty.read(&mut buf) {
@@ -286,7 +285,7 @@ impl ServerCore {
                                 shell.feed_output(&buf[..n]);
                             }
                         }
-                        Err(PtyError::Sys(Errno::EAGAIN)) => break,
+                        Err(PtyError::WouldBlock) => break, // no data ready now
                         Err(_) => break,
                     }
                 }

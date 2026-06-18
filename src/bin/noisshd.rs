@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! noisshd — the noissh server daemon.
 //!
 //! Modes:

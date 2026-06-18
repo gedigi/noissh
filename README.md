@@ -37,7 +37,7 @@ A Cargo workspace of focused, independently-testable crates plus two binaries:
 | `term` | Clean-room authoritative terminal emulator (`vte`-based) + latest-wins screen diff |
 | `predict` | Client-side predictive-echo engine (guess → paint → reconcile) |
 | `auth` | `known_hosts` TOFU + `authorized_keys`, X25519 key text format |
-| `pty` | Portable PTY/login + Linux PAM/privsep (`cfg`-gated, PAM behind a feature) |
+| `pty` | PTY allocation + login-shell launching (safe, via `pty-process`) |
 | `proto` | Handshake driver, control channel, server-authoritative state-sync data plane |
 | `noissh` (root) | UDP client/server runtime, config, raw-tty renderer, SSH bootstrap, binaries |
 
@@ -97,14 +97,18 @@ covered by automated tests — both an in-process harness that injects
 loss/reorder and rewrites the source address mid-session, and a real-socket e2e
 that rebinds the client's UDP socket mid-session.
 
+## Safety
+
+The whole project is `#![forbid(unsafe_code)]` — **no `unsafe` in any crate or
+binary**. OS primitives (PTY, fork/exec, daemonize, terminal size) are delegated
+to well-tested safe-API crates.
+
 ## Platform notes
 
-- **Server:** Linux and macOS. The portable backend allocates a real PTY and
-  runs the login shell as the current user (no root needed) — this is the
-  tested path. The sshd-style privilege-separated backend
-  (`setgid`/`initgroups`/`setuid` + optional PAM `acct_mgmt`/`open_session`) is
-  Linux-only and requires running as root; PAM is behind the `pty/pam` cargo
-  feature so the default build needs no libpam headers.
+- **Server:** Linux and macOS. The login backend allocates a real PTY and runs
+  the login shell as the current user (no root needed) — the tested path.
+  Multi-user deployments use the mosh model: the SSH bootstrap launches the
+  server already running as the authenticated user (no in-process `setuid`).
 - **Non-goals:** Windows *server*, X11 forwarding, GSSAPI/Kerberos, SSH
   wire-protocol interop.
 

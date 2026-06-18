@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Transport / session layer for noissh — the mini-QUIC-with-Noise spine.
 //!
 //! Owns the wire packet format, the cryptographic session id, anti-replay,

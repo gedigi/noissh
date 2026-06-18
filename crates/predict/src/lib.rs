@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Client-side predictive echo engine.
 //!
 //! On each keystroke the client guesses the visible effect (echo of printable

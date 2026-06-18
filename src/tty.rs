@@ -42,14 +42,9 @@ fn io_err(e: nix::errno::Errno) -> RuntimeError {
 
 /// Query the controlling terminal's size as (cols, rows).
 pub fn terminal_size() -> (u16, u16) {
-    use std::os::fd::AsRawFd;
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let fd = io::stdout().as_raw_fd();
-    let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
-    if ok == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        (ws.ws_col, ws.ws_row)
-    } else {
-        (80, 24)
+    match terminal_size::terminal_size() {
+        Some((terminal_size::Width(w), terminal_size::Height(h))) if w > 0 && h > 0 => (w, h),
+        _ => (80, 24),
     }
 }
 

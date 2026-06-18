@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Wire frame codec for noissh.
 //!
 //! Defines the plaintext frame format carried inside each Noise-encrypted

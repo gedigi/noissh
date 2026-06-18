@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Protocol wiring for noissh: handshake driver, control channel, and the
 //! interactive-shell data plane that ties the Noise core, transport, terminal
 //! model, predictive echo, and auth crates together.

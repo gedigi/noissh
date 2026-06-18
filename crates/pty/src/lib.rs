@@ -1,46 +1,52 @@
-//! PTY allocation, login-shell launching, and (Linux) PAM/privilege separation.
+//! PTY allocation and login-shell launching.
 //!
-//! Two login backends share one [`LoginSession`] trait:
+//! Built on the safe [`pty_process`] crate (which encapsulates the PTY/fork/exec
+//! and controlling-terminal setup), so this crate contains no `unsafe` code.
 //!
-//! - [`LocalLogin`] — portable: allocates a PTY and execs the login shell as
-//!   the *current* user. This is the path exercised by the test-suite and by
-//!   the local/dev daemon (no root needed).
-//! - [`PrivsepLogin`] — the sshd-style flow: PAM `acct_mgmt`/`open_session`
-//!   then `setgid`/`initgroups`/`setuid` to the target user before exec. PAM is
-//!   Linux-only and gated behind `cfg(target_os = "linux")`; the privilege drop
-//!   itself is portable but requires the daemon to run as root.
+//! The portable [`LocalLogin`] backend allocates a real PTY and execs the login
+//! shell. It runs as the current user by default; if a target user is given it
+//! drops to that user's uid/gid before exec (requires root). For full multi-user
+//! deployments use the mosh-style SSH bootstrap, where the server is already
+//! launched as the authenticated user by SSH — so no in-process setuid (and its
+//! supplementary-group subtleties) is involved.
 
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, OwnedFd};
+#![forbid(unsafe_code)]
 
-use nix::pty::{Winsize, openpty};
-use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid};
+use std::io::{Read, Write};
+use std::process::Child;
+
+use pty_process::Size;
+use pty_process::blocking::{Command, Pty};
 use thiserror::Error;
 
 pub mod login;
 pub use login::{LocalLogin, LoginSession};
 
-#[cfg(target_os = "linux")]
-pub use login::PrivsepLogin;
-
 #[derive(Debug, Error)]
 pub enum PtyError {
-    #[error("system error: {0}")]
-    Sys(#[from] nix::errno::Errno),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("pty: {0}")]
+    Pty(String),
+    #[error("operation would block")]
+    WouldBlock,
     #[error("unknown user {0:?}")]
     UnknownUser(String),
-    #[error("invalid command/env string (contains NUL)")]
-    BadCString,
-    #[error("pam: {0}")]
-    Pam(String),
+    #[error("system error: {0}")]
+    Nix(#[from] nix::errno::Errno),
+}
+
+impl From<pty_process::Error> for PtyError {
+    fn from(e: pty_process::Error) -> Self {
+        PtyError::Pty(e.to_string())
+    }
 }
 
 /// A request to start a login session.
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
-    /// Target user. `None` = current user (no privilege change).
+    /// Target user. `None` = current user (no privilege change). When set, the
+    /// child drops to that user's uid/gid before exec (requires root).
     pub user: Option<String>,
     /// Command + args to exec. `None` = the target user's login shell.
     pub command: Option<Vec<String>>,
@@ -64,67 +70,45 @@ impl Default for SpawnRequest {
     }
 }
 
-fn winsize(rows: u16, cols: u16) -> Winsize {
-    Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    }
-}
-
 /// A running PTY-backed child process.
 pub struct PtyHandle {
-    master: OwnedFd,
-    pid: Pid,
+    pty: Pty,
+    child: Child,
     status: Option<i32>,
 }
 
 impl PtyHandle {
-    /// Raw master fd, e.g. to register with a poller.
-    pub fn master_fd(&self) -> i32 {
-        self.master.as_raw_fd()
-    }
-
     /// Make the master end non-blocking (for event-loop integration).
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), PtyError> {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
-        let fd = self.master.as_raw_fd();
-        let mut flags = OFlag::from_bits_truncate(fcntl(self.master_borrow(), FcntlArg::F_GETFL)?);
+        use std::os::fd::AsFd;
+        let cur = fcntl(self.pty.as_fd(), FcntlArg::F_GETFL)?;
+        let mut flags = OFlag::from_bits_truncate(cur);
         flags.set(OFlag::O_NONBLOCK, nonblocking);
-        fcntl(self.master_borrow(), FcntlArg::F_SETFL(flags))?;
-        let _ = fd;
+        fcntl(self.pty.as_fd(), FcntlArg::F_SETFL(flags))?;
         Ok(())
     }
 
-    fn master_borrow(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd;
-        self.master.as_fd()
-    }
-
-    /// Read shell output. Returns `Ok(0)` at EOF (child closed the PTY).
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, PtyError> {
-        match nix::unistd::read(self.master_borrow(), buf) {
+    /// Read shell output. Returns `Ok(0)` at EOF (child closed the PTY) and
+    /// `Err(WouldBlock)` when non-blocking and no data is ready.
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
+        match (&self.pty).read(buf) {
             Ok(n) => Ok(n),
-            // The slave side closing yields EIO on Linux; treat as EOF.
-            Err(nix::errno::Errno::EIO) => Ok(0),
-            Err(e) => Err(e.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(PtyError::WouldBlock),
+            // EIO and other read errors on a PTY master mean the slave is gone.
+            Err(_) => Ok(0),
         }
     }
 
     /// Write bytes (e.g. keystrokes) to the shell.
     pub fn write(&self, buf: &[u8]) -> Result<usize, PtyError> {
-        Ok(nix::unistd::write(self.master_borrow(), buf)?)
+        let mut master = &self.pty;
+        Ok(master.write(buf)?)
     }
 
     /// Propagate a window resize to the PTY (sends SIGWINCH to the shell).
     pub fn set_winsize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        let ws = winsize(rows, cols);
-        let ret = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
-        if ret < 0 {
-            return Err(nix::errno::Errno::last().into());
-        }
-        Ok(())
+        Ok(self.pty.resize(Size::new(rows, cols))?)
     }
 
     /// Non-blocking check for child exit; returns the exit status if exited.
@@ -132,17 +116,13 @@ impl PtyHandle {
         if let Some(s) = self.status {
             return Ok(Some(s));
         }
-        match waitpid(self.pid, Some(WaitPidFlag::WNOHANG))? {
-            WaitStatus::Exited(_, code) => {
+        match self.child.try_wait()? {
+            Some(es) => {
+                let code = status_code(es);
                 self.status = Some(code);
                 Ok(Some(code))
             }
-            WaitStatus::Signaled(_, sig, _) => {
-                let s = 128 + sig as i32;
-                self.status = Some(s);
-                Ok(Some(s))
-            }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -151,18 +131,15 @@ impl PtyHandle {
         if let Some(s) = self.status {
             return Ok(s);
         }
-        let s = match waitpid(self.pid, None)? {
-            WaitStatus::Exited(_, code) => code,
-            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-            _ => 0,
-        };
-        self.status = Some(s);
-        Ok(s)
+        let es = self.child.wait()?;
+        let code = status_code(es);
+        self.status = Some(code);
+        Ok(code)
     }
 
     /// Terminate the child.
-    pub fn kill(&self) -> Result<(), PtyError> {
-        let _ = kill(self.pid, Signal::SIGHUP);
+    pub fn kill(&mut self) -> Result<(), PtyError> {
+        let _ = self.child.kill();
         Ok(())
     }
 }
@@ -170,185 +147,77 @@ impl PtyHandle {
 impl Drop for PtyHandle {
     fn drop(&mut self) {
         if self.status.is_none() {
-            let _ = self.kill();
-            let _ = waitpid(self.pid, Some(WaitPidFlag::WNOHANG));
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
 
-/// Resolve the command/argv/env/cwd/uid for a request, then fork+exec under a
-/// fresh PTY. The `pre_exec` closure runs in the child after `setsid` and PTY
-/// setup but before `execvpe` — the privilege drop and PAM credentials hook in
-/// here.
-pub(crate) fn spawn_with(
-    req: &SpawnRequest,
-    pre_exec: impl FnOnce() -> Result<(), nix::errno::Errno>,
-) -> Result<PtyHandle, PtyError> {
-    use nix::unistd::User;
+/// Map an `ExitStatus` to a shell-style integer code (128 + signal if killed).
+fn status_code(es: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    es.code().unwrap_or_else(|| 128 + es.signal().unwrap_or(0))
+}
 
-    // Resolve the target user (defaults to current).
+/// Resolve the request to a command + env and spawn it under a fresh PTY.
+pub(crate) fn spawn(req: &SpawnRequest) -> Result<PtyHandle, PtyError> {
+    use nix::unistd::{User, getuid};
+
     let target = match &req.user {
         Some(name) => User::from_name(name)?.ok_or_else(|| PtyError::UnknownUser(name.clone()))?,
         None => {
-            let uid = nix::unistd::getuid();
-            User::from_uid(uid)?.ok_or_else(|| PtyError::UnknownUser(uid.to_string()))?
+            User::from_uid(getuid())?.ok_or_else(|| PtyError::UnknownUser(getuid().to_string()))?
         }
     };
 
-    // Build the program, argv, and env *before* fork (no allocation in child).
     let shell =
         std::env::var("SHELL").unwrap_or_else(|_| target.shell.to_string_lossy().into_owned());
-    let (program, argv) = match &req.command {
-        Some(cmd) if !cmd.is_empty() => {
-            let prog = resolve_program(&cmd[0])?;
-            let argv = cmd.iter().map(|s| cstr(s)).collect::<Result<Vec<_>, _>>()?;
-            (prog, argv)
+
+    let (pty, pts) = pty_process::blocking::open()?;
+    pty.resize(Size::new(req.rows, req.cols))?;
+
+    let mut cmd = match &req.command {
+        Some(c) if !c.is_empty() => {
+            let mut b = Command::new(&c[0]);
+            if c.len() > 1 {
+                b = b.args(&c[1..]);
+            }
+            b
         }
         _ => {
-            let prog = resolve_program(&shell)?;
             // Login shell convention: argv[0] = "-<basename>".
             let base = shell.rsplit('/').next().unwrap_or("sh");
-            let argv0 = cstr(&format!("-{base}"))?;
-            (prog, vec![argv0])
+            Command::new(&shell).arg0(format!("-{base}"))
         }
     };
 
-    let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-    env_map.insert("TERM".to_string(), req.term.clone());
-    env_map.insert(
-        "HOME".to_string(),
-        target.dir.to_string_lossy().into_owned(),
-    );
-    env_map.insert("USER".to_string(), target.name.clone());
-    env_map.insert("SHELL".to_string(), shell.clone());
+    cmd = cmd
+        .env("TERM", &req.term)
+        .env("HOME", &target.dir)
+        .env("USER", &target.name)
+        .env("SHELL", &shell);
     for (k, v) in &req.env {
-        env_map.insert(k.clone(), v.clone());
+        cmd = cmd.env(k, v);
     }
-    let envp = env_map
-        .iter()
-        .map(|(k, v)| cstr(&format!("{k}={v}")))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let ws = winsize(req.rows, req.cols);
-    let pty = openpty(Some(&ws), None)?;
-    let master = pty.master;
-    let slave = pty.slave;
-    let slave_raw = slave.as_raw_fd();
-    let master_raw = master.as_raw_fd();
-
-    match unsafe { nix::unistd::fork()? } {
-        ForkResult::Child => {
-            // Child: only async-signal-safe libc calls from here on.
-            unsafe {
-                if libc::setsid() < 0 {
-                    libc::_exit(126);
-                }
-                // Acquire the controlling terminal.
-                if libc::ioctl(slave_raw, libc::TIOCSCTTY as _, 0) < 0 {
-                    libc::_exit(126);
-                }
-                // Wire stdio to the slave.
-                libc::dup2(slave_raw, 0);
-                libc::dup2(slave_raw, 1);
-                libc::dup2(slave_raw, 2);
-                if slave_raw > 2 {
-                    libc::close(slave_raw);
-                }
-                // Guard against master_raw being a std stream (0/1/2): those were
-                // just reassigned to the slave by dup2 above, so closing them
-                // would close the slave-backed stdio.
-                if master_raw > 2 {
-                    libc::close(master_raw);
-                }
-            }
-            // Privilege drop / PAM credential hook.
-            if pre_exec().is_err() {
-                unsafe { libc::_exit(125) };
-            }
-            // Exec; only returns on failure.
-            let _ = nix::unistd::execve(&program, &argv, &envp);
-            unsafe { libc::_exit(127) };
-        }
-        ForkResult::Parent { child } => {
-            drop(slave); // parent doesn't need the slave end
-            Ok(PtyHandle {
-                master,
-                pid: child,
-                status: None,
-            })
-        }
-    }
-}
-
-fn cstr(s: &str) -> Result<CString, PtyError> {
-    CString::new(s).map_err(|_| PtyError::BadCString)
-}
-
-/// Resolve a program name to an absolute path (searching `PATH` if needed),
-/// so the cross-platform `execve` can be used. Runs before fork.
-fn resolve_program(prog: &str) -> Result<CString, PtyError> {
-    if prog.contains('/') {
-        return cstr(prog);
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            let cand = format!("{dir}/{prog}");
-            if std::path::Path::new(&cand).exists() {
-                return cstr(&cand);
-            }
-        }
-    }
-    cstr(prog) // let execve fail -> _exit(127) if not found
-}
-
-/// Resolved target-user credentials, computed in the parent BEFORE fork so the
-/// post-fork child needs no heap allocation or NSS lookup (`getpwnam` and
-/// `CString::new` are not async-signal-safe and can deadlock a multi-threaded
-/// process after fork). Linux-only (uses `initgroups`).
-#[cfg(target_os = "linux")]
-pub(crate) struct Credentials {
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    name: CString,
-}
-
-#[cfg(target_os = "linux")]
-impl Credentials {
-    /// Resolve `name` to numeric uid/gid + a C name string (heap work happens
-    /// here, in the parent, before fork).
-    pub(crate) fn resolve(name: &str) -> Result<Self, PtyError> {
-        use nix::unistd::User;
-        let user = User::from_name(name)?.ok_or_else(|| PtyError::UnknownUser(name.to_string()))?;
-        Ok(Credentials {
-            uid: user.uid.as_raw(),
-            gid: user.gid.as_raw(),
-            name: cstr(name)?,
-        })
+    if req.user.is_some() {
+        // Basic privilege drop (uid/gid). Requires root. Supplementary groups
+        // are not initialised here; prefer the SSH-bootstrap model for full
+        // multi-user fidelity.
+        cmd = cmd.uid(target.uid.as_raw()).gid(target.gid.as_raw());
     }
 
-    /// Apply the privilege drop in the child: setgid, initgroups, then setuid
-    /// (that order matters). Uses only async-signal-safe raw libc calls.
-    pub(crate) fn apply(&self) -> Result<(), nix::errno::Errno> {
-        unsafe {
-            if libc::setgid(self.gid) < 0 {
-                return Err(nix::errno::Errno::last());
-            }
-            if libc::initgroups(self.name.as_ptr(), self.gid) < 0 {
-                return Err(nix::errno::Errno::last());
-            }
-            if libc::setuid(self.uid) < 0 {
-                return Err(nix::errno::Errno::last());
-            }
-        }
-        Ok(())
-    }
+    let child = cmd.spawn(pts)?;
+    Ok(PtyHandle {
+        pty,
+        child,
+        status: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Read until the child exits, accumulating all PTY output.
     fn read_to_end(h: &mut PtyHandle) -> Vec<u8> {
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
@@ -356,6 +225,7 @@ mod tests {
             match h.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(PtyError::WouldBlock) => continue,
                 Err(_) => break,
             }
         }
@@ -391,7 +261,6 @@ mod tests {
     #[test]
     fn winsize_is_applied_to_pty() {
         let login = LocalLogin;
-        // `stty size` prints "<rows> <cols>" from the controlling tty.
         let req = SpawnRequest {
             command: Some(vec!["/bin/sh".into(), "-c".into(), "stty size".into()]),
             rows: 30,
@@ -407,7 +276,6 @@ mod tests {
     #[test]
     fn resize_after_spawn_updates_winsize() {
         let login = LocalLogin;
-        // Sleep briefly, then report size — gives us time to resize.
         let req = SpawnRequest {
             command: Some(vec![
                 "/bin/sh".into(),

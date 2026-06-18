@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Terminal model for noissh.
 //!
 //! A clean-room, server-side authoritative terminal emulator plus a latest-wins

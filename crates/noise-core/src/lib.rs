@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Noise session core for noissh.
 //!
 //! Wraps `snow` to provide the `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake

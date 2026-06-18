@@ -44,12 +44,18 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate map and
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire format. The design rationale
 is in [`docs/specs/2026-06-18-noissh-design.md`](docs/specs/2026-06-18-noissh-design.md).
 
+## Safety
+
+The project is `#![forbid(unsafe_code)]` in every crate and binary. Do not add
+`unsafe`; reach for a vetted safe-API crate (as we do with `pty-process`,
+`daemonize`, `nix`, `terminal_size`) instead.
+
 ## Platform notes
 
-- The portable PTY/login path (`LocalLogin`) works on Linux and macOS with no
-  root and is exercised by the test suite.
-- The Linux privsep/PAM path (`PrivsepLogin`, `pty/pam` feature) requires Linux
-  and root to run; it is `cfg`-gated and cannot be exercised on macOS.
+- The PTY/login path (`LocalLogin`, via `pty-process`) works on Linux and macOS
+  with no root and is exercised by the test suite.
+- Multi-user deployments use the SSH-bootstrap model (server runs as the
+  authenticated user); an optional root daemon can drop `uid`/`gid` before exec.
 
 ## Commit messages
 
