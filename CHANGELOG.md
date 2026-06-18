@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2]
+
+### Fixed
+
+- **Restore the terminal on signals**: if the interactive client is killed by
+  `SIGTERM`/`SIGINT`/`SIGHUP` (e.g. an external `kill`), it now resets the
+  terminal out of raw mode before exiting, instead of leaving the shell unusable
+  until `reset`.
+
 ## [0.4.1]
 
 ### Security

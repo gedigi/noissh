@@ -45,7 +45,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "auth"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64",
  "thiserror",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "noise-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64",
  "snow",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "noissh"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "auth",
  "base64",
@@ -347,6 +347,7 @@ dependencies = [
  "predict",
  "proto",
  "pty",
+ "signal-hook",
  "term",
  "terminal_size",
  "thiserror",
@@ -385,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "predict"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "term",
 ]
@@ -401,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "auth",
  "noise-core",
@@ -414,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "pty"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "nix",
  "pty-process",
@@ -511,6 +512,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "snow"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -546,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "term"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "thiserror",
  "unicode-width",
@@ -586,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "getrandom 0.4.3",
  "noise-core",
@@ -749,7 +770,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wire"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "thiserror",
 ]

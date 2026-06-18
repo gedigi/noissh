@@ -291,7 +291,27 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     let mut inbuf = [0u8; 4096];
     let mut next_keepalive = Instant::now() + KEEPALIVE;
 
+    // Restore the terminal if we're killed by a signal: register a flag for
+    // SIGTERM/SIGINT/SIGHUP; the signal interrupts poll(), we observe the flag,
+    // break out, and the RawMode guard's Drop runs (resetting termios). Without
+    // this, an external `kill` would leave the terminal in raw mode.
+    let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
+        let _ = signal_hook::flag::register(sig, std::sync::Arc::clone(&signalled));
+    }
+
     loop {
+        if signalled.load(std::sync::atomic::Ordering::Relaxed) {
+            // Restore the cursor and terminal, then exit (128 + SIGTERM).
+            let _ = stdout.write_all(b"\x1b[?25h\r\n");
+            let _ = stdout.flush();
+            drop(_raw);
+            exit(143);
+        }
         // Wait for the socket or stdin to be ready, or a timer to fire. This is
         // event-driven: idle sessions wake only to keepalive, not in a busy loop.
         let timeout = if client.core().has_outgoing() {
