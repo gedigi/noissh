@@ -48,12 +48,21 @@ const IDLE_REAP_TICKS: u32 = 20_000;
 /// against a flood of fresh session-ids from a spoofed source.
 const MAX_PENDING_HANDSHAKES: usize = 512;
 
+/// The per-user directory under which forwarded agent sockets live. Kept private
+/// to the owning user (mode 0700) so no other local user can reach the sockets.
+fn agent_socket_dir() -> std::path::PathBuf {
+    let uid = nix::unistd::Uid::current().as_raw();
+    std::env::temp_dir().join(format!("noissh-{uid}"))
+}
+
 /// Filesystem path for a session's forwarded SSH agent socket. Unique per
-/// process and session so concurrent sessions never collide.
+/// process and session so concurrent sessions never collide. The containing
+/// directory (created and locked down by the driver at bind time) is what keeps
+/// the socket private; see [`Server::ensure_agent_dir`].
 fn agent_socket_path(sid: SessionId) -> String {
     let hex: String = sid.iter().map(|b| format!("{b:02x}")).collect();
-    std::env::temp_dir()
-        .join(format!("noissh-agent-{}-{hex}.sock", std::process::id()))
+    agent_socket_dir()
+        .join(format!("agent-{}-{hex}.sock", std::process::id()))
         .to_string_lossy()
         .into_owned()
 }
@@ -594,6 +603,55 @@ impl Server {
         })
     }
 
+    /// Ensure the per-user agent-socket directory exists, is a real directory we
+    /// own, and is private (mode 0700). Rejects a pre-existing path owned by
+    /// another user or that is not a directory (symlink/replace defence).
+    fn ensure_agent_dir() -> std::io::Result<std::path::PathBuf> {
+        use std::io::{Error, ErrorKind};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+        let dir = agent_socket_dir();
+        let uid = nix::unistd::Uid::current().as_raw();
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Err(Error::new(
+                        ErrorKind::AlreadyExists,
+                        "agent socket dir is not a directory",
+                    ));
+                }
+                if meta.uid() != uid {
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "agent socket dir not owned by current user",
+                    ));
+                }
+                // Tighten in case a previous run (or umask) left it loose.
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(dir)
+    }
+
+    /// Bind the per-session agent listener at `path`, locked down so only the
+    /// owning user can connect: a 0700 parent directory plus a 0600 socket.
+    fn bind_agent_socket(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+        use std::os::unix::fs::PermissionsExt;
+
+        Self::ensure_agent_dir()?;
+        let p = std::path::Path::new(path);
+        let _ = std::fs::remove_file(p); // clear a stale socket from a prior run
+        let listener = std::os::unix::net::UnixListener::bind(p)?;
+        // Restrict the socket file itself (defence in depth alongside the dir).
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    }
+
     /// Service forwarded TCP connections: dial out for new forward streams,
     /// move bytes between TCP and the session streams in both directions.
     fn pump_forwards(&mut self) {
@@ -639,15 +697,16 @@ impl Server {
         }
 
         // Honour agent-forwarding requests: bind a Unix listener per request at
-        // the path the shell's SSH_AUTH_SOCK points to. Clear any stale socket
-        // file first (a crashed previous run could leave one behind).
-        use std::os::unix::net::{UnixListener, UnixStream};
+        // the path the shell's SSH_AUTH_SOCK points to. The socket carries the
+        // user's live agent, so it must not be reachable by other local users:
+        // it lives in a per-user 0700 directory and is itself chmod 0600.
+        use std::os::unix::net::UnixStream;
         for (sid, path) in self.core.take_agent_socket_requests() {
-            let p = std::path::PathBuf::from(&path);
-            let _ = std::fs::remove_file(&p);
-            if let Ok(l) = UnixListener::bind(&p) {
-                let _ = l.set_nonblocking(true);
-                self.agent_listeners.push((l, sid, p));
+            match Self::bind_agent_socket(&path) {
+                Ok(l) => self
+                    .agent_listeners
+                    .push((l, sid, std::path::PathBuf::from(path))),
+                Err(e) => eprintln!("noisshd: agent forwarding disabled for session: {e}"),
             }
         }
         // Drop agent listeners whose session is gone, unlinking the socket file.

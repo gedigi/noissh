@@ -49,10 +49,12 @@ fn spawn_mock_agent(stop: Arc<AtomicBool>) -> String {
     path_str
 }
 
-/// Find the server-side agent socket this process created (glob the temp dir).
+/// Find the server-side agent socket this process created. Sockets live in a
+/// per-user 0700 directory (`<tmp>/noissh-<uid>/agent-<pid>-<sid>.sock`).
 fn find_server_agent_sock() -> Option<std::path::PathBuf> {
-    let prefix = format!("noissh-agent-{}-", std::process::id());
-    let dir = std::env::temp_dir();
+    let uid = nix::unistd::Uid::current().as_raw();
+    let prefix = format!("agent-{}-", std::process::id());
+    let dir = std::env::temp_dir().join(format!("noissh-{uid}"));
     let entries = std::fs::read_dir(&dir).ok()?;
     for e in entries.flatten() {
         let name = e.file_name();
