@@ -140,6 +140,33 @@ fn get_downloads_a_file_from_the_server() {
 }
 
 #[test]
+fn put_to_uncreatable_destination_is_reported_as_an_error() {
+    let server = start_server();
+    let mut client = server.connect();
+
+    let local = temp_path("put-bad-src");
+    std::fs::write(&local, b"hello").unwrap();
+    // A destination whose parent directory does not exist: the server can't
+    // create the sink and must abort the transfer.
+    let remote = "/noissh-no-such-dir-xyz/dst.bin".to_string();
+
+    let req = XferRequest::Put {
+        path: remote,
+        size: 5,
+    };
+    let result = client.run_transfer(&req, &local.to_string_lossy());
+
+    server.shutdown();
+
+    assert!(
+        result.is_err(),
+        "uploading to an uncreatable path should error"
+    );
+
+    let _ = std::fs::remove_file(&local);
+}
+
+#[test]
 fn get_of_missing_file_is_reported_as_an_error() {
     let server = start_server();
     let mut client = server.connect();

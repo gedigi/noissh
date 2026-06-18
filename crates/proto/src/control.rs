@@ -126,6 +126,8 @@ impl ControlMsg {
                 let cols = get_varint(buf, &mut pos)? as u16;
                 let rows = get_varint(buf, &mut pos)? as u16;
                 let term = get_str(buf, &mut pos)?;
+                // `agent` is the last field. If you append another field here,
+                // advance `pos` past this byte first (as the other arms do).
                 let agent = *buf.get(pos).ok_or(ControlError::Eof)? != 0;
                 ControlMsg::OpenShell {
                     cols,

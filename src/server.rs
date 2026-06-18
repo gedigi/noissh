@@ -640,13 +640,20 @@ impl Server {
     /// Bind the per-session agent listener at `path`, locked down so only the
     /// owning user can connect: a 0700 parent directory plus a 0600 socket.
     fn bind_agent_socket(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+        use nix::sys::stat::{Mode, umask};
         use std::os::unix::fs::PermissionsExt;
 
         Self::ensure_agent_dir()?;
         let p = std::path::Path::new(path);
         let _ = std::fs::remove_file(p); // clear a stale socket from a prior run
-        let listener = std::os::unix::net::UnixListener::bind(p)?;
-        // Restrict the socket file itself (defence in depth alongside the dir).
+        // Bind under a restrictive umask so the socket is created 0600 from the
+        // start — closing the window between bind and a path-based chmod where it
+        // could briefly be reachable by another same-uid process.
+        let prev = umask(Mode::from_bits_truncate(0o177));
+        let bound = std::os::unix::net::UnixListener::bind(p);
+        umask(prev); // restore promptly, even on bind failure
+        let listener = bound?;
+        // Belt and suspenders: tighten perms explicitly too.
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         Ok(listener)
@@ -731,8 +738,17 @@ impl Server {
             }
         }
         for (sid, s) in agent_accepted {
-            if let (Some(id), Ok(conn)) = (self.core.open_agent(sid), ForwardConn::new_unix(s)) {
-                self.agent_conns.insert((sid, id), conn);
+            let Some(id) = self.core.open_agent(sid) else {
+                continue;
+            };
+            match ForwardConn::new_unix(s) {
+                Ok(conn) => {
+                    self.agent_conns.insert((sid, id), conn);
+                }
+                // Couldn't wrap the accepted socket: reset the just-opened stream
+                // so it isn't orphaned (retransmitting an open the client can
+                // never satisfy) and stalling the session.
+                Err(_) => self.core.stream_reset(sid, id),
             }
         }
 
@@ -836,36 +852,47 @@ impl Server {
             // Whether the download stream has room for another chunk (bounded by
             // unacked in-flight bytes); computed before the borrow below.
             let get_has_window = self.core.stream_in_flight(k.0, k.1) < SEND_CAP;
+            // `abort` distinguishes an I/O failure (reset → client sees an error)
+            // from a clean end-of-transfer (graceful close → client sees success).
+            let mut abort = false;
             let done = match self.xfers.get_mut(&k) {
                 Some(XferState::Put(sink)) => {
-                    let mut err = false;
                     loop {
                         let d = self.core.stream_read(k.0, k.1);
                         if d.is_empty() {
                             break;
                         }
                         if sink.write(&d).is_err() {
-                            err = true;
+                            abort = true;
                             break;
                         }
                     }
                     // Finished once the client closed its half and all bytes are
                     // written; or aborted on a write error.
-                    err || self.core.stream_recv_finished(k.0, k.1)
+                    abort || self.core.stream_recv_finished(k.0, k.1)
                 }
                 Some(XferState::Get(src)) if get_has_window => match src.read_chunk(64 * 1024) {
                     Ok(d) if !d.is_empty() => {
                         self.core.stream_write(k.0, k.1, &d);
                         false
                     }
-                    // EOF or read error: nothing more to send.
-                    _ => true,
+                    Ok(_) => true, // EOF: the whole file has been sent.
+                    Err(_) => {
+                        abort = true; // mid-file read error: fail the transfer.
+                        true
+                    }
                 },
                 // Window full (or no such transfer): wait for the next pump.
                 Some(XferState::Get(_)) | None => false,
             };
             if done {
-                self.core.stream_close(k.0, k.1);
+                if abort {
+                    // Signal failure so the client doesn't treat a partial
+                    // transfer as success.
+                    self.core.stream_reset(k.0, k.1);
+                } else {
+                    self.core.stream_close(k.0, k.1);
+                }
                 self.xfers.remove(&k);
             }
         }
