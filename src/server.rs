@@ -20,6 +20,11 @@ struct ServerSession {
     pty: Option<PtyHandle>,
     rows: u16,
     cols: u16,
+    /// The authenticated client static key, used to reattach a returning client.
+    client_key: Vec<u8>,
+    /// Ticks since we last received an authenticated packet from this client;
+    /// resets to 0 on activity. Drives detached-session reaping.
+    idle_ticks: u32,
     /// Set once the shell has exited; carries its status for retransmission.
     exit_status: Option<i32>,
     /// Ticks elapsed since exit, used to bound Exit retransmission before the
@@ -30,6 +35,12 @@ struct ServerSession {
 /// How many ticks to keep retransmitting the Exit notice before reclaiming a
 /// finished session (the notice is best-effort; this bounds delivery + memory).
 const EXIT_RETRANSMIT_TICKS: u32 = 50;
+
+/// Reap a session whose client has been silent for this many ticks (no acks,
+/// no keepalives). A live client sends keepalives well within this window; this
+/// is also the grace during which a vanished client may reattach. At the
+/// server's tick cadence (~tens of ms) this is on the order of minutes.
+const IDLE_REAP_TICKS: u32 = 20_000;
 
 /// Cap on simultaneously in-flight (incomplete) handshakes, bounding memory
 /// against a flood of fresh session-ids from a spoofed source.
@@ -151,18 +162,38 @@ impl ServerCore {
                 return Ok(out); // reject: no session created
             }
             let session = hs.into_session(Some(src))?;
-            self.sessions.insert(
-                sid,
-                ServerSession {
-                    session,
-                    shell: None,
-                    pty: None,
-                    rows: 24,
-                    cols: 80,
-                    exit_status: None,
-                    exit_ticks: 0,
-                },
-            );
+
+            // Reattach: if this client key already has a live session (its
+            // previous connection went silent but the shell is still running),
+            // move that running shell/pty onto the new transport session and
+            // resend the screen as a full snapshot.
+            let existing = self.sessions.iter().find_map(|(k, s)| {
+                (s.client_key == client_static && s.exit_status.is_none()).then_some(*k)
+            });
+
+            let mut new_sess = ServerSession {
+                session,
+                shell: None,
+                pty: None,
+                rows: 24,
+                cols: 80,
+                client_key: client_static,
+                idle_ticks: 0,
+                exit_status: None,
+                exit_ticks: 0,
+            };
+            if let Some(old_sid) = existing
+                && let Some(mut old) = self.sessions.remove(&old_sid)
+            {
+                if let Some(shell) = &mut old.shell {
+                    shell.rebind_to_new_client();
+                }
+                new_sess.shell = old.shell.take();
+                new_sess.pty = old.pty.take();
+                new_sess.rows = old.rows;
+                new_sess.cols = old.cols;
+            }
+            self.sessions.insert(sid, new_sess);
             self.ever_active = true;
         } else {
             self.pending.insert(sid, hs);
@@ -182,7 +213,9 @@ impl ServerCore {
             let Some(sess) = self.sessions.get_mut(&sid) else {
                 return Ok(Vec::new());
             };
-            sess.session.open(src, buf)? // roaming: peer_addr now = src
+            let frames = sess.session.open(src, buf)?; // roaming: peer_addr now = src
+            sess.idle_ticks = 0; // authenticated activity resets the idle timer
+            frames
         };
         let mut reply_frames: Vec<Frame> = Vec::new();
         for frame in frames {
@@ -210,6 +243,7 @@ impl ServerCore {
                         self.handle_control(sid, msg);
                     }
                 }
+                Frame::Ping { stamp } => reply_frames.push(Frame::Pong { stamp }),
                 _ => {}
             }
         }
@@ -274,6 +308,17 @@ impl ServerCore {
             let Some(sess) = self.sessions.get_mut(&sid) else {
                 continue;
             };
+            // Reap a session whose client has been silent past the grace window
+            // (detached and never reattached). Killing the PTY here lets the
+            // child exit; the exit path below then retires the session.
+            sess.idle_ticks = sess.idle_ticks.saturating_add(1);
+            if sess.idle_ticks >= IDLE_REAP_TICKS && sess.exit_status.is_none() {
+                if let Some(pty) = &mut sess.pty {
+                    let _ = pty.kill();
+                }
+                finished.push(sid);
+                continue;
+            }
             // Drain available PTY output.
             if let Some(pty) = &mut sess.pty {
                 let mut buf = [0u8; 8192];

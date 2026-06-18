@@ -31,6 +31,9 @@ pub struct ClientCore {
     pending_control: Vec<Frame>,
     open_shell_pending: bool,
     open_shell_ticks: u32,
+    /// A state-diff arrived since we last sent frames; re-ack so the server is
+    /// not left retransmitting if a prior ack was lost.
+    need_ack: bool,
     known_hosts_dirty: bool,
 }
 
@@ -67,6 +70,7 @@ impl ClientCore {
             pending_control: Vec::new(),
             open_shell_pending: false,
             open_shell_ticks: 0,
+            need_ack: false,
             known_hosts_dirty: false,
         };
         Ok((core, first))
@@ -170,6 +174,9 @@ impl ClientCore {
             match frame {
                 Frame::StateDiff { seq, base, data } => {
                     self.shell.apply_state_diff(seq, base, &data);
+                    // Re-ack on every diff (even stale ones) so a lost ack can't
+                    // wedge the server into retransmitting an already-applied state.
+                    self.need_ack = true;
                 }
                 Frame::Ack { seq } => self.shell.on_input_ack(seq),
                 Frame::Control { data } => {
@@ -177,7 +184,7 @@ impl ClientCore {
                         self.exited = Some(status);
                     }
                 }
-                _ => {}
+                _ => {} // Pong and others: liveness only
             }
         }
         // Once the server is sending screen state, the shell is open.
@@ -190,6 +197,23 @@ impl ClientCore {
     /// Datagrams to send now: pending control + input + state ack.
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
         self.outgoing().unwrap_or_default()
+    }
+
+    /// Whether there is anything worth sending right now (lets an event-driven
+    /// driver avoid waking up just to send a redundant ack).
+    pub fn has_outgoing(&self) -> bool {
+        self.session.is_some()
+            && (self.open_shell_pending
+                || !self.pending_control.is_empty()
+                || self.need_ack
+                || self.shell.has_pending_input())
+    }
+
+    /// A keepalive datagram (Ping) to refresh NAT mappings and prove liveness
+    /// while idle. `None` before the session is established.
+    pub fn keepalive(&mut self) -> Option<Vec<u8>> {
+        let session = self.session.as_mut()?;
+        session.seal(&[Frame::Ping { stamp: 0 }]).ok()
     }
 
     fn outgoing(&mut self) -> Result<Vec<Vec<u8>>, RuntimeError> {
@@ -213,6 +237,7 @@ impl ClientCore {
         }
         frames.append(&mut self.pending_control);
         frames.extend(self.shell.poll_frames());
+        self.need_ack = false;
         if frames.is_empty() {
             return Ok(Vec::new());
         }
@@ -293,23 +318,52 @@ impl Client {
         Ok(())
     }
 
-    /// One I/O iteration: receive (if any) and flush outgoing frames.
-    pub fn pump_once(&mut self) -> Result<(), RuntimeError> {
+    /// Borrow the UDP socket (e.g. to register it with a poller).
+    pub fn socket(&self) -> &UdpSocket {
+        &self.socket
+    }
+
+    /// Drain a single ready datagram (non-blocking) and send any replies.
+    /// Returns true if a datagram was processed.
+    pub fn recv_and_handle(&mut self) -> Result<bool, RuntimeError> {
         let mut buf = [0u8; 65536];
         match self.socket.recv_from(&mut buf) {
             Ok((n, _src)) => {
                 for pkt in self.core.handle_packet(&buf[..n])? {
                     self.socket.send_to(&pkt, self.server_addr)?;
                 }
+                Ok(true)
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(e.into()),
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
         }
+    }
+
+    /// Flush any pending outgoing frames (input, acks, control).
+    pub fn flush(&mut self) -> Result<(), RuntimeError> {
         for pkt in self.core.tick() {
             self.socket.send_to(&pkt, self.server_addr)?;
         }
         Ok(())
+    }
+
+    /// Send a keepalive datagram (refreshes NAT, proves liveness while idle).
+    pub fn send_keepalive(&mut self) -> Result<(), RuntimeError> {
+        if let Some(pkt) = self.core.keepalive() {
+            self.socket.send_to(&pkt, self.server_addr)?;
+        }
+        Ok(())
+    }
+
+    /// One I/O iteration: receive (if any) and flush outgoing frames. Used by
+    /// the handshake drive loop and tests.
+    pub fn pump_once(&mut self) -> Result<(), RuntimeError> {
+        self.recv_and_handle()?;
+        self.flush()
     }
 }

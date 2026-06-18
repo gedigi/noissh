@@ -23,6 +23,7 @@ pub struct ServerShell {
     history: BTreeMap<u64, Grid>,
     last_sent: Grid,
     input_rx: InputReceiver,
+    force_full: bool,
 }
 
 impl ServerShell {
@@ -37,7 +38,23 @@ impl ServerShell {
             history,
             last_sent: blank,
             input_rx: InputReceiver::new(),
+            force_full: false,
         }
+    }
+
+    /// Re-bind this (already-running) shell to a freshly-connected client after
+    /// a reattach: forget the previous client's ack/input progress and arrange
+    /// to send the current screen as a full snapshot. The live terminal state
+    /// (the running shell's screen) is preserved.
+    pub fn rebind_to_new_client(&mut self) {
+        let (rows, cols) = (self.term.screen().rows, self.term.screen().cols);
+        let blank = Grid::new(rows, cols);
+        self.acked_seq = 0;
+        self.history.clear();
+        self.history.insert(0, blank.clone());
+        self.last_sent = blank; // forces poll_diff to re-emit the current screen
+        self.input_rx = InputReceiver::new(); // the new client's input restarts at 0
+        self.force_full = true;
     }
 
     /// Feed shell/pty output into the authoritative emulator.
@@ -86,11 +103,21 @@ impl ServerShell {
         if self.seq == self.acked_seq {
             return None; // client is fully caught up
         }
-        let acked_grid = self.history.get(&self.acked_seq);
-        let data = encode_diff(acked_grid, &self.last_sent);
+        // After a reattach, send one full snapshot so a fresh client (whose
+        // grid dimensions and state differ from the old client's) can apply it
+        // unconditionally; thereafter fall back to acked→current deltas.
+        let (data, base) = if self.force_full {
+            self.force_full = false;
+            (encode_diff(None, &self.last_sent), 0)
+        } else {
+            (
+                encode_diff(self.history.get(&self.acked_seq), &self.last_sent),
+                self.acked_seq,
+            )
+        };
         Some(Frame::StateDiff {
             seq: self.seq,
-            base: self.acked_seq,
+            base,
             data,
         })
     }
@@ -124,6 +151,11 @@ impl ClientShell {
     pub fn type_input(&mut self, bytes: &[u8]) {
         self.input_tx.push(bytes);
         self.predictor.predict_input(bytes);
+    }
+
+    /// Whether there is unacknowledged input still to (re)transmit.
+    pub fn has_pending_input(&self) -> bool {
+        self.input_tx.pending().is_some()
     }
 
     /// Frames to send now: pending input (if any) plus the screen-state ack.

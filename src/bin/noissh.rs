@@ -9,7 +9,6 @@
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
-use std::os::fd::AsFd;
 use std::process::exit;
 use std::time::Duration;
 
@@ -130,7 +129,16 @@ fn pin_key(known: &mut KnownHosts, label: &str, pubkey: &[u8]) -> Result<(), Run
     }
 }
 
+/// How often to send a keepalive while otherwise idle.
+const KEEPALIVE: Duration = Duration::from_secs(3);
+/// Poll wakeup while there is unacked data to (re)transmit.
+const ACTIVE_POLL: Duration = Duration::from_millis(40);
+
 fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+    use std::time::Instant;
+
     let _raw = RawMode::enable()?;
     let mut renderer = Renderer::new();
 
@@ -143,24 +151,56 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
 
     let mut last_size = terminal_size();
     let mut inbuf = [0u8; 4096];
+    let mut next_keepalive = Instant::now() + KEEPALIVE;
 
     loop {
-        client.pump_once()?;
-
-        // Forward local keystrokes.
-        match stdin.lock().read(&mut inbuf) {
-            Ok(0) => {}
-            Ok(n) => client.core_mut().type_input(&inbuf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => {}
+        // Wait for the socket or stdin to be ready, or a timer to fire. This is
+        // event-driven: idle sessions wake only to keepalive, not in a busy loop.
+        let timeout = if client.core().has_outgoing() {
+            ACTIVE_POLL
+        } else {
+            next_keepalive
+                .saturating_duration_since(Instant::now())
+                .min(KEEPALIVE)
+        };
+        {
+            let sock = client.socket().as_fd();
+            let inp = stdin.as_fd();
+            let mut fds = [
+                PollFd::new(sock, PollFlags::POLLIN),
+                PollFd::new(inp, PollFlags::POLLIN),
+            ];
+            let ms: u16 = timeout.as_millis().min(u16::MAX as u128) as u16;
+            let _ = poll(&mut fds, PollTimeout::from(ms));
         }
 
-        // Detect local resize.
+        // Network: drain everything ready.
+        while client.recv_and_handle()? {}
+
+        // Local keystrokes.
+        loop {
+            match stdin.lock().read(&mut inbuf) {
+                Ok(0) => break,
+                Ok(n) => client.core_mut().type_input(&inbuf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+
+        // Local resize.
         let size = terminal_size();
         if size != last_size {
             last_size = size;
             client.core_mut().resize(size.0, size.1);
             renderer.invalidate();
+        }
+
+        client.flush()?;
+
+        // Keepalive.
+        if Instant::now() >= next_keepalive {
+            client.send_keepalive()?;
+            next_keepalive = Instant::now() + KEEPALIVE;
         }
 
         // Render the predicted overlay.
@@ -173,8 +213,6 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
             drop(_raw);
             exit(status);
         }
-
-        std::thread::sleep(Duration::from_millis(8));
     }
 }
 

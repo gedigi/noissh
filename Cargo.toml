@@ -21,7 +21,7 @@ authors = ["Gerardo <gedigi@live.com>"]
 # Lean dependency surface: only the features actually used are enabled.
 snow = "0.10" # default-resolver provides ChaChaPoly + BLAKE2s + 25519 (pure Rust)
 vte = { version = "0.15", default-features = false } # core Parser/Perform only (no `ansi` layer)
-nix = { version = "0.31", default-features = false, features = ["term", "fs", "user"] }
+nix = { version = "0.31", default-features = false, features = ["term", "fs", "user", "poll"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 getrandom = "0.4"
 thiserror = "2"
