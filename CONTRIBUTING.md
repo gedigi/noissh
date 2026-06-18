@@ -3,10 +3,19 @@
 Thanks for your interest! noissh is a Rust workspace; contributions of bug fixes,
 tests, and features are welcome.
 
+## Minimum supported Rust version (MSRV)
+
+noissh uses **edition 2024**, which requires **Rust 1.85 or newer** — that is the
+project's MSRV. CI builds and tests on the current stable toolchain (1.96 at the
+time of writing) on both Linux and macOS. There is intentionally no separate
+"pinned MSRV" CI job: 1.85 is the floor implied by the edition, and we do not
+guarantee it stays green against future dependency bumps. If you need a hard MSRV
+guarantee, build with `rustup toolchain install 1.85` locally.
+
 ## Development setup
 
 ```sh
-rustup toolchain install stable      # edition 2024; tested on 1.96+
+rustup toolchain install stable      # edition 2024 needs Rust >= 1.85; tested on 1.96+
 git clone https://github.com/gedigi/noissh
 cd noissh
 cargo build
@@ -22,6 +31,21 @@ cargo fmt --all                                   # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 cargo test --workspace                            # all tests green
 ```
+
+### Supply-chain checks
+
+CI also runs supply-chain hardening jobs (see `.github/workflows/ci.yml`). To
+reproduce them locally:
+
+```sh
+cargo install cargo-deny cargo-audit --locked   # one-time
+cargo deny check                                 # advisories, licenses, bans, sources
+cargo audit                                      # RustSec vulnerability scan
+```
+
+License policy and accepted advisories live in [`deny.toml`](deny.toml). If you
+add a dependency under a new license, add that SPDX id to the `licenses.allow`
+list there (and explain why in the same commit).
 
 ## Project conventions
 

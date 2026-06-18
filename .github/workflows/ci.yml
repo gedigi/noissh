@@ -5,13 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: build, test, lint
-    runs-on: ubuntu-latest
+    name: build, test, lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -19,9 +26,44 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
       - uses: Swatinem/rust-cache@v2
+      # fmt is platform-independent, so only run it once (on Linux) to save time.
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
+  cargo-audit:
+    name: cargo-audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # cargo audit fails on vulnerabilities. The --ignore IDs below are advisories
+      # we have triaged and accepted (kept in sync with deny.toml's advisories.ignore):
+      #   RUSTSEC-2025-0069  daemonize is unmaintained; no safe upgrade exists.
+      #   RUSTSEC-2022-0015  false positive: matches our local `pty` crate by name,
+      #                      not the unrelated crates.io `pty` crate.
+      #   RUSTSEC-2018-0015  false positive: matches our local `term` crate by name,
+      #                      not the unrelated crates.io `term` crate.
+      - name: cargo audit
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2025-0069
+          --ignore RUSTSEC-2022-0015
+          --ignore RUSTSEC-2018-0015

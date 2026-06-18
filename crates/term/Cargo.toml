@@ -7,6 +7,7 @@ edition.workspace = true
 vte.workspace = true
 wire.workspace = true
 thiserror.workspace = true
+unicode-width = { version = "0.2", default-features = false }
 
 [lints]
 workspace = true

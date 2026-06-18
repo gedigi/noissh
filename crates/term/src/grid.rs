@@ -1,5 +1,6 @@
 //! Authoritative screen grid + terminal emulator driven by `vte`.
 
+use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
 use crate::cell::{Cell, Color, flags};
@@ -81,26 +82,79 @@ impl Grid {
         let start = self.idx(row, 0);
         let s: String = self.cells[start..start + self.cols]
             .iter()
+            // Skip wide-char continuation spacers ('\0'); the leading cell
+            // already carries the full glyph.
+            .filter(|c| c.ch != '\0')
             .map(|c| c.ch)
             .collect();
         s.trim_end().to_string()
     }
 
     fn put_char(&mut self, c: char) {
+        // Display width per Unicode Annex #11. `None` (control / unassigned)
+        // is treated as width 0.
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+
+        // Width-0 chars (combining marks, ZWJ, etc.): `Cell.ch` is a single
+        // `char`, so true grapheme clustering would require a Cell redesign.
+        // We deliberately keep it simple and SKIP width-0 chars entirely — no
+        // cursor advance and no write — so they never clobber the current cell
+        // or desync the grid from the cursor. The trade-off is that combining
+        // marks are dropped rather than composed onto the base glyph.
+        if w == 0 {
+            return;
+        }
+
+        // Resolve a pending autowrap from the previous glyph before placing.
         if self.wrap_pending && self.autowrap {
             self.cursor_col = 0;
             self.line_feed();
             self.wrap_pending = false;
         }
+
+        // A width-2 glyph cannot straddle the right edge: if it would not fit
+        // in the remaining columns, wrap to the next line first (DECAWM). When
+        // autowrap is off, clamp it into the last two columns instead.
+        if w == 2 && self.cursor_col + 1 >= self.cols {
+            if self.autowrap {
+                self.cursor_col = 0;
+                self.line_feed();
+            } else {
+                self.cursor_col = self.cols.saturating_sub(2);
+            }
+            self.wrap_pending = false;
+        }
+
         let (r, col) = (self.cursor_row, self.cursor_col);
         let i = self.idx(r, col);
         let mut cell = self.pen;
         cell.ch = c;
         self.cells[i] = cell;
-        if self.cursor_col + 1 < self.cols {
-            self.cursor_col += 1;
-        } else if self.autowrap {
-            self.wrap_pending = true;
+
+        if w == 2 {
+            // Mark the trailing column as a continuation/spacer cell so that
+            // rendering and the latest-wins diff stay aligned. A spacer is a
+            // normal `Cell` whose `ch` is '\0'.
+            let spacer_i = self.idx(r, col + 1);
+            let mut spacer = self.pen;
+            spacer.ch = '\0';
+            self.cells[spacer_i] = spacer;
+
+            // Advance by 2. The wide glyph occupies [col, col+1].
+            if col + 2 < self.cols {
+                self.cursor_col = col + 2;
+            } else if self.autowrap {
+                self.wrap_pending = true;
+            } else {
+                self.cursor_col = self.cols - 1;
+            }
+        } else {
+            // Width 1: advance by one.
+            if self.cursor_col + 1 < self.cols {
+                self.cursor_col += 1;
+            } else if self.autowrap {
+                self.wrap_pending = true;
+            }
         }
     }
 
@@ -732,6 +786,57 @@ mod tests {
         assert_eq!(t.screen().row_text(0), "hello");
         assert_eq!(t.screen().rows, 5);
         assert_eq!(t.screen().cols, 20);
+    }
+
+    #[test]
+    fn wide_cjk_chars_occupy_two_cells_with_spacer() {
+        // "世界": each is an East-Asian wide (width-2) char.
+        let t = run("世界".as_bytes());
+        assert_eq!(t.screen().cell(0, 0).ch, '世');
+        assert_eq!(t.screen().cell(0, 1).ch, '\0'); // spacer
+        assert_eq!(t.screen().cell(0, 2).ch, '界');
+        assert_eq!(t.screen().cell(0, 3).ch, '\0'); // spacer
+        assert_eq!(t.screen().cursor_col, 4);
+        // row_text hides the spacers.
+        assert_eq!(t.screen().row_text(0), "世界");
+    }
+
+    #[test]
+    fn wide_emoji_occupies_two_cells() {
+        // U+1F600 GRINNING FACE is width 2.
+        let t = run("😀x".as_bytes());
+        assert_eq!(t.screen().cell(0, 0).ch, '😀');
+        assert_eq!(t.screen().cell(0, 1).ch, '\0');
+        assert_eq!(t.screen().cell(0, 2).ch, 'x');
+        assert_eq!(t.screen().cursor_col, 3);
+    }
+
+    #[test]
+    fn combining_mark_does_not_desync_grid() {
+        // "e\u{0301}" is 'e' followed by a width-0 combining acute accent.
+        // We skip width-0 chars: the combining mark is dropped, the cursor
+        // does not advance past 'e', and the next char lands adjacent.
+        let t = run("e\u{0301}x".as_bytes());
+        assert_eq!(t.screen().cell(0, 0).ch, 'e');
+        assert_eq!(t.screen().cell(0, 1).ch, 'x');
+        assert_eq!(t.screen().cursor_col, 2);
+        assert_eq!(t.screen().row_text(0), "ex");
+    }
+
+    #[test]
+    fn wide_char_wraps_at_last_column() {
+        // 4 columns: fill cols 0..=2 with ASCII, leaving only col 3 free.
+        // A wide char cannot fit in the single remaining column, so it wraps.
+        let mut t = Terminal::new(3, 4);
+        t.advance(b"abc"); // cursor at col 3
+        t.advance("世".as_bytes());
+        // 'abc' stays on row 0; the wide char wraps to row 1.
+        assert_eq!(t.screen().cell(0, 0).ch, 'a');
+        assert_eq!(t.screen().cell(0, 2).ch, 'c');
+        assert_eq!(t.screen().cell(1, 0).ch, '世');
+        assert_eq!(t.screen().cell(1, 1).ch, '\0');
+        assert_eq!(t.screen().cursor_row, 1);
+        assert_eq!(t.screen().cursor_col, 2);
     }
 
     #[test]
