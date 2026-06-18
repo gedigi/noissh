@@ -33,6 +33,13 @@ const PKT_TRANSPORT: u8 = 1;
 /// to keep datagrams within a typical path MTU (avoiding IP fragmentation).
 pub const MAX_DATAGRAM_PLAINTEXT: usize = 1200;
 
+/// Minimum size of a client's INITIAL handshake datagram. The client pads its
+/// first message up to this; the server refuses to create state or reply to a
+/// smaller new-session init. This is an anti-amplification / anti-spoofing
+/// measure: the larger handshake reply can never be more than ~this many bytes,
+/// so a spoofed small init can't be used to reflect amplified traffic.
+pub const MIN_HANDSHAKE_INIT: usize = 1200;
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("packet too short")]

@@ -44,7 +44,12 @@ impl Handshaker {
         session_id: SessionId,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
         let mut hs = Handshake::new(Role::Initiator, local_private)?;
-        let msg1 = hs.write_message(&[])?;
+        // Pad the initial datagram to the anti-amplification floor by carrying a
+        // zero payload in the first message. The padding rides as the message's
+        // (ignored) Noise payload, so the responder processes it as part of a
+        // well-formed message — over-padding slightly to stay safely above the
+        // floor regardless of framing overhead.
+        let msg1 = hs.write_message(&vec![0u8; transport::MIN_HANDSHAKE_INIT])?;
         let pkt = build_handshake_packet(&session_id, &msg1);
         Ok((
             Handshaker {

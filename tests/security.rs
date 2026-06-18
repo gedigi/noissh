@@ -170,3 +170,47 @@ fn forged_transport_packet_is_rejected() {
         assert!(out.is_empty());
     }
 }
+
+#[test]
+fn undersized_handshake_init_gets_no_reply() {
+    // Anti-amplification: a small, unpadded new-session init must not draw the
+    // (larger) handshake reply, and must not create state. A properly padded
+    // init from a real client does get a reply.
+    use transport::{build_handshake_packet, random_session_id};
+
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "ok");
+    let mut server = ServerCore::new(server_kp, authorized, Box::new(LocalLogin), None);
+    let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+    // A tiny init: header + a handful of bytes (well under the floor).
+    let sid = random_session_id();
+    let small = build_handshake_packet(&sid, &[1, 2, 3, 4, 5]);
+    assert!(
+        server.handle_packet(addr, &small).is_empty(),
+        "server replied to an undersized init (amplification vector)"
+    );
+    assert_eq!(server.session_count(), 0);
+
+    // A real, padded client init does get a reply.
+    let (_client, first) = ClientCore::new(
+        &client_kp,
+        KnownHosts::new(),
+        "h:1",
+        addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+    )
+    .unwrap();
+    assert!(
+        first.len() >= transport::MIN_HANDSHAKE_INIT,
+        "client init must be padded to the floor"
+    );
+    assert!(
+        !server.handle_packet(addr, &first).is_empty(),
+        "server should answer a properly padded init"
+    );
+}

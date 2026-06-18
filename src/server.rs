@@ -185,6 +185,13 @@ impl ServerCore {
         let hs = match self.pending.remove(&sid) {
             Some(hs) => hs,
             None => {
+                // Anti-amplification: a brand-new init must be padded to the
+                // floor. Refuse smaller ones so a spoofed small datagram can't
+                // reflect the larger handshake reply (and can't cheaply create
+                // state). `body` is the datagram minus the 9-byte packet header.
+                if body.len() + 9 < transport::MIN_HANDSHAKE_INIT {
+                    return Ok(Vec::new());
+                }
                 // New handshake: refuse if we're already tracking too many, to
                 // bound memory against a session-id flood.
                 if self.pending.len() >= MAX_PENDING_HANDSHAKES {
