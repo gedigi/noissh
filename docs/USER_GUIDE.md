@@ -66,6 +66,17 @@ What happens:
 3. noissh reads the port + the server's ephemeral public key (delivered over the
    authenticated SSH channel), pins it, and connects over Noise/UDP.
 
+If the remote does not have `noisshd` yet, the first connect installs it for you
+automatically: noissh runs the published installer over the same SSH session,
+which detects the remote OS/arch, downloads the matching prebuilt release binary,
+verifies its SHA-256 checksum, and installs it into `~/.local/bin`. Installer
+progress streams to your terminal, then the handshake is retried using that path
+and the connection proceeds. This applies only to the default server command; it
+is skipped when `--server-cmd` is set to something custom. Pass `--no-install` to
+opt out, in which case a missing `noisshd` simply fails as before. (The install
+step needs either `curl` or `wget` on the remote; if neither is present it fails
+with a clear message.)
+
 `--server-cmd` sets the remote command if `noisshd` is not on the default `PATH`
 (e.g. `--server-cmd /opt/noissh/bin/noisshd`). Everything after `--` is passed
 straight to `ssh` (e.g. `-- -p 2222 -i ~/.ssh/id_ed25519`).
@@ -245,10 +256,11 @@ is `0600`, so other local users on the server cannot reach your forwarded agent.
 ### `noissh`
 
 ```
-noissh [--ssh] [--port N] [--server-cmd CMD] [-L SPEC] [-R SPEC] [-A] [user@]host [-- <ssh args>]
+noissh [--ssh] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-A] [user@]host [-- <ssh args>]
   --ssh           bootstrap the server over SSH
   --port N        UDP port for direct connection (default 51820)
   --server-cmd C  remote server command for --ssh (default "noisshd")
+  --no-install    do not auto-install noisshd on the remote if it is missing
   -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
   -R RPORT:HOST:PORT   remote forward (repeatable); implies forward-only
   --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
@@ -296,8 +308,10 @@ key line `noissh-x25519 <base64>` to stdout.
   `~/.config/noissh/known_hosts`; otherwise treat it as a potential
   man-in-the-middle and investigate.
 - **`--ssh` fails with "no connect line".** The remote `noisshd` could not be
-  launched. Check it is installed and on `PATH` on the server, or pass
-  `--server-cmd /full/path/to/noisshd`.
+  launched. Normally noissh auto-installs it on first connect; if you passed
+  `--no-install`, or the install step could not run (e.g. the remote has neither
+  `curl` nor `wget`), install `noisshd` on the server or pass
+  `--server-cmd /full/path/to/noisshd` to point at an existing binary.
 - **The session freezes after changing networks.** It should recover
   automatically within a second; if not, check that the new network allows
   outbound UDP to the server.

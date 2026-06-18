@@ -37,6 +37,8 @@ struct Args {
     local_forwards: Vec<(u16, String)>,
     /// Remote port forwards: (remote_port, "host:port").
     remote_forwards: Vec<(u16, String)>,
+    /// Dynamic (SOCKS) forwards: (bind_addr, port).
+    dynamic_forwards: Vec<(String, u16)>,
     /// A one-shot file transfer: (request, local path). Mutually exclusive with
     /// an interactive shell and port forwarding.
     transfer: Option<(proto::XferRequest, String)>,
@@ -56,6 +58,16 @@ fn parse_forward(s: &str) -> Option<(u16, String)> {
     Some((port, target.to_string()))
 }
 
+/// Parse a `-D` spec `[BIND:]PORT` into (bind_addr, port). Defaults to loopback.
+fn parse_dynamic(s: &str) -> Option<(String, u16)> {
+    match s.rsplit_once(':') {
+        Some((bind, port)) if !bind.is_empty() => Some((bind.to_string(), port.parse().ok()?)),
+        // ":1080" (empty bind) or a bare port → bind loopback.
+        Some((_, port)) => Some(("127.0.0.1".to_string(), port.parse().ok()?)),
+        None => Some(("127.0.0.1".to_string(), s.parse().ok()?)),
+    }
+}
+
 fn parse_args() -> Args {
     let mut a = Args {
         ssh: false,
@@ -65,6 +77,7 @@ fn parse_args() -> Args {
         ssh_args: Vec::new(),
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
+        dynamic_forwards: Vec::new(),
         transfer: None,
         forward_agent: false,
         no_install: false,
@@ -97,6 +110,13 @@ fn parse_args() -> Args {
                     a.remote_forwards.push(spec);
                 } else {
                     eprintln!("noissh: ignoring malformed -R spec (want RPORT:HOST:PORT)");
+                }
+            }
+            "-D" => {
+                if let Some(spec) = it.next().as_deref().and_then(parse_dynamic) {
+                    a.dynamic_forwards.push(spec);
+                } else {
+                    eprintln!("noissh: ignoring malformed -D spec (want [BIND:]PORT)");
                 }
             }
             "--put" => match it.next().as_deref().and_then(|s| s.split_once(':')) {
@@ -170,9 +190,11 @@ fn run() -> Result<(), RuntimeError> {
         (addr, format!("{host}:{}", args.port))
     };
 
-    // No interactive shell for a one-shot transfer or when `-L`/`-R` is given
-    // (the latter behaves like `ssh -N`).
-    let forward_only = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
+    // No interactive shell for a one-shot transfer or when `-L`/`-R`/`-D` is
+    // given (the latter behaves like `ssh -N`).
+    let forward_only = !args.local_forwards.is_empty()
+        || !args.remote_forwards.is_empty()
+        || !args.dynamic_forwards.is_empty();
     let want_shell = !forward_only && args.transfer.is_none();
     // Agent forwarding only applies to an interactive shell; it needs a local
     // agent ($SSH_AUTH_SOCK) to bridge to.
@@ -209,7 +231,11 @@ fn run() -> Result<(), RuntimeError> {
         eprintln!("noissh: transfer complete");
         Ok(())
     } else if forward_only {
-        client.run_forwards(&args.local_forwards, &args.remote_forwards)
+        client.run_forwards(
+            &args.local_forwards,
+            &args.remote_forwards,
+            &args.dynamic_forwards,
+        )
     } else {
         interactive_loop(&mut client)
     }

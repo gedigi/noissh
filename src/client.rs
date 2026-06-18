@@ -560,8 +560,10 @@ impl Client {
         &mut self,
         local: &[(u16, String)],
         remote: &[(u16, String)],
+        dynamic: &[(String, u16)],
     ) -> Result<(), RuntimeError> {
         use crate::forward::ForwardConn;
+        use crate::socks::{Progress, SocksConn};
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
         use std::collections::HashMap;
         use std::net::TcpListener;
@@ -583,6 +585,17 @@ impl Client {
             self.core.request_remote_forward(*port, target);
             eprintln!("-R {}:{port} -> {target}", self.server_addr.ip());
         }
+        // SOCKS (`-D`) listeners: each accepts SOCKS clients and tunnels their
+        // CONNECT targets dynamically.
+        let mut socks_listeners = Vec::new();
+        for (bind, port) in dynamic {
+            let l = TcpListener::bind((bind.as_str(), *port))?;
+            l.set_nonblocking(true)?;
+            eprintln!("-D {bind}:{port} (SOCKS) -> via {}", self.server_addr);
+            socks_listeners.push(l);
+        }
+        // SOCKS connections still negotiating (no forward stream opened yet).
+        let mut pending_socks: Vec<SocksConn> = Vec::new();
 
         let mut conns: HashMap<u64, ForwardConn> = HashMap::new();
         let keepalive = Duration::from_secs(3);
@@ -594,7 +607,10 @@ impl Client {
         const SEND_CAP: u64 = 512 * 1024;
 
         loop {
-            let timeout = if self.core.has_outgoing() || conns.values().any(|c| c.wants_write()) {
+            let timeout = if self.core.has_outgoing()
+                || conns.values().any(|c| c.wants_write())
+                || !pending_socks.is_empty()
+            {
                 Duration::from_millis(20)
             } else {
                 next_keepalive
@@ -607,9 +623,16 @@ impl Client {
                 for (l, _) in &listeners {
                     fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
                 }
+                for l in &socks_listeners {
+                    fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
+                }
                 // Wait on each forwarded socket too (no busy-spin while connected).
                 let conn_fds: Vec<_> = conns.values().map(|c| c.as_fd()).collect();
                 for fd in &conn_fds {
+                    fds.push(PollFd::new(*fd, PollFlags::POLLIN));
+                }
+                let socks_fds: Vec<_> = pending_socks.iter().map(|c| c.as_fd()).collect();
+                for fd in &socks_fds {
                     fds.push(PollFd::new(*fd, PollFlags::POLLIN));
                 }
                 let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
@@ -631,6 +654,48 @@ impl Client {
                     }
                 }
             }
+
+            // Accept new SOCKS (`-D`) connections; negotiation happens below.
+            for l in &socks_listeners {
+                loop {
+                    match l.accept() {
+                        Ok((s, _)) => {
+                            if let Ok(sc) = SocksConn::new(s) {
+                                pending_socks.push(sc);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            // Drive SOCKS negotiations; on CONNECT, open a forward and bridge.
+            let mut still_pending = Vec::new();
+            for sc in pending_socks.drain(..) {
+                match sc.negotiate() {
+                    (
+                        Progress::Connected {
+                            target,
+                            socket,
+                            leftover,
+                        },
+                        _,
+                    ) => {
+                        if let Ok(conn) = ForwardConn::new(socket) {
+                            let id = self.core.open_forward(&target);
+                            if !leftover.is_empty() {
+                                self.core.stream_write(id, &leftover);
+                            }
+                            conns.insert(id, conn);
+                        }
+                    }
+                    (Progress::Pending, Some(sc)) => still_pending.push(sc),
+                    // Failed, or pending-without-handback: drop the connection.
+                    _ => {}
+                }
+            }
+            pending_socks = still_pending;
 
             // Inbound session packets.
             while self.recv_and_handle()? {}

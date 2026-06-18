@@ -8,6 +8,7 @@ noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .IR N ]
 .RB [ \-\-server\-cmd
 .IR CMD ]
+.RB [ \-\-no\-install ]
 .RI [ user @] host
 .RB [ \-\-
 .IR "ssh args" ...]
@@ -30,7 +31,28 @@ Bootstrap the server over SSH: run
 to obtain the UDP port and the server's ephemeral public key, then connect over
 Noise/UDP. No pre\-shared
 .I authorized_keys
-entry is required.
+entry is required. If
+.B noisshd
+is not yet installed on the remote, the first connect installs it automatically:
+the published installer is run over the same SSH session, detecting the remote
+OS/arch, downloading the matching prebuilt release binary, verifying its SHA\-256
+checksum, and installing it into
+.IR ~/.local/bin ,
+after which the handshake is retried. This applies only to the default server
+command and is skipped when
+.B \-\-server\-cmd
+is set. The install step requires
+.BR curl (1)
+or
+.BR wget (1)
+on the remote.
+.TP
+.B \-\-no\-install
+Disable the automatic remote install performed by
+.BR \-\-ssh .
+A missing
+.B noisshd
+then fails the connection instead of being installed.
 .TP
 .BI \-\-port " N"
 UDP port for a direct connection to a standalone server (default 51820).
