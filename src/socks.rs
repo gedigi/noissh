@@ -10,6 +10,10 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsFd, BorrowedFd};
 
+/// Upper bound on buffered negotiation bytes before a connection is rejected as
+/// malformed (the longest valid SOCKS4a request is ~520 bytes).
+const MAX_NEGOTIATION_BYTES: usize = 600;
+
 /// Negotiation state of one accepted SOCKS connection.
 enum Phase {
     /// SOCKS5: awaiting the method-selection greeting.
@@ -86,6 +90,13 @@ impl SocksConn {
                 Err(_) => return (Progress::Failed, None),
             }
         }
+        // Bound the negotiation buffer: the largest valid request (SOCKS4a with
+        // max userid + hostname) is well under 600 bytes, so anything larger is
+        // a malformed/stalling client. This also caps a peer that never sends a
+        // terminating NUL.
+        if self.inbuf.len() > MAX_NEGOTIATION_BYTES {
+            return (Progress::Failed, None);
+        }
         self.try_parse();
         self.flush_out();
         match self.phase {
@@ -135,6 +146,10 @@ impl SocksConn {
                         5 => {
                             // [ver, nmethods, methods...]
                             let Some(&n) = self.inbuf.get(1) else { return };
+                            if n == 0 {
+                                self.phase = Phase::Failed; // no methods offered
+                                return;
+                            }
                             let total = 2 + n as usize;
                             if self.inbuf.len() < total {
                                 return;
@@ -252,6 +267,12 @@ impl SocksConn {
         let cmd = self.inbuf[1];
         let port = u16::from_be_bytes([self.inbuf[2], self.inbuf[3]]);
         let ip = [self.inbuf[4], self.inbuf[5], self.inbuf[6], self.inbuf[7]];
+        // The all-zero IP is not a valid destination (and isn't the 0.0.0.x
+        // SOCKS4a marker); reject rather than forward to 0.0.0.0.
+        if ip == [0, 0, 0, 0] {
+            self.fail_socks4();
+            return;
+        }
         // userid is NUL-terminated starting at offset 8.
         let Some(uid_nul) = self.inbuf[8..].iter().position(|&b| b == 0).map(|p| p + 8) else {
             return; // userid not fully received yet

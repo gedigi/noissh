@@ -19,6 +19,8 @@ This guide covers installing, connecting, configuring, and troubleshooting.
   - [Generating your key with noissh-keygen](#generating-your-key-with-noissh-keygen)
 - [Configuration & file layout](#configuration--file-layout)
   - [Config file](#config-file)
+- [Port forwarding](#port-forwarding)
+- [Remote command execution](#remote-command-execution)
 - [File transfer](#file-transfer)
 - [Agent forwarding](#agent-forwarding)
 - [Command reference](#command-reference)
@@ -207,6 +209,64 @@ Recognized keys:
 | `port` | number | default UDP port for direct connections |
 | `term` | string | `$TERM` value to advertise to the remote shell |
 
+## Port forwarding
+
+Local (`-L`) and remote (`-R`) port forwarding ride the same resilient session
+and work like SSH's equivalents. Adding any forward makes the session
+forward-only (no shell), like a `-N`-style session.
+
+```sh
+# Local: localhost:8080 (your machine) -> 10.0.0.5:80 (reachable from the server)
+noissh --ssh user@server -L 8080:10.0.0.5:80
+
+# Remote: server:9000 -> localhost:3000 (on your machine)
+noissh --ssh user@server -R 9000:localhost:3000
+```
+
+`-R` listeners bind to loopback on the server, so forwarded ports are not
+exposed to the network.
+
+### Dynamic (SOCKS) forwarding
+
+`-D [BIND:]PORT` runs a local SOCKS proxy whose connections tunnel dynamically
+to whatever host:port each client requests, resolved via the server:
+
+```sh
+# SOCKS proxy on localhost:1080
+noissh --ssh user@server -D 1080
+
+# bind a specific address
+noissh --ssh user@server -D 127.0.0.1:1080
+```
+
+Point a SOCKS-aware application at the proxy and its connections exit from the
+server. The proxy speaks SOCKS5 (no authentication) and SOCKS4/4a, CONNECT only.
+It binds loopback by default. Like `-L`/`-R`, `-D` makes the session
+forward-only (no shell), and all forwards may be combined.
+
+## Remote command execution
+
+`--exec "command"` runs a single command non-interactively on the server
+instead of opening a shell:
+
+```sh
+noissh --ssh user@server --exec "uname -a"
+```
+
+The command's stdout and stderr are streamed separately to yours, your stdin is
+forwarded until EOF, and noissh exits with the command's exit code. Output is
+byte-for-byte (no PTY/terminal mangling), so it is safe to redirect into a file
+or use in a pipeline:
+
+```sh
+noissh --ssh user@server --exec "tar czf - /etc" > etc.tar.gz
+```
+
+Like file transfer and agent forwarding, `--exec` is refused by a standalone
+daemon configured with a `--user` privilege drop (see
+[Security](SECURITY.md)); use the SSH-bootstrap model or run the daemon as the
+target user.
+
 ## File transfer
 
 You can copy a single file over the resilient session without opening a shell.
@@ -256,13 +316,15 @@ is `0600`, so other local users on the server cannot reach your forwarded agent.
 ### `noissh`
 
 ```
-noissh [--ssh] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-A] [user@]host [-- <ssh args>]
+noissh [--ssh] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--exec CMD] [-A] [user@]host [-- <ssh args>]
   --ssh           bootstrap the server over SSH
   --port N        UDP port for direct connection (default 51820)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   --no-install    do not auto-install noisshd on the remote if it is missing
   -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
   -R RPORT:HOST:PORT   remote forward (repeatable); implies forward-only
+  -D [BIND:]PORT       dynamic SOCKS forward (repeatable); implies forward-only
+  --exec CMD           run CMD on the server non-interactively, then exit
   --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
   --get REMOTE:LOCAL   download REMOTE to LOCAL, then exit (no shell)
   -A, --forward-agent  forward your local auth agent to the shell session
@@ -270,14 +332,18 @@ noissh [--ssh] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] 
 ```
 
 Port forwarding rides the same resilient session. `-R` listeners bind to
-loopback on the server (forwarded ports are not exposed to the network).
+loopback on the server (forwarded ports are not exposed to the network); `-D`
+binds loopback locally by default and speaks SOCKS5 (no auth) and SOCKS4/4a,
+CONNECT only.
 
 ### `noisshd`
 
 ```
-noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--command CMD ...]
+noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--command CMD ...] [-v]
 noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
   --listen ADDR        bind address (default 0.0.0.0:51820)
+  -v, --verbose        log session lifecycle (established/ended, active count)
+                       and fatal socket errors
   --key PATH           static key file (default <config>/noisshd_key)
   --authorized-keys P  authorized_keys file (default <config>/authorized_keys)
   --command CMD ...    run this command instead of the login shell

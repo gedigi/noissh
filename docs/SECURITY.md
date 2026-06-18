@@ -49,7 +49,10 @@ noissh mirrors SSH's trust model with Noise static keys:
 - **Denial of service.** An attacker who can flood the UDP port can degrade
   service. There is no proof-of-work or cookie exchange before the handshake;
   each unknown session-id handshake allocates a small amount of state. This is a
-  known area for hardening.
+  known area for hardening. (noissh *is* hardened against being used as a
+  reflection/amplification vector: the client pads its initial handshake packet
+  and the server refuses an undersized new-session init, so a spoofed-source
+  request can never elicit a response larger than what was sent.)
 - **Traffic analysis.** Packet sizes and timing are not padded; an observer can
   infer activity (typing, screen updates).
 - **Compromised endpoints.** noissh secures the link, not the machines. A

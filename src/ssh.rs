@@ -74,7 +74,12 @@ fn looks_like_missing_command(output: &std::process::Output) -> bool {
     }
     let mut s = String::from_utf8_lossy(&output.stderr).to_lowercase();
     s.push_str(&String::from_utf8_lossy(&output.stdout).to_lowercase());
-    s.contains("command not found") || s.contains("not found") || s.contains("no such file")
+    // Match only the specific shell phrasings for a missing command, so a
+    // working-but-erroring noisshd (whose output merely contains "not found")
+    // doesn't trigger a spurious reinstall over it.
+    s.contains("command not found")
+        || s.contains(": not found") // POSIX sh: "noisshd: not found"
+        || s.contains("no such file or directory")
 }
 
 /// Whether `remote_server_cmd` is the default (unconfigured) `noisshd` — we only
@@ -92,6 +97,9 @@ fn attempt(
 ) -> Result<Attempt, RuntimeError> {
     let mut cmd = Command::new(ssh_prog());
     cmd.args(extra_ssh_args);
+    // `--` terminates ssh option parsing so a `target` starting with `-` can't
+    // be smuggled in as an ssh flag (argument injection).
+    cmd.arg("--");
     cmd.arg(target);
     for part in remote_server_cmd {
         cmd.arg(part);
@@ -130,18 +138,25 @@ fn attempt(
 /// it by an absolute path regardless of the non-interactive `PATH`. Installer
 /// output streams to the user's terminal.
 fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), RuntimeError> {
-    const INSTALLER: &str = "https://raw.githubusercontent.com/gedigi/noissh/main/install.sh";
+    // Pin the installer to THIS client's released tag rather than a moving
+    // branch, so an auto-install runs a versioned, reproducible script (the
+    // installer itself then verifies the release binary's SHA-256 checksum).
+    let installer = format!(
+        "https://raw.githubusercontent.com/gedigi/noissh/v{}/install.sh",
+        env!("CARGO_PKG_VERSION")
+    );
     // One self-contained shell command: prefer curl, fall back to wget, error if
     // neither is available. `$HOME` is expanded by the remote shell.
     let remote = format!(
         "if command -v curl >/dev/null 2>&1; then \
-           curl -fsSL {INSTALLER} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
+           curl -fsSL {installer} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
          elif command -v wget >/dev/null 2>&1; then \
-           wget -qO- {INSTALLER} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
+           wget -qO- {installer} | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
          else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi"
     );
     let mut cmd = Command::new(ssh_prog());
     cmd.args(extra_ssh_args);
+    cmd.arg("--"); // terminate ssh option parsing (target may start with `-`)
     cmd.arg(target);
     cmd.arg(remote);
     // Inherit stdio so the user sees the installer's progress.

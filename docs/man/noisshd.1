@@ -1,4 +1,4 @@
-.TH NOISSHD 1 "2026-06-18" "noissh 0.2.0" "System Administration"
+.TH NOISSHD 1 "2026-06-18" "noissh 0.4.0" "System Administration"
 .SH NAME
 noisshd \- resilient remote shell over the Noise Protocol Framework (server)
 .SH SYNOPSIS
@@ -11,6 +11,7 @@ noisshd \- resilient remote shell over the Noise Protocol Framework (server)
 .IR PATH ]
 .RB [ \-\-command
 .IR "CMD ..." ]
+.RB [ \-v ]
 .br
 .B noisshd \-\-one\-shot \-\-authorize
 .I B64PUB
@@ -65,6 +66,10 @@ In one\-shot mode, the single base64 client public key to trust.
 .TP
 .BI \-\-bind " ADDR"
 Bind address in one\-shot mode (default 0.0.0.0:0, an ephemeral port).
+.TP
+.BR \-v ", " \-\-verbose
+Log session lifecycle (each session established and ended, with the current
+active session count) and fatal socket errors.
 .SH SECURITY
 An unauthorized client key is rejected at handshake completion, before any
 session or PTY/login work occurs. On Linux, when built with the

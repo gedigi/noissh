@@ -40,6 +40,7 @@ fn bootstrap_installs_missing_noisshd_then_connects() {
            echo 'sh: 1: noisshd: not found' >&2\n\
            exit 127\n\
          fi\n\
+         [ \"$1\" = \"--\" ] && shift\n\
          shift\n\
          exec \"$@\" --command /bin/sh -c 'sleep 1'\n",
     )

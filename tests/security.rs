@@ -172,6 +172,77 @@ fn forged_transport_packet_is_rejected() {
 }
 
 #[test]
+fn injected_garbage_does_not_kill_inflight_handshake() {
+    // The session id is plaintext, so an attacker could try to abort an
+    // in-progress handshake by injecting a packet with that id. A bogus packet
+    // must NOT destroy the pending state: the legitimate handshake still
+    // completes.
+    use transport::build_handshake_packet;
+
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "ok");
+    let mut server = ServerCore::new(server_kp, authorized, Box::new(LocalLogin), None);
+    let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+    let (mut client, first) = ClientCore::new(
+        &client_kp,
+        KnownHosts::new(),
+        "h:1",
+        addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+    )
+    .unwrap();
+    let mut sid = [0u8; 8];
+    sid.copy_from_slice(&first[1..9]);
+
+    // msg1 -> server creates pending state and replies msg2.
+    let reply = server.handle_packet(addr, &first);
+    assert!(!reply.is_empty(), "server should answer msg1");
+
+    // Attacker injects a (large enough to pass the floor) garbage packet for the
+    // same session id from a different address; it must be ignored.
+    let garbage = build_handshake_packet(&sid, &vec![7u8; 1300]);
+    assert!(
+        server
+            .handle_packet("198.51.100.9:1".parse().unwrap(), &garbage)
+            .is_empty()
+    );
+
+    // The legitimate client finishes the handshake; a session must result.
+    let mut to_client: Vec<Vec<u8>> = reply.into_iter().map(|(_, p)| p).collect();
+    for _ in 0..10 {
+        let mut next = Vec::new();
+        for pkt in to_client.drain(..) {
+            if let Ok(reps) = client.handle_packet(&pkt) {
+                for r in reps {
+                    for (_a, o) in server.handle_packet(addr, &r) {
+                        next.push(o);
+                    }
+                }
+            }
+        }
+        for p in client.tick() {
+            for (_a, o) in server.handle_packet(addr, &p) {
+                next.push(o);
+            }
+        }
+        to_client = next;
+        if server.session_count() > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        server.session_count(),
+        1,
+        "garbage injection destroyed the in-flight handshake"
+    );
+}
+
+#[test]
 fn undersized_handshake_init_gets_no_reply() {
     // Anti-amplification: a small, unpadded new-session init must not draw the
     // (larger) handshake reply, and must not create state. A properly padded

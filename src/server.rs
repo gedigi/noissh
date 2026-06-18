@@ -182,8 +182,8 @@ impl ServerCore {
         if self.sessions.contains_key(&sid) {
             return Ok(Vec::new()); // already established
         }
-        let hs = match self.pending.remove(&sid) {
-            Some(hs) => hs,
+        let (mut hs, was_pending) = match self.pending.remove(&sid) {
+            Some(hs) => (hs, true),
             None => {
                 // Anti-amplification: a brand-new init must be padded to the
                 // floor. Refuse smaller ones so a spoofed small datagram can't
@@ -197,11 +197,23 @@ impl ServerCore {
                 if self.pending.len() >= MAX_PENDING_HANDSHAKES {
                     return Ok(Vec::new());
                 }
-                Handshaker::server(&self.keypair.private, sid)?
+                (Handshaker::server(&self.keypair.private, sid)?, false)
             }
         };
-        let mut hs = hs;
-        let outcome = hs.read(body)?;
+        // A failed read must NOT consume EXISTING pending state: the session id
+        // is plaintext, so otherwise anyone could kill an in-flight handshake by
+        // injecting one garbage packet with that id. Restore it and drop the
+        // bogus packet. (A freshly-created handshaker that fails its first read
+        // is just discarded — re-inserting it would only waste a slot.)
+        let outcome = match hs.read(body) {
+            Ok(o) => o,
+            Err(_) => {
+                if was_pending {
+                    self.pending.insert(sid, hs);
+                }
+                return Ok(Vec::new());
+            }
+        };
         let mut out = Vec::new();
         if let Some(reply) = outcome.reply {
             out.push((src, reply));
@@ -866,12 +878,16 @@ impl Server {
                 } => {
                     let cmd = String::from_utf8_lossy(&meta).into_owned();
                     match crate::exec::ExecProc::spawn(&cmd) {
-                        Ok(proc) => match self.core.open_exec(sid) {
+                        Ok(mut proc) => match self.core.open_exec(sid) {
                             Some(err_id) => {
                                 self.execs.insert((sid, id), ExecState { proc, err_id });
                             }
-                            // Session vanished between events: nothing to attach.
-                            None => self.core.stream_reset(sid, id),
+                            // Session vanished between events: kill the child we
+                            // just spawned so it isn't leaked, then reset.
+                            None => {
+                                proc.kill();
+                                self.core.stream_reset(sid, id);
+                            }
                         },
                         // Couldn't spawn the command: signal failure to the client.
                         Err(_) => self.core.stream_reset(sid, id),

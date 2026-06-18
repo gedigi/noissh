@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-06-18" "noissh 0.2.0" "User Commands"
+.TH NOISSH 1 "2026-06-18" "noissh 0.4.0" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -9,6 +9,10 @@ noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .RB [ \-\-server\-cmd
 .IR CMD ]
 .RB [ \-\-no\-install ]
+.RB [ \-D
+.IR SPEC ]
+.RB [ \-\-exec
+.IR CMD ]
 .RI [ user @] host
 .RB [ \-\-
 .IR "ssh args" ...]
@@ -77,6 +81,28 @@ and tunnels accepted connections back to this client for delivery to
 .IR HOST:PORT .
 May be repeated. Implies forward\-only (no shell).
 .TP
+.BI \-D " [BIND:]PORT"
+Dynamic port forward: run a local SOCKS proxy on
+.I PORT
+(bound to loopback unless
+.I BIND
+is given) whose connections are tunnelled, over the resilient session, to the
+host and port each client requests, resolved via the server. The proxy speaks
+SOCKS5 (no authentication) and SOCKS4/4a, CONNECT only. May be repeated. Implies
+forward\-only (no shell).
+.TP
+.BI \-\-exec " CMD"
+Run
+.I CMD
+on the server non\-interactively instead of opening a shell, then exit. The
+command's standard output and standard error are streamed separately to yours,
+your standard input is forwarded until EOF, and noissh exits with the command's
+exit status. Output is byte\-for\-byte (no PTY/terminal processing), so it is safe
+to redirect or pipe. Mutually exclusive with an interactive shell. Refused by a
+standalone daemon configured with a
+.B \-\-user
+privilege drop.
+.TP
 .BI \-\-put " LOCAL:REMOTE"
 Upload local file
 .I LOCAL
@@ -144,6 +170,12 @@ Upload a file:
 .TP
 Download a file:
 .B noissh --ssh user@server --get /var/log/app.log ./app.log
+.TP
+Dynamic SOCKS proxy on a local port:
+.B noissh --ssh user@server -D 1080
+.TP
+Run a single remote command:
+.B noissh --ssh user@server --exec "uname -a"
 .TP
 Interactive shell with agent forwarding:
 .B noissh --ssh user@server -A

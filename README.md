@@ -28,8 +28,11 @@ laptop going to sleep.
   restarts, **reconnect and you're back in the same running session.**
 - **It feels instant.** Your keystrokes show up immediately, even on a laggy or
   lossy connection, instead of waiting for a round trip to the server.
-- **It tunnels too.** Local and remote **port forwarding** (`-L`/`-R`) ride the
-  same resilient, encrypted session.
+- **It tunnels too.** Local, remote, and dynamic SOCKS **port forwarding**
+  (`-L`/`-R`/`-D`) ride the same resilient, encrypted session.
+- **It runs commands.** Run a single remote command non-interactively
+  (`--exec`), streaming its output and exiting with its status — handy for
+  scripts.
 - **It moves files.** Copy files to and from the server (`--put`/`--get`) over
   the same authenticated channel — no second tool, no extra login.
 - **It forwards your keys.** **Agent forwarding** (`-A`) lets commands on the
@@ -117,9 +120,12 @@ noissh --ssh user@server -L 8080:10.0.0.5:80
 
 # Remote: server:9000 -> localhost:3000 (on your machine)
 noissh --ssh user@server -R 9000:localhost:3000
+
+# Dynamic: a local SOCKS proxy on :1080 whose connections tunnel via the server
+noissh --ssh user@server -D 1080
 ```
 
-Adding `-L`/`-R` makes the session forward-only (no shell), like `ssh -N`.
+Adding `-L`/`-R`/`-D` makes the session forward-only (no shell), like `ssh -N`.
 
 **Copying files** rides the same session — no separate transfer tool:
 
@@ -130,6 +136,15 @@ noissh --ssh user@server --put ./report.pdf:/home/user/report.pdf
 # Download remote -> local
 noissh --ssh user@server --get /var/log/app.log:./app.log
 ```
+
+**Running a single command** non-interactively, with byte-exact output:
+
+```sh
+noissh --ssh user@server --exec "uname -a"
+```
+
+It streams the command's stdout and stderr separately and exits with its exit
+code, so it's safe to use in scripts and pipelines.
 
 **Agent forwarding** (`-A`) lets remote `git`/`ssh` use your local keys:
 
@@ -154,8 +169,9 @@ Want the details? See the **[Architecture](docs/ARCHITECTURE.md)** and
 ## Project status
 
 Working and tested end-to-end: the resilient interactive shell, predictive
-typing, roaming, local/remote port forwarding, file transfer (`--put`/`--get`),
-and SSH agent forwarding (`-A`) — all over the same reliable-stream layer. This
+typing, roaming, local/remote/dynamic port forwarding (`-L`/`-R`/`-D`), remote
+command execution (`--exec`), file transfer (`--put`/`--get`), and SSH agent
+forwarding (`-A`) — all over the same reliable-stream layer. This
 is young software and hasn't had an independent security audit yet — see the
 **[Security model](docs/SECURITY.md)** before relying on it for anything
 sensitive.

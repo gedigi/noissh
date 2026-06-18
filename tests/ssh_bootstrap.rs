@@ -28,7 +28,8 @@ fn ssh_bootstrap_then_session() {
     fs::write(
         &fake_ssh,
         "#!/bin/sh\n\
-         # args: <target> <noisshd> --one-shot --authorize <pub>\n\
+         # args: [--] <target> <noisshd> --one-shot --authorize <pub>\n\
+         [ \"$1\" = \"--\" ] && shift  # skip ssh's option terminator\n\
          shift  # drop the ssh target\n\
          exec \"$@\" --command /bin/sh -c 'printf \"SSH-BOOT-OK\\n\"; sleep 0.8'\n",
     )

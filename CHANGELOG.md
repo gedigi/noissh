@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+### Added
+
+- **Dynamic (SOCKS) port forwarding** (`-D [BIND:]PORT`): a local SOCKS proxy
+  whose connections tunnel dynamically, over the resilient session, to the
+  host:port each client requests (resolved via the server). Speaks SOCKS5 (no
+  authentication) and SOCKS4/4a, CONNECT only; binds loopback by default. Like
+  `-L`/`-R`, it makes the session forward-only.
+- **Remote command execution** (`--exec CMD`): run a single command
+  non-interactively on the server, streaming its stdout and stderr separately to
+  yours, forwarding stdin until EOF, and exiting with the command's exit code.
+  Output is byte-for-byte (no PTY/terminal processing), so it is safe to redirect
+  or pipe. Refused by a standalone daemon configured with a `--user` privilege
+  drop (same posture as file transfer and agent forwarding).
+- **RTT-based congestion control**: streams now use an adaptive,
+  RTT-estimated retransmission timeout plus a congestion window (slow start /
+  congestion avoidance), improving throughput on lossy or high-latency links.
+- **Daemon observability** (`noisshd -v`/`--verbose`): logs session lifecycle
+  (each session established and ended, with the current active session count) and
+  fatal socket errors.
+- **Auto-install of `noisshd` on first `--ssh` connect**: if the remote does not
+  have `noisshd`, the first connect runs the published installer over the same
+  SSH session (detecting OS/arch, downloading the matching prebuilt release,
+  verifying its SHA-256 checksum, installing into `~/.local/bin`) and retries the
+  handshake. Skipped with `--no-install` or a custom `--server-cmd`.
+- **`noissh-keygen` man page** (`noissh-keygen.1`).
+
+### Security
+
+- **Handshake anti-amplification floor**: the client pads its initial handshake
+  packet and the server refuses an undersized new-session init, so the handshake
+  cannot be used as a UDP reflection/amplification vector.
+
+### Removed
+
+- **Never-wired second-factor control messages** (`AuthPrompt`/`AuthResponse`),
+  which were defined but never used.
+
 ## [0.3.1]
 
 ### Security
