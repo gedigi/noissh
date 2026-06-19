@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use auth::{AuthorizedKeys, KnownHosts, PublicKey};
 use noise_core::{Keypair, generate_keypair};
@@ -74,6 +75,7 @@ impl TestServer {
             DisplayMode::Adaptive,
             false,
             None,
+            Duration::from_secs(5),
         )
         .unwrap()
     }
@@ -210,6 +212,7 @@ fn file_transfer_is_refused_when_privsep_user_is_configured() {
         DisplayMode::Adaptive,
         false,
         None,
+        Duration::from_secs(5),
     )
     .unwrap();
 

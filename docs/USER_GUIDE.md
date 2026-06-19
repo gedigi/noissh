@@ -11,8 +11,8 @@ This guide covers installing, connecting, configuring, and troubleshooting.
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Connecting](#connecting)
-  - [SSH bootstrap](#ssh-bootstrap)
-  - [Direct connection](#direct-connection)
+  - [Direct connection (the first attempt)](#direct-connection-the-first-attempt)
+  - [SSH bootstrap (the automatic fallback)](#ssh-bootstrap-the-automatic-fallback)
 - [Running the server](#running-the-server)
   - [Running noisshd under systemd](#running-noisshd-under-systemd)
 - [Keys & trust](#keys--trust)
@@ -42,19 +42,58 @@ Install them somewhere on your `PATH` on both machines (the server host needs
 
 ## Quick start
 
-The easiest path, if you can already SSH to the server:
+Just point noissh at a host you can already reach:
 
 ```sh
-noissh --ssh user@server
+noissh user@server
 ```
 
-This uses your existing SSH access to launch the server and negotiate a Noise/UDP
-session — no extra server configuration required. (Make sure UDP is reachable;
-see [Troubleshooting](#troubleshooting).)
+That's it. noissh first tries to reach a standing `noisshd` directly over
+Noise/UDP, and if nothing answers it automatically falls back to launching the
+server over your existing SSH access — no extra server configuration required.
+(Make sure UDP is reachable; see [Troubleshooting](#troubleshooting).)
 
 ## Connecting
 
-### SSH bootstrap
+The default — `noissh [user@]host` — does the right thing on its own. You do not
+choose a mode up front:
+
+1. **Direct first.** noissh tries a Noise/UDP session to a standing `noisshd` on
+   the host (UDP port 51820 by default, or `--port N`), pinning the server's key
+   via TOFU in `known_hosts`.
+2. **SSH fallback.** If nothing answers within a few seconds (no daemon is
+   running there), noissh automatically falls back to the SSH bootstrap: it
+   launches `noisshd` over your existing SSH access — auto-installing it if
+   missing — and runs the session.
+
+You can pin either step explicitly:
+
+- `--direct` requires a direct connection and never falls back to SSH.
+- `--ssh` forces the SSH bootstrap and skips the direct attempt entirely, which
+  is handy when you already know there is no standing daemon and want to avoid the
+  few-second probe.
+
+A host-key mismatch on the direct attempt is a hard error (`HOST KEY MISMATCH`):
+noissh aborts rather than silently falling back to SSH.
+
+### Direct connection (the first attempt)
+
+This is what noissh tries first, and what `--direct` forces. It applies when a
+standalone `noisshd` is already running and your key is authorized:
+
+```sh
+noissh [user@]host            # default UDP port 51820
+noissh --port 51820 host
+noissh --direct user@host     # require direct; never fall back to SSH
+```
+
+On first connect the server's key is pinned (TOFU) in `known_hosts`. A later key
+change aborts the connection with a `HOST KEY MISMATCH` error.
+
+### SSH bootstrap (the automatic fallback)
+
+This is what noissh falls back to when the direct attempt finds no daemon, and
+what `--ssh` forces (skipping the direct probe):
 
 ```sh
 noissh --ssh [user@]host [--server-cmd noisshd] [--port N] [-- <extra ssh args>]
@@ -68,7 +107,7 @@ What happens:
 3. noissh reads the port + the server's ephemeral public key (delivered over the
    authenticated SSH channel), pins it, and connects over Noise/UDP.
 
-If the remote does not have `noisshd` yet, the first connect installs it for you
+If the remote does not have `noisshd` yet, the bootstrap installs it for you
 automatically: noissh runs the published installer over the same SSH session,
 which detects the remote OS/arch, downloads the matching prebuilt release binary,
 verifies its SHA-256 checksum, and installs it into `~/.local/bin`. Installer
@@ -82,18 +121,6 @@ with a clear message.)
 `--server-cmd` sets the remote command if `noisshd` is not on the default `PATH`
 (e.g. `--server-cmd /opt/noissh/bin/noisshd`). Everything after `--` is passed
 straight to `ssh` (e.g. `-- -p 2222 -i ~/.ssh/id_ed25519`).
-
-### Direct connection
-
-If a standalone `noisshd` is already running and your key is authorized:
-
-```sh
-noissh [user@]host            # default UDP port 51820
-noissh --port 51820 host
-```
-
-On first connect the server's key is pinned (TOFU) in `known_hosts`. A later key
-change aborts the connection with a `HOST KEY MISMATCH` error.
 
 ## Running the server
 
@@ -316,8 +343,9 @@ is `0600`, so other local users on the server cannot reach your forwarded agent.
 ### `noissh`
 
 ```
-noissh [--ssh] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--exec CMD] [-A] [user@]host [-- <ssh args>]
-  --ssh           bootstrap the server over SSH
+noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--exec CMD] [-A] [user@]host [-- <ssh args>]
+  --ssh           force the SSH bootstrap (skip the direct probe)
+  --direct        direct connection only; never fall back to SSH
   --port N        UDP port for direct connection (default 51820)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   --no-install    do not auto-install noisshd on the remote if it is missing

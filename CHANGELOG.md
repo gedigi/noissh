@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3]
+
+### Changed
+
+- **`noissh host` now connects automatically**: it first tries a direct UDP
+  session to a standing server, and if none answers it falls back to the SSH
+  bootstrap on its own (launching — and, if missing, installing — `noisshd` over
+  SSH). `--ssh` now *forces* the bootstrap (skips the direct probe); the new
+  `--direct` requires a direct connection and never falls back. A host-key
+  mismatch on the direct attempt is a hard error and does not fall back.
+
 ## [0.4.2]
 
 ### Fixed

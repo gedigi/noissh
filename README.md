@@ -13,9 +13,10 @@ normal shell, secured end-to-end by the modern
 [Noise Protocol](https://noiseprotocol.org/).
 
 ```sh
-# Connect over your existing SSH access — the server component installs itself
-# automatically on first use if it isn't there yet:
-noissh --ssh you@server
+# Just connect. If a noissh server is already running it's used directly;
+# otherwise noissh starts one over your existing SSH access — installing the
+# server component automatically on first use if it isn't there yet:
+noissh you@server
 ```
 
 You get a normal shell — except it shrugs off flaky links and survives your
@@ -84,17 +85,20 @@ Put `noissh` on your laptop and `noisshd` on the server. (To remove it later:
 
 ## Getting started
 
-**The easy way — if you can already SSH to the host:**
+**Just connect — if you can already SSH to the host:**
 
 ```sh
-noissh --ssh you@server
+noissh you@server
 ```
 
-noissh uses your existing SSH access to start the server for you and then runs
-the session over its own resilient, encrypted channel. **If `noisshd` isn't on
-the server yet, the first connect installs it for you** over the same SSH session
-(fetching the matching, checksum-verified release into `~/.local/bin`). Pass
-`--no-install` to opt out.
+noissh first tries a direct session to a server that's already running; if none
+answers, it uses your existing SSH access to start one for you and then runs the
+session over its own resilient, encrypted channel. **If `noisshd` isn't on the
+server yet, the first connect installs it for you** over the same SSH session
+(fetching the matching, checksum-verified release into `~/.local/bin`).
+
+Use `--ssh` to force the SSH path, `--direct` to require a direct connection (no
+SSH fallback), and `--no-install` to skip the automatic install.
 
 **Running your own always-on server:**
 
@@ -102,7 +106,7 @@ the server yet, the first connect installs it for you** over the same SSH sessio
 # on the server
 noisshd --listen 0.0.0.0:51820
 
-# on your machine (first connect remembers the server's key)
+# on your machine — connects directly (first connect remembers the server's key)
 noissh you@server
 ```
 

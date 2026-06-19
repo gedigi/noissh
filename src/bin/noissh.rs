@@ -1,11 +1,15 @@
 #![forbid(unsafe_code)]
 //! noissh — the noissh client.
 //!
-//! Modes:
-//!   noissh [--port N] [user@]host
-//!       Direct connect to a standalone noisshd (known_hosts TOFU pinning).
+//! Connecting:
+//!   noissh [user@]host
+//!       Try a direct UDP session to a standing noisshd (known_hosts TOFU); if
+//!       nothing answers, automatically fall back to the SSH bootstrap below.
 //!   noissh --ssh [user@]host [--server-cmd noisshd] [-- <ssh args>...]
-//!       bootstrap the server over SSH, then run the session over Noise/UDP.
+//!       Force the SSH bootstrap: launch (and, if missing, install) noisshd over
+//!       SSH, then run the session over Noise/UDP.
+//!   noissh --direct [--port N] [user@]host
+//!       Direct only — never fall back to SSH.
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
@@ -48,6 +52,8 @@ struct Args {
     no_install: bool,
     /// Run a non-interactive remote command instead of an interactive shell.
     exec: Option<String>,
+    /// Force a direct UDP connection only (never fall back to the SSH bootstrap).
+    direct: bool,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -84,11 +90,13 @@ fn parse_args() -> Args {
         forward_agent: false,
         no_install: false,
         exec: None,
+        direct: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ssh" => a.ssh = true,
+            "--direct" => a.direct = true,
             "--no-install" => a.no_install = true,
             "--exec" => {
                 if let Some(c) = it.next() {
@@ -175,31 +183,6 @@ fn run() -> Result<(), RuntimeError> {
 
     let (cols, rows) = terminal_size();
 
-    let (server_addr, host_label) = if args.ssh {
-        // Bootstrap the server over SSH.
-        let boot = ssh::bootstrap(
-            &target,
-            std::slice::from_ref(&args.server_cmd),
-            &keypair.public,
-            &args.ssh_args,
-            !args.no_install,
-        )?;
-        // The server key arrived over the authenticated SSH channel: pin it
-        // directly under the host:port label so the UDP handshake validates.
-        let label = format!("{}:{}", ssh::host_of(&target), boot.server_addr.port());
-        pin_key(&mut known, &label, &boot.server_pubkey)?;
-        save_known_hosts(&kh_path, &known)?;
-        (boot.server_addr, label)
-    } else {
-        let host = ssh::host_of(&target).to_string();
-        let addr = (host.as_str(), args.port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .ok_or(RuntimeError::SshBootstrap)?;
-        (addr, format!("{host}:{}", args.port))
-    };
-
     // No interactive shell for a one-shot transfer or when `-L`/`-R`/`-D` is
     // given (the latter behaves like `ssh -N`).
     let forward_only = !args.local_forwards.is_empty()
@@ -219,17 +202,78 @@ fn run() -> Result<(), RuntimeError> {
     } else {
         None
     };
-    let mut client = Client::connect_with(
-        &keypair,
-        known,
-        host_label,
-        server_addr,
-        rows,
-        cols,
-        DisplayMode::Adaptive,
-        want_shell,
-        agent_sock,
-    )?;
+
+    // Connect: unless told otherwise, try a direct UDP session to a standing
+    // noisshd first; if that doesn't answer (no daemon), fall back to the SSH
+    // bootstrap automatically. `--ssh` forces bootstrap; `--direct` forbids it.
+    let host = ssh::host_of(&target).to_string();
+    let mut client = None;
+
+    if !args.ssh {
+        if let Some(addr) = (host.as_str(), args.port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+        {
+            let label = format!("{host}:{}", args.port);
+            match Client::connect_with(
+                &keypair,
+                known.clone(),
+                label,
+                addr,
+                rows,
+                cols,
+                DisplayMode::Adaptive,
+                want_shell,
+                agent_sock.clone(),
+                DIRECT_CONNECT_TIMEOUT,
+            ) {
+                Ok(c) => client = Some(c),
+                // No daemon answered in time: fall back to SSH (unless forbidden).
+                Err(RuntimeError::Timeout) if !args.direct => {
+                    eprintln!(
+                        "noissh: no direct response on udp/{}; bootstrapping over SSH…",
+                        args.port
+                    );
+                }
+                // A real failure (e.g. host-key mismatch) must not silently
+                // trigger an SSH bootstrap that would re-pin a key.
+                Err(e) => return Err(e),
+            }
+        } else if args.direct {
+            return Err(RuntimeError::SshBootstrap); // can't resolve, can't fall back
+        }
+    }
+
+    if client.is_none() {
+        // SSH bootstrap: launch (and, if missing, install) noisshd over SSH.
+        let boot = ssh::bootstrap(
+            &target,
+            std::slice::from_ref(&args.server_cmd),
+            &keypair.public,
+            &args.ssh_args,
+            !args.no_install,
+        )?;
+        // The server key arrived over the authenticated SSH channel: pin it
+        // under the host:port label so the UDP handshake validates.
+        let label = format!("{host}:{}", boot.server_addr.port());
+        pin_key(&mut known, &label, &boot.server_pubkey)?;
+        save_known_hosts(&kh_path, &known)?;
+        client = Some(Client::connect_with(
+            &keypair,
+            known,
+            label,
+            boot.server_addr,
+            rows,
+            cols,
+            DisplayMode::Adaptive,
+            want_shell,
+            agent_sock,
+            BOOTSTRAP_CONNECT_TIMEOUT,
+        )?);
+    }
+
+    let mut client = client.expect("a client was established");
 
     // Persist any newly-pinned host key (direct-mode TOFU).
     if client.core().known_hosts_dirty() {
@@ -267,6 +311,12 @@ fn pin_key(known: &mut KnownHosts, label: &str, pubkey: &[u8]) -> Result<(), Run
 const KEEPALIVE: Duration = Duration::from_secs(3);
 /// Poll wakeup while there is unacked data to (re)transmit.
 const ACTIVE_POLL: Duration = Duration::from_millis(40);
+/// How long to probe for a direct (standing-daemon) UDP session before falling
+/// back to the SSH bootstrap — short so the fallback is snappy.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Handshake timeout for the SSH-bootstrapped session (the server is freshly
+/// launched and known to be there).
+const BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};

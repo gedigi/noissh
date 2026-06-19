@@ -4,6 +4,7 @@ noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
 .B noissh
 .RB [ \-\-ssh ]
+.RB [ \-\-direct ]
 .RB [ \-\-port
 .IR N ]
 .RB [ \-\-server\-cmd
@@ -26,14 +27,47 @@ reconnecting. All cryptography uses the Noise Protocol Framework
 .RB ( Noise_XX_25519_ChaChaPoly_BLAKE2s ).
 The interactive shell rides unreliable latest\-wins datagrams and a client\-side
 predictive\-echo engine, giving an instant feel even on poor links.
+.PP
+A bare
+.B noissh
+.I host
+first attempts a direct Noise/UDP session to a standing
+.BR noisshd (1)
+on the host (UDP port 51820 by default, or
+.BR \-\-port ),
+pinning the server's key on first use. If nothing answers within a few seconds,
+it automatically falls back to the SSH bootstrap (see
+.BR \-\-ssh ),
+launching
+.B noisshd
+over your existing SSH access and auto\-installing it if missing. A host\-key
+mismatch on the direct attempt is a hard error and does
+.I not
+fall back to SSH. Use
+.B \-\-direct
+to require a direct connection, or
+.B \-\-ssh
+to force the bootstrap and skip the direct probe.
 .SH OPTIONS
 .TP
+.B \-\-direct
+Require a direct connection to a standing
+.BR noisshd (1)
+and never fall back to the SSH bootstrap. This forces the first attempt that a
+bare
+.B noissh
+.I host
+makes by default.
+.TP
 .B \-\-ssh
-Bootstrap the server over SSH: run
+Force the SSH bootstrap, skipping the direct probe. Run
 .B ssh
 .I host noisshd --one-shot
 to obtain the UDP port and the server's ephemeral public key, then connect over
-Noise/UDP. No pre\-shared
+Noise/UDP. (Without this flag the bootstrap still runs automatically when the
+direct attempt finds no daemon;
+.B \-\-ssh
+just skips the few\-second probe.) No pre\-shared
 .I authorized_keys
 entry is required. If
 .B noisshd
@@ -166,10 +200,10 @@ Direct connection on a custom port:
 .B noissh --port 51820 user@server
 .TP
 Upload a file:
-.B noissh --ssh user@server --put ./report.pdf /home/user/report.pdf
+.B noissh user@server --put ./report.pdf:/home/user/report.pdf
 .TP
 Download a file:
-.B noissh --ssh user@server --get /var/log/app.log ./app.log
+.B noissh user@server --get /var/log/app.log:./app.log
 .TP
 Dynamic SOCKS proxy on a local port:
 .B noissh --ssh user@server -D 1080

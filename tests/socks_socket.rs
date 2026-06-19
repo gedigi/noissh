@@ -110,6 +110,7 @@ fn socks5_dynamic_forward_round_trips() {
         DisplayMode::Adaptive,
         false,
         None,
+        Duration::from_secs(5),
     )
     .unwrap();
     let cli = thread::spawn(move || {

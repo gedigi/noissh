@@ -397,6 +397,7 @@ impl Client {
             prediction,
             true,
             None,
+            Duration::from_secs(5),
         )
     }
 
@@ -413,6 +414,7 @@ impl Client {
         prediction: DisplayMode,
         want_shell: bool,
         agent_sock: Option<String>,
+        connect_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
         let bind: SocketAddr = if server_addr.is_ipv6() {
             "[::]:0".parse().unwrap()
@@ -442,8 +444,8 @@ impl Client {
             agent_sock,
             agent_conns: std::collections::HashMap::new(),
         };
-        // Drive the handshake to completion.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Drive the handshake to completion within the connect timeout.
+        let deadline = std::time::Instant::now() + connect_timeout;
         while !client.core.is_established() {
             if std::time::Instant::now() > deadline {
                 return Err(RuntimeError::Timeout);

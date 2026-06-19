@@ -110,6 +110,7 @@ fn agent_forwarding_round_trips_to_the_local_agent() {
         DisplayMode::Adaptive,
         true,
         Some(mock_agent.clone()),
+        Duration::from_secs(5),
     )
     .unwrap();
     client.socket().set_nonblocking(true).ok();
