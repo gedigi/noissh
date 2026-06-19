@@ -3,7 +3,7 @@
 This document specifies the noissh wire protocol as implemented: packet framing,
 the handshake, the frame format, the interactive data plane, and the reliable
 stream layer. It is descriptive of the current implementation, not a frozen
-standard — the version is **0.1** and may change.
+standard — the protocol is pre-1.0 and may change.
 
 All multi-byte integers in headers are **big-endian**; all variable-length
 integers inside frame payloads are **LEB128 unsigned varints**.
@@ -60,6 +60,15 @@ against `known_hosts` (TOFU).
 Session-id reuse: the server keys in-progress handshakes and established sessions
 by session id, independent of source address.
 
+**Anti-amplification.** The client pads its initial handshake datagram (message 1)
+to a fixed floor (the padding rides as the first Noise message's ignored
+payload), and the server refuses to reply to — or create state for — a new-session
+init smaller than that floor. The handshake reply can therefore never be larger
+than what was received, so a spoofed-source init cannot be used to reflect
+amplified traffic. A read failure for an *already-pending* session id does not
+discard its state (the id is plaintext, so otherwise an injected packet could
+abort an in-flight handshake).
+
 ```mermaid
 sequenceDiagram
     participant C as noissh (client)
@@ -103,7 +112,8 @@ bytes. Signed integers use zig-zag varint encoding.
 | `0x14` | `StreamReset` | `id: varint` |
 | `0x20` | `Control` | `data: bytes` (a control message, section 6) |
 
-`StreamKind`: `0 = Session`, `1 = Forward`, `2 = FileTransfer`, `3 = Agent`.
+`StreamKind`: `0 = Session`, `1 = Forward` (`-L`/`-R`/`-D`), `2 = FileTransfer`
+(`--put`/`--get`), `3 = Agent` (`-A`), `4 = Exec` (`--exec`).
 
 Unknown frame types and truncated fields are hard decode errors (the whole
 datagram is dropped). The decoder is fuzzed and never panics on arbitrary input.
@@ -148,31 +158,42 @@ color: [0]                | [1][index u8] | [2][r u8][g u8][b u8]
 ## 6. Control messages (inside `Control` frames)
 
 ```
-0x01 OpenShell    : cols varint, rows varint, term string
-0x02 Resize       : cols varint, rows varint
-0x03 Exit         : status zigzag varint
-0x04 AuthPrompt   : echo u8, prompt string   (optional 2nd factor, server→client)
-0x05 AuthResponse : data string               (optional 2nd factor, client→server)
+0x01 OpenShell     : cols varint, rows varint, term string, agent u8
+0x02 Resize        : cols varint, rows varint
+0x03 Exit          : status zigzag varint
+0x06 RemoteForward : bind_port varint, target string   (client→server, -R)
 ```
 
-Strings are `varint length` + UTF-8 bytes.
+`OpenShell`'s `agent` byte requests SSH agent forwarding (`-A`). Strings are
+`varint length` + UTF-8 bytes. (Tags `0x04`/`0x05` are reserved — they were a
+never-wired second-factor prompt/response, since removed.)
 
 ## 7. Reliable streams (v2)
 
 `StreamMux` provides reliable, ordered, flow-controlled byte streams over the same
 session. Locally-initiated stream ids use parity to avoid collisions (client even,
-server odd). Per stream:
+server odd); a peer-opened stream of the wrong parity is rejected, and the number
+of concurrent peer-opened streams is capped. Per stream:
 
-- **Send:** buffered bytes from the acked offset; retransmit unacked data within
-  the peer's advertised window; `fin` marks the last byte.
+- **Send:** buffered bytes from the acked offset, sent within the smaller of the
+  peer's advertised window and a **congestion window** (slow start / congestion
+  avoidance, collapsing to one segment on loss). Unacked data is retransmitted
+  after a **retransmit timeout derived from a smoothed RTT estimate**
+  (Jacobson/Karels, with Karn's algorithm and exponential backoff), not on every
+  poll. `fin` marks the last byte.
 - **Receive:** out-of-order segments are reassembled into a contiguous stream; the
   receiver advertises a window of `DEFAULT_WINDOW - unread` so an idle reader
-  applies backpressure (flow control).
+  applies backpressure (flow control). Frames that overflow or fall outside the
+  window are dropped, and a peer FIN offset is recorded only once.
 - **Lifecycle:** `StreamOpen` (with kind + metadata) announces a stream;
-  `StreamClose{status}` is a graceful close carrying an exit status;
-  `StreamReset` is an abort.
+  `StreamClose{status}` is a graceful close carrying an exit status (the exec
+  channel uses it to deliver the command's exit code); `StreamReset` is an abort.
 
-Streams roam with the session exactly like the v1 datagram path.
+The stream metadata identifies the endpoint per kind: `Forward` carries the
+target `host:port` (dial-out target for `-L`/`-D`, or the client-side delivery
+target announced via the `RemoteForward` control message for `-R`); `FileTransfer`
+carries a `PUT <size> <path>` / `GET <path>` request; `Exec` carries the command;
+`Agent` has none. Streams roam with the session exactly like the v1 datagram path.
 
 ## 8. Anti-replay & roaming
 

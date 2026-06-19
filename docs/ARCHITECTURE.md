@@ -55,9 +55,10 @@ crates/
   predict/     client-side predictive-echo engine
   auth/        known_hosts (TOFU) + authorized_keys, X25519 key text format
   pty/         PTY allocation + login-shell launching (safe, via pty-process)
-  proto/       handshake driver, control channel, state-sync data plane
-src/           runtime (client/server cores + UDP drivers), config, tty, ssh
-src/bin/       noissh (client) and noisshd (server) binaries
+  proto/       handshake driver, control channel, state-sync plane, xfer request
+src/           runtime (client/server cores + UDP drivers), config, tty, ssh,
+               forward (TCP/Unix), socks (-D), exec (--exec), xfer (file I/O)
+src/bin/       noissh (client), noisshd (server), noissh-keygen (key tool)
 ```
 
 ### Dependency direction
@@ -137,14 +138,30 @@ it just applies cell/cursor diffs and paints predictions on top. Prediction is
 **adaptive** — it only displays once the server has confirmed an echo, which
 naturally suppresses predictions at non-echoing prompts (passwords).
 
-## v2: reliable streams
+## Reliable streams and the SSH-rich feature set
 
-The wire frame format reserves a **stream frame class** from day one. The
-`transport::StreamMux` implements reliable, ordered, flow-controlled byte streams
-(ARQ retransmit, in-order reassembly, sliding receive window) over the same
-Noise/UDP session, which roams exactly like the v1 datagram path. This is the
-substrate SSH-style richness (port forwarding, file transfer, agent forwarding)
-builds on.
+Alongside the latest-wins interactive plane, `transport::StreamMux` provides
+reliable, ordered, flow-controlled byte streams over the same Noise/UDP session,
+which roam exactly like the v1 datagram path: ARQ retransmit on an **RTT-derived
+timeout** with a **congestion window** (slow start / congestion avoidance),
+in-order reassembly, and a sliding receive window. It is hardened against a
+misbehaving peer (out-of-window/overflow frames dropped, stream-id parity
+enforced, concurrent streams capped).
+
+Every SSH-style feature is a stream `kind` multiplexed over that one session,
+concurrently with the shell:
+
+- **Port forwarding** — local `-L`, remote `-R`, and dynamic `-D` (a local SOCKS5/4
+  proxy whose `CONNECT`s open forward streams). `-R` listeners bind loopback.
+- **File transfer** — `--put` / `--get`, written via a temp file and atomically
+  renamed on success.
+- **Agent forwarding** — `-A` exposes `SSH_AUTH_SOCK` on the server, tunnelling
+  agent connections back to the client's local agent.
+- **Remote command execution** — `--exec` runs a command under pipes (byte-exact
+  stdout, separate stderr, exit code in the stream's close status).
+
+The handshake is padded/floored to prevent UDP reflection/amplification (see
+[PROTOCOL.md](PROTOCOL.md) and [SECURITY.md](SECURITY.md)).
 
 ## Login & privilege model
 
