@@ -114,7 +114,8 @@ Authorize a client by adding its public key (printed on first run, stored at
 `~/.config/noissh/id`) to `~/.config/noissh/authorized_keys` on the server.
 
 > **Tip:** noissh talks over **UDP**. If SSH works but noissh times out, the
-> usual culprit is a firewall blocking the UDP port — open it and you're set.
+> usual culprit is a firewall blocking the UDP port. Open a port and pin the
+> server to it with `--server-port N` (e.g. `noissh --server-port 51820 you@server`).
 
 **Port forwarding** works like SSH's `-L`/`-R` and rides the same session:
 

@@ -50,6 +50,7 @@ fn ssh_bootstrap_then_session() {
         &client_kp.public,
         &[],
         false,
+        None,
     )
     .expect("bootstrap");
 

@@ -101,6 +101,16 @@ Remote server command used with
 (default
 .IR noisshd ).
 .TP
+.BI \-\-server\-port " N"
+Pin the bootstrapped server to UDP port
+.I N
+instead of an ephemeral one, so the port can be opened in a firewall/NAT. Useful
+when a host permits SSH but blocks arbitrary inbound UDP: open
+.I N
+and pass the same
+.I N
+here.
+.TP
 .BI \-L " LPORT:HOST:PORT"
 Local port forward: connections to
 .IR 127.0.0.1:LPORT

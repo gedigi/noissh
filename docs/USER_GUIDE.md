@@ -122,6 +122,11 @@ with a clear message.)
 (e.g. `--server-cmd /opt/noissh/bin/noisshd`). Everything after `--` is passed
 straight to `ssh` (e.g. `-- -p 2222 -i ~/.ssh/id_ed25519`).
 
+By default the bootstrapped server binds an **ephemeral** UDP port. If the host
+permits SSH but blocks arbitrary inbound UDP, pin the server to a port you've
+opened with `--server-port N` (e.g. `noissh --server-port 51820 user@host`), then
+open that UDP port in the firewall.
+
 ## Running the server
 
 ### Standalone daemon

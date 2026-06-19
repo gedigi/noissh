@@ -54,6 +54,9 @@ struct Args {
     exec: Option<String>,
     /// Force a direct UDP connection only (never fall back to the SSH bootstrap).
     direct: bool,
+    /// Pin the bootstrapped server's UDP port (so it can be opened in a firewall)
+    /// instead of an ephemeral one.
+    server_port: Option<u16>,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -91,6 +94,7 @@ fn parse_args() -> Args {
         no_install: false,
         exec: None,
         direct: false,
+        server_port: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -114,6 +118,13 @@ fn parse_args() -> Args {
             "--server-cmd" => {
                 if let Some(c) = it.next() {
                     a.server_cmd = c;
+                }
+            }
+            "--server-port" => {
+                if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
+                    a.server_port = Some(p);
+                } else {
+                    eprintln!("noissh: --server-port wants a port number");
                 }
             }
             "-L" => {
@@ -253,24 +264,41 @@ fn run() -> Result<(), RuntimeError> {
             &keypair.public,
             &args.ssh_args,
             !args.no_install,
+            args.server_port,
         )?;
         // The server key arrived over the authenticated SSH channel: pin it
         // under the host:port label so the UDP handshake validates.
-        let label = format!("{host}:{}", boot.server_addr.port());
+        let udp_port = boot.server_addr.port();
+        let label = format!("{host}:{udp_port}");
         pin_key(&mut known, &label, &boot.server_pubkey)?;
         save_known_hosts(&kh_path, &known)?;
-        client = Some(Client::connect_with(
-            &keypair,
-            known,
-            label,
-            boot.server_addr,
-            rows,
-            cols,
-            DisplayMode::Adaptive,
-            want_shell,
-            agent_sock,
-            BOOTSTRAP_CONNECT_TIMEOUT,
-        )?);
+        client = Some(
+            Client::connect_with(
+                &keypair,
+                known,
+                label,
+                boot.server_addr,
+                rows,
+                cols,
+                DisplayMode::Adaptive,
+                want_shell,
+                agent_sock,
+                BOOTSTRAP_CONNECT_TIMEOUT,
+            )
+            .map_err(|e| {
+                // The SSH side worked but the UDP session didn't establish — the
+                // most common cause is the server's UDP port being unreachable
+                // (firewall/NAT). Point the user at the fix.
+                if matches!(e, RuntimeError::Timeout) {
+                    eprintln!(
+                        "noissh: connected over SSH but the UDP session to {host}:{udp_port} \
+                         timed out — that UDP port is likely blocked by a firewall/NAT. \
+                         Open it (or pick an open one with --server-port N) and retry."
+                    );
+                }
+                e
+            })?,
+        );
     }
 
     let mut client = client.expect("a client was established");

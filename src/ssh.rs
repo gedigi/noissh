@@ -94,6 +94,7 @@ fn attempt(
     remote_server_cmd: &[String],
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
+    bind_port: Option<u16>,
 ) -> Result<Attempt, RuntimeError> {
     let mut cmd = Command::new(ssh_prog());
     cmd.args(extra_ssh_args);
@@ -107,6 +108,12 @@ fn attempt(
     cmd.arg("--one-shot");
     cmd.arg("--authorize");
     cmd.arg(STANDARD.encode(client_pubkey));
+    // Pin the server's UDP port (so it can be opened in a firewall) instead of
+    // the default ephemeral bind.
+    if let Some(p) = bind_port {
+        cmd.arg("--bind");
+        cmd.arg(format!("0.0.0.0:{p}"));
+    }
 
     let output = cmd.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -190,8 +197,15 @@ pub fn bootstrap(
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
     auto_install: bool,
+    bind_port: Option<u16>,
 ) -> Result<Bootstrap, RuntimeError> {
-    match attempt(target, remote_server_cmd, client_pubkey, extra_ssh_args)? {
+    match attempt(
+        target,
+        remote_server_cmd,
+        client_pubkey,
+        extra_ssh_args,
+        bind_port,
+    )? {
         Attempt::Connected(b) => Ok(b),
         Attempt::NotFound if auto_install && is_default_server_cmd(remote_server_cmd) => {
             eprintln!(
@@ -204,6 +218,7 @@ pub fn bootstrap(
                 &installed_noisshd_cmd(),
                 client_pubkey,
                 extra_ssh_args,
+                bind_port,
             )? {
                 Attempt::Connected(b) => {
                     eprintln!("noissh: noisshd installed; connecting…");

@@ -63,6 +63,7 @@ fn bootstrap_installs_missing_noisshd_then_connects() {
         &client_kp.public,
         &[],
         true, // auto-install enabled
+        None,
     )
     .expect("bootstrap should auto-install then connect");
 

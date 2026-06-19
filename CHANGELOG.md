@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4]
+
+### Added
+
+- **`--server-port N`** pins the SSH-bootstrapped server to a fixed UDP port
+  instead of an ephemeral one, so it can be opened in a firewall/NAT — useful on
+  hosts that allow SSH but block arbitrary inbound UDP.
+
+### Changed
+
+- A bootstrapped session that connects over SSH but then times out on UDP now
+  prints an actionable hint (the UDP port is likely firewalled; open it or use
+  `--server-port`).
+
 ## [0.4.3]
 
 ### Changed
