@@ -19,7 +19,7 @@ use std::time::Duration;
 use auth::{KnownHosts, PublicKey};
 use noissh::client::Client;
 use noissh::config::{config_dir, load_known_hosts, load_or_generate_keypair, save_known_hosts};
-use noissh::tty::{RawMode, Renderer, terminal_size};
+use noissh::tty::{RawMode, Renderer, TtyWriter, terminal_size};
 use noissh::{RuntimeError, ssh};
 use predict::DisplayMode;
 use proto::XferRequest;
@@ -364,7 +364,10 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     let stdin = std::io::stdin();
     set_nonblocking(stdin.as_fd());
 
-    let mut stdout = std::io::stdout();
+    // Use a TTY writer that rides out EWOULDBLOCK: stdin and stdout share the
+    // terminal file description, so making stdin non-blocking also makes stdout
+    // non-blocking, and a large repaint would otherwise fail mid-write.
+    let mut stdout = TtyWriter;
     stdout.write_all(b"\x1b[2J\x1b[H")?; // clear screen
     stdout.flush()?;
 

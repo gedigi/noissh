@@ -40,6 +40,64 @@ fn io_err(e: nix::errno::Errno) -> RuntimeError {
     RuntimeError::Io(io::Error::from_raw_os_error(e as i32))
 }
 
+/// A blocking writer to the terminal (stdout) that tolerates a non-blocking fd.
+///
+/// The interactive loop puts stdin into non-blocking mode; because stdin and
+/// stdout usually share one terminal file description, stdout becomes
+/// non-blocking too, so a large repaint can return `EWOULDBLOCK` mid-write. This
+/// writer waits for writability (via `poll`) and retries, so callers can treat
+/// it as an ordinary blocking writer. Output is unbuffered (written straight to
+/// the fd), which is what a raw-mode renderer wants.
+#[derive(Default)]
+pub struct TtyWriter;
+
+impl Write for TtyWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use nix::errno::Errno;
+        let out = io::stdout();
+        let fd = out.as_fd();
+        loop {
+            match nix::unistd::write(fd, buf) {
+                Ok(n) => return Ok(n),
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => wait_writable(fd)?,
+                Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(()) // unbuffered: writes go straight to the fd
+    }
+}
+
+/// Write every byte to `fd`, waiting out `EWOULDBLOCK` (for a possibly
+/// non-blocking stdout/stderr). Used for raw command output (`--exec`).
+pub fn write_all_fd(fd: std::os::fd::BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
+    use nix::errno::Errno;
+    while !buf.is_empty() {
+        match nix::unistd::write(fd, buf) {
+            Ok(0) => {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => wait_writable(fd)?,
+            Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+    Ok(())
+}
+
+/// Block until the fd is writable (used to ride out `EWOULDBLOCK`).
+fn wait_writable(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(fd, PollFlags::POLLOUT)];
+    poll(&mut fds, PollTimeout::NONE)
+        .map(|_| ())
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))
+}
+
 /// Query the controlling terminal's size as (cols, rows).
 pub fn terminal_size() -> (u16, u16) {
     match terminal_size::terminal_size() {

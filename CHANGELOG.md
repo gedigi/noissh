@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6]
+
+### Fixed
+
+- **Interactive sessions no longer crash with "Resource temporarily available"
+  (EWOULDBLOCK).** Making stdin non-blocking also makes the shared-terminal
+  stdout non-blocking, so a large screen repaint could fail mid-write; terminal
+  output now rides out EWOULDBLOCK by waiting for writability. Command output
+  from `--exec` is written the same way (no dropped bytes), and a full UDP send
+  buffer is tolerated (the datagram is dropped and recovered) instead of being
+  fatal.
+
 ## [0.4.5]
 
 ### Changed

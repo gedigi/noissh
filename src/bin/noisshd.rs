@@ -143,7 +143,11 @@ fn run_one_shot(args: Args) -> Result<(), RuntimeError> {
     let keypair = noise_core::generate_keypair()?;
     let authorize_b64 = args.authorize.clone().ok_or(RuntimeError::SshBootstrap)?;
     // Validate the client key up front (fail fast on a bad value).
-    PublicKey::from_bytes(&STANDARD.decode(&authorize_b64).map_err(|_| RuntimeError::BadKeyFile)?)?;
+    PublicKey::from_bytes(
+        &STANDARD
+            .decode(&authorize_b64)
+            .map_err(|_| RuntimeError::BadKeyFile)?,
+    )?;
 
     let bind: SocketAddr = args
         .bind

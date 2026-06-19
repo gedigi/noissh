@@ -905,7 +905,7 @@ impl Client {
     /// our stdin until EOF.
     pub fn run_exec(&mut self, cmd: &str) -> Result<i32, RuntimeError> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-        use std::io::{Read, Write};
+        use std::io::Read;
         use std::os::fd::AsFd;
         use std::time::Instant;
 
@@ -918,8 +918,6 @@ impl Client {
         let mut exit_code: Option<i32> = None;
         let mut stdin_eof = false;
 
-        let mut stdout = std::io::stdout();
-        let mut stderr = std::io::stderr();
         let keepalive = Duration::from_secs(3);
         let mut next_keepalive = Instant::now() + keepalive;
         let mut inbuf = [0u8; 16384];
@@ -965,17 +963,16 @@ impl Client {
                 }
             }
 
-            // command stdout / stderr → our stdout / stderr.
+            // command stdout / stderr → our stdout / stderr (blocking writes that
+            // tolerate a non-blocking TTY, so no bytes are dropped).
             let out = self.core.stream_read(e);
             if !out.is_empty() {
-                stdout.write_all(&out).ok();
-                stdout.flush().ok();
+                crate::tty::write_all_fd(std::io::stdout().as_fd(), &out)?;
             }
             if let Some(s) = err_id {
                 let er = self.core.stream_read(s);
                 if !er.is_empty() {
-                    stderr.write_all(&er).ok();
-                    stderr.flush().ok();
+                    crate::tty::write_all_fd(std::io::stderr().as_fd(), &er)?;
                 }
             }
 
@@ -1028,6 +1025,17 @@ impl Client {
         }
     }
 
+    /// Send a datagram, tolerating a full send buffer on the non-blocking socket
+    /// (EWOULDBLOCK): the datagram is simply dropped — the reliability/latest-wins
+    /// layers recover — rather than crashing the session.
+    fn send_dgram(&self, pkt: &[u8]) -> Result<(), RuntimeError> {
+        match self.socket.send_to(pkt, self.server_addr) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Drain a single ready datagram (non-blocking) and send any replies.
     /// Returns true if a datagram was processed.
     pub fn recv_and_handle(&mut self) -> Result<bool, RuntimeError> {
@@ -1035,7 +1043,7 @@ impl Client {
         match self.socket.recv_from(&mut buf) {
             Ok((n, _src)) => {
                 for pkt in self.core.handle_packet(&buf[..n])? {
-                    self.socket.send_to(&pkt, self.server_addr)?;
+                    self.send_dgram(&pkt)?;
                 }
                 Ok(true)
             }
@@ -1052,7 +1060,7 @@ impl Client {
     /// Flush any pending outgoing frames (input, acks, control).
     pub fn flush(&mut self) -> Result<(), RuntimeError> {
         for pkt in self.core.tick() {
-            self.socket.send_to(&pkt, self.server_addr)?;
+            self.send_dgram(&pkt)?;
         }
         Ok(())
     }
@@ -1060,7 +1068,7 @@ impl Client {
     /// Send a keepalive datagram (refreshes NAT, proves liveness while idle).
     pub fn send_keepalive(&mut self) -> Result<(), RuntimeError> {
         if let Some(pkt) = self.core.keepalive() {
-            self.socket.send_to(&pkt, self.server_addr)?;
+            self.send_dgram(&pkt)?;
         }
         Ok(())
     }
