@@ -198,9 +198,11 @@ pub(crate) fn spawn(req: &SpawnRequest) -> Result<PtyHandle, PtyError> {
     };
 
     cmd = cmd
+        .current_dir(&target.dir) // start a login shell in the user's home
         .env("TERM", &req.term)
         .env("HOME", &target.dir)
         .env("USER", &target.name)
+        .env("LOGNAME", &target.name)
         .env("SHELL", &shell);
     for (k, v) in &req.env {
         cmd = cmd.env(k, v);
@@ -250,6 +252,27 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("hello-pty"), "got: {s:?}");
         assert_eq!(h.wait().unwrap(), 0);
+    }
+
+    #[test]
+    fn spawn_starts_in_the_user_home_directory() {
+        // A login session must start in $HOME, not wherever the daemon's CWD is.
+        let home = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap()
+            .dir;
+        let login = LocalLogin;
+        let req = SpawnRequest {
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "pwd".into()]),
+            ..Default::default()
+        };
+        let mut h = login.spawn(&req).unwrap();
+        let out = read_to_end(&mut h);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains(&*home.to_string_lossy()),
+            "expected cwd {home:?} in output, got: {s:?}"
+        );
     }
 
     #[test]

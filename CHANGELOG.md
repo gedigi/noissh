@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7]
+
+### Fixed
+
+- **Login sessions now start in `$HOME`.** The spawned shell/command runs in the
+  user's home directory (and gets `LOGNAME` set) instead of inheriting the
+  daemon's working directory (which the bootstrap's daemonize left at `/`).
+
 ## [0.4.6]
 
 ### Fixed
