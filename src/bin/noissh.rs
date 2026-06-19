@@ -16,7 +16,7 @@ use std::net::ToSocketAddrs;
 use std::process::exit;
 use std::time::Duration;
 
-use auth::{KnownHosts, PublicKey, Tofu};
+use auth::{KnownHosts, PublicKey};
 use noissh::client::Client;
 use noissh::config::{config_dir, load_known_hosts, load_or_generate_keypair, save_known_hosts};
 use noissh::tty::{RawMode, Renderer, terminal_size};
@@ -190,7 +190,6 @@ fn run() -> Result<(), RuntimeError> {
     let dir = config_dir();
     let keypair = load_or_generate_keypair(&dir.join("id"))?;
     let kh_path = dir.join("known_hosts");
-    let mut known = load_known_hosts(&kh_path)?;
 
     let (cols, rows) = terminal_size();
 
@@ -227,9 +226,12 @@ fn run() -> Result<(), RuntimeError> {
             .and_then(|mut a| a.next())
         {
             let label = format!("{host}:{}", args.port);
+            // Direct connections use the persistent known_hosts (TOFU pinning of
+            // standing servers).
+            let known = load_known_hosts(&kh_path)?;
             match Client::connect_with(
                 &keypair,
-                known.clone(),
+                known,
                 label,
                 addr,
                 rows,
@@ -258,24 +260,34 @@ fn run() -> Result<(), RuntimeError> {
 
     if client.is_none() {
         // SSH bootstrap: launch (and, if missing, install) noisshd over SSH.
+        // Default the server's UDP port to the conventional one (`--port`, 51820)
+        // rather than an ephemeral one, so a single firewall rule for that port
+        // covers both direct and bootstrapped sessions. The server falls back to
+        // an ephemeral port only if it's already taken.
+        let server_port = args.server_port.unwrap_or(args.port);
         let boot = ssh::bootstrap(
             &target,
             std::slice::from_ref(&args.server_cmd),
             &keypair.public,
             &args.ssh_args,
             !args.no_install,
-            args.server_port,
+            Some(server_port),
         )?;
-        // The server key arrived over the authenticated SSH channel: pin it
-        // under the host:port label so the UDP handshake validates.
+        // The server key arrived over the authenticated SSH channel. It's an
+        // ephemeral one-shot key (different every connect), so trust it for THIS
+        // session only — pin it in a fresh, in-memory known_hosts that is never
+        // persisted. (Persisting it under a fixed --server-port label would look
+        // like a host-key change on the next connect.) It still protects the UDP
+        // handshake: an attacker who can't produce the SSH-delivered key can't
+        // impersonate the server.
         let udp_port = boot.server_addr.port();
         let label = format!("{host}:{udp_port}");
-        pin_key(&mut known, &label, &boot.server_pubkey)?;
-        save_known_hosts(&kh_path, &known)?;
+        let mut boot_known = KnownHosts::new();
+        boot_known.check_or_add(&label, &PublicKey::from_bytes(&boot.server_pubkey)?);
         client = Some(
             Client::connect_with(
                 &keypair,
-                known,
+                boot_known,
                 label,
                 boot.server_addr,
                 rows,
@@ -323,15 +335,6 @@ fn run() -> Result<(), RuntimeError> {
         )
     } else {
         interactive_loop(&mut client)
-    }
-}
-
-/// Pin a key under a label, hard-failing on mismatch (used after SSH bootstrap).
-fn pin_key(known: &mut KnownHosts, label: &str, pubkey: &[u8]) -> Result<(), RuntimeError> {
-    let key = PublicKey::from_bytes(pubkey)?;
-    match known.check_or_add(label, &key) {
-        Tofu::Mismatch => Err(RuntimeError::HostKeyMismatch(label.to_string())),
-        _ => Ok(()),
     }
 }
 

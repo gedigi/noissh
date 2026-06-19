@@ -141,14 +141,9 @@ fn serve_verbose(server: &mut Server) {
 fn run_one_shot(args: Args) -> Result<(), RuntimeError> {
     // Ephemeral key; trust only the client key passed over the SSH channel.
     let keypair = noise_core::generate_keypair()?;
-    let mut authorized = AuthorizedKeys::new();
-    if let Some(b64) = &args.authorize {
-        let raw = STANDARD.decode(b64).map_err(|_| RuntimeError::BadKeyFile)?;
-        let key = PublicKey::from_bytes(&raw)?;
-        authorized.add(key, "ssh-bootstrap");
-    } else {
-        return Err(RuntimeError::SshBootstrap);
-    }
+    let authorize_b64 = args.authorize.clone().ok_or(RuntimeError::SshBootstrap)?;
+    // Validate the client key up front (fail fast on a bad value).
+    PublicKey::from_bytes(&STANDARD.decode(&authorize_b64).map_err(|_| RuntimeError::BadKeyFile)?)?;
 
     let bind: SocketAddr = args
         .bind
@@ -157,11 +152,31 @@ fn run_one_shot(args: Args) -> Result<(), RuntimeError> {
         .parse()
         .map_err(|_| RuntimeError::BadKeyFile)?;
 
-    let mut core = ServerCore::local(keypair.clone(), authorized);
-    if let Some(cmd) = args.command {
-        core = core.with_command(cmd);
-    }
-    let mut server = Server::bind(bind, core)?;
+    // Build a fresh core (Server::bind consumes it, so we need one per attempt).
+    let make_core = || -> Result<ServerCore, RuntimeError> {
+        let mut authorized = AuthorizedKeys::new();
+        let raw = STANDARD
+            .decode(&authorize_b64)
+            .map_err(|_| RuntimeError::BadKeyFile)?;
+        authorized.add(PublicKey::from_bytes(&raw)?, "ssh-bootstrap");
+        let mut core = ServerCore::local(keypair.clone(), authorized);
+        if let Some(cmd) = &args.command {
+            core = core.with_command(cmd.clone());
+        }
+        Ok(core)
+    };
+
+    // Bind the requested port; if it's already taken (e.g. a concurrent session),
+    // fall back to an ephemeral port so the bootstrap still succeeds. The actual
+    // port is reported in the connect line, so the client always reaches us.
+    let mut server = match Server::bind(bind, make_core()?) {
+        Ok(s) => s,
+        Err(_) if bind.port() != 0 => {
+            let eph: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            Server::bind(eph, make_core()?)?
+        }
+        Err(e) => return Err(e),
+    };
     let port = server.local_addr()?.port();
 
     // Hand the port + pubkey back over SSH, then detach so SSH can return.

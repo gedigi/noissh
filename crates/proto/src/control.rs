@@ -37,6 +37,10 @@ pub enum ControlMsg {
     /// Client → server: please listen on `bind_port` and forward accepted
     /// connections back to the client, which connects them to `target` (`-R`).
     RemoteForward { bind_port: u16, target: String },
+    /// Client → server: the client is done; tear the session down now (rather
+    /// than waiting for the idle-reap grace). Sent on clean completion of a
+    /// non-interactive task (e.g. `--exec` or a file transfer).
+    Bye,
 }
 
 const M_OPEN_SHELL: u8 = 1;
@@ -44,6 +48,7 @@ const M_RESIZE: u8 = 2;
 const M_EXIT: u8 = 3;
 // Tags 4 and 5 were a never-wired second-factor prompt/response; left reserved.
 const M_REMOTE_FORWARD: u8 = 6;
+const M_BYE: u8 = 7;
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u64);
@@ -100,6 +105,7 @@ impl ControlMsg {
                 put_varint(&mut out, *bind_port as u64);
                 put_str(&mut out, target);
             }
+            ControlMsg::Bye => out.push(M_BYE),
         }
         out
     }
@@ -135,6 +141,7 @@ impl ControlMsg {
                 let target = get_str(buf, &mut pos)?;
                 ControlMsg::RemoteForward { bind_port, target }
             }
+            M_BYE => ControlMsg::Bye,
             other => return Err(ControlError::Unknown(other)),
         })
     }
@@ -173,6 +180,7 @@ mod tests {
             bind_port: 8080,
             target: "127.0.0.1:80".into(),
         });
+        roundtrip(ControlMsg::Bye);
     }
 
     #[test]

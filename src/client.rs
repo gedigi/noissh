@@ -142,6 +142,15 @@ impl ClientCore {
         });
     }
 
+    /// Queue a `Bye` so the server tears the session down promptly (best-effort;
+    /// the server's idle reap is the fallback if it's lost). Sent on clean
+    /// completion of a one-shot task like `--exec` or a file transfer.
+    pub fn send_bye(&mut self) {
+        self.pending_control.push(Frame::Control {
+            data: ControlMsg::Bye.encode(),
+        });
+    }
+
     /// The authoritative screen.
     pub fn screen(&self) -> &Grid {
         self.shell.screen()
@@ -857,6 +866,7 @@ impl Client {
                 // Done once the server acknowledges by closing its half back.
                 if sent_fin && self.core.stream_recv_finished(id) {
                     self.flush()?;
+                    self.say_bye();
                     return Ok(());
                 }
             }
@@ -873,6 +883,7 @@ impl Client {
                 if self.core.stream_recv_finished(id) {
                     self.core.stream_close(id);
                     self.flush()?;
+                    self.say_bye();
                     // Atomically move the completed download into place. (On an
                     // error return below, the sink is dropped and the temp file
                     // is discarded — the destination is never clobbered.)
@@ -999,8 +1010,21 @@ impl Client {
                 && stdout_done
                 && stderr_done
             {
+                self.say_bye();
                 return Ok(code);
             }
+        }
+    }
+
+    /// Best-effort: tell the server we're done so a one-shot tears down promptly
+    /// (the server's idle reap is the fallback if the packet is lost). Spends a
+    /// few milliseconds pushing it out.
+    fn say_bye(&mut self) {
+        self.core.send_bye();
+        for _ in 0..6 {
+            let _ = self.flush();
+            let _ = self.recv_and_handle();
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 

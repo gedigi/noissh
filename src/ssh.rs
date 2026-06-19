@@ -208,6 +208,17 @@ pub fn bootstrap(
     )? {
         Attempt::Connected(b) => Ok(b),
         Attempt::NotFound if auto_install && is_default_server_cmd(remote_server_cmd) => {
+            // It may already be installed at our known location but simply not on
+            // the non-interactive PATH — try that before re-downloading.
+            if let Attempt::Connected(b) = attempt(
+                target,
+                &installed_noisshd_cmd(),
+                client_pubkey,
+                extra_ssh_args,
+                bind_port,
+            )? {
+                return Ok(b);
+            }
             eprintln!(
                 "noissh: noisshd is not installed on {}; installing it over SSH…",
                 host_of(target)

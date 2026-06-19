@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5]
+
+### Changed
+
+- **The SSH bootstrap now uses the conventional UDP port by default** (`--port`,
+  51820) instead of a random ephemeral one, so a single firewall rule covers
+  both direct and bootstrapped sessions. The server falls back to an ephemeral
+  port only if the conventional one is already taken. `--server-port N` still
+  overrides.
+- **The bootstrap key is no longer persisted to `known_hosts`.** It's an
+  ephemeral, SSH-authenticated key; persisting it under a fixed `--server-port`
+  label caused a spurious "HOST KEY MISMATCH" on the next connect. It's now
+  trusted per-session (still validating the UDP handshake).
+
+### Fixed
+
+- **The bootstrap no longer re-downloads `noisshd` on every connect**: it tries
+  the known install path (`~/.local/bin/noisshd`) before falling back to a
+  reinstall (the binary isn't on the non-interactive SSH `PATH`).
+- **One-shot servers now exit promptly after a non-interactive task.** A client
+  finishing `--exec` or a file transfer sends a `Bye`, so the one-shot tears
+  down (freeing its UDP port) instead of lingering until the idle-reap grace.
+
 ## [0.4.4]
 
 ### Added

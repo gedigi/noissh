@@ -411,6 +411,15 @@ impl ServerCore {
             ControlMsg::RemoteForward { bind_port, target } => {
                 self.remote_forward_requests.push((sid, bind_port, target));
             }
+            ControlMsg::Bye => {
+                // The client is done: mark the session finished so it is reclaimed
+                // promptly (and a one-shot server exits) instead of waiting out
+                // the idle-reap grace.
+                if let Some(sess) = self.sessions.get_mut(&sid) {
+                    sess.exit_status.get_or_insert(0);
+                    sess.exit_ticks = 0;
+                }
+            }
             _ => {}
         }
     }
