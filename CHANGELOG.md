@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8]
+
+### Fixed
+
+- **Roaming survives network changes again.** A failed UDP send (no route /
+  network down while switching Wi-Fi/cellular or sleeping) and a corrupt, stale,
+  or replayed datagram are now dropped instead of being fatal, so the session
+  rides out the outage and resumes — roaming to the new address — once
+  connectivity returns, rather than disconnecting.
+- **No more spurious "HOST KEY MISMATCH" in auto mode.** `noissh host` now only
+  attempts a direct connection when a standing server is already pinned for that
+  host:port; otherwise it goes straight to the SSH bootstrap. This avoids
+  pinning (or mismatching) the ephemeral key of a transient one-shot server that
+  happens to be on the conventional port. `--direct` still forces a direct,
+  trust-on-first-use connection.
+- **`--exec` runs in your home directory** (matching the interactive shell),
+  instead of the daemon's working directory.
+
 ## [0.4.7]
 
 ### Fixed

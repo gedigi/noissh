@@ -62,15 +62,21 @@ pub struct ExecProc {
 }
 
 impl ExecProc {
-    /// Spawn `cmd` via `/bin/sh -c` with piped, non-blocking stdio.
+    /// Spawn `cmd` via `/bin/sh -c` with piped, non-blocking stdio, running in
+    /// the user's home directory (like a login would) rather than the daemon's
+    /// working directory.
     pub fn spawn(cmd: &str) -> std::io::Result<Self> {
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
+            command.current_dir(&user.dir);
+        }
+        let mut child = command.spawn()?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

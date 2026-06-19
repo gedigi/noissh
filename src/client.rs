@@ -211,7 +211,12 @@ impl ClientCore {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
-        let frames = session.open(self.server_addr, buf)?;
+        // A transport packet that fails to authenticate/decrypt — forged, stale,
+        // replayed, or arriving out of order while roaming — is dropped, never
+        // fatal to the session.
+        let Ok(frames) = session.open(self.server_addr, buf) else {
+            return Ok(());
+        };
         for frame in frames {
             match frame {
                 Frame::StateDiff { seq, base, data } => {
@@ -1025,35 +1030,34 @@ impl Client {
         }
     }
 
-    /// Send a datagram, tolerating a full send buffer on the non-blocking socket
-    /// (EWOULDBLOCK): the datagram is simply dropped — the reliability/latest-wins
-    /// layers recover — rather than crashing the session.
+    /// Send a datagram. A send failure is NEVER fatal: a full send buffer
+    /// (EWOULDBLOCK) or a transient network outage (no route / network down,
+    /// e.g. while roaming between Wi-Fi and cellular) just drops the datagram —
+    /// the reliability/latest-wins layers retransmit, and the session resumes
+    /// (and roams to the new address) once connectivity returns.
     fn send_dgram(&self, pkt: &[u8]) -> Result<(), RuntimeError> {
-        match self.socket.send_to(pkt, self.server_addr) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        let _ = self.socket.send_to(pkt, self.server_addr);
+        Ok(())
     }
 
     /// Drain a single ready datagram (non-blocking) and send any replies.
-    /// Returns true if a datagram was processed.
+    /// Returns true if a datagram was processed. Receive errors are treated as
+    /// "nothing right now" (transient) rather than fatal, so a network outage
+    /// doesn't tear the session down.
     pub fn recv_and_handle(&mut self) -> Result<bool, RuntimeError> {
         let mut buf = [0u8; 65536];
         match self.socket.recv_from(&mut buf) {
             Ok((n, _src)) => {
+                // `?` so a handshake-time failure (e.g. HOST KEY MISMATCH) still
+                // aborts; transport-layer junk is dropped inside handle_packet.
                 for pkt in self.core.handle_packet(&buf[..n])? {
                     self.send_dgram(&pkt)?;
                 }
                 Ok(true)
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(e.into()),
+            // Any receive error (would-block, timed out, or a transient
+            // network-down/unreachable during roaming) means "no data now".
+            Err(_) => Ok(false),
         }
     }
 

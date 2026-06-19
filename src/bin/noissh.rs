@@ -219,20 +219,25 @@ fn run() -> Result<(), RuntimeError> {
     let host = ssh::host_of(&target).to_string();
     let mut client = None;
 
-    if !args.ssh {
+    let label = format!("{host}:{}", args.port);
+    let known = load_known_hosts(&kh_path)?;
+    // Only attempt a direct connection when explicitly asked (`--direct`) or when
+    // we already trust a standing server on this host:port (a known_hosts pin).
+    // Otherwise go straight to the SSH bootstrap: the conventional port may be
+    // hosting a transient, ephemeral-keyed one-shot from another session, and a
+    // direct probe would either mis-pin its key or spuriously mismatch.
+    let try_direct = args.direct || (!args.ssh && known.get(&label).is_some());
+
+    if try_direct {
         if let Some(addr) = (host.as_str(), args.port)
             .to_socket_addrs()
             .ok()
             .and_then(|mut a| a.next())
         {
-            let label = format!("{host}:{}", args.port);
-            // Direct connections use the persistent known_hosts (TOFU pinning of
-            // standing servers).
-            let known = load_known_hosts(&kh_path)?;
             match Client::connect_with(
                 &keypair,
                 known,
-                label,
+                label.clone(),
                 addr,
                 rows,
                 cols,
@@ -242,10 +247,11 @@ fn run() -> Result<(), RuntimeError> {
                 DIRECT_CONNECT_TIMEOUT,
             ) {
                 Ok(c) => client = Some(c),
-                // No daemon answered in time: fall back to SSH (unless forbidden).
+                // The known standing server didn't answer: fall back to SSH
+                // (unless the user demanded a direct connection).
                 Err(RuntimeError::Timeout) if !args.direct => {
                     eprintln!(
-                        "noissh: no direct response on udp/{}; bootstrapping over SSH…",
+                        "noissh: the server on udp/{} didn't answer; bootstrapping over SSH…",
                         args.port
                     );
                 }
