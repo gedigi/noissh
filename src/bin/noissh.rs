@@ -80,6 +80,49 @@ fn parse_dynamic(s: &str) -> Option<(String, u16)> {
     }
 }
 
+fn print_help() {
+    println!(
+        "noissh {ver} — resilient remote shell over the Noise Protocol
+
+Usage:
+  noissh [OPTIONS] [user@]host [command ...]
+  noissh [OPTIONS] [user@]host -- <ssh args ...>
+
+By default noissh tries a direct UDP session to a standing noisshd on the host
+(trusting it on first use); if nothing answers it automatically bootstraps over
+SSH, launching (and, if missing, installing) noisshd on the remote.
+
+Anything after the host is run as a one-shot remote command (ssh-style), then
+noissh exits with its status. Omit it for an interactive shell.
+
+Options:
+  --ssh                 force the SSH bootstrap (skip the direct probe)
+  --direct              direct connection only; never fall back to SSH
+  --port N              UDP port for the direct connection (default 51820)
+  --server-port N       pin the bootstrapped server's UDP port (firewall-friendly)
+  --server-cmd CMD      remote server command for --ssh (default \"noisshd\")
+  --no-install          do not auto-install noisshd on the remote if missing
+  -L LPORT:HOST:PORT    local port forward (repeatable); implies no shell
+  -R RPORT:HOST:PORT    remote port forward (repeatable); implies no shell
+  -D [BIND:]PORT        dynamic SOCKS forward (repeatable); implies no shell
+  --put LOCAL:REMOTE    upload LOCAL to REMOTE, then exit
+  --get REMOTE:LOCAL    download REMOTE to LOCAL, then exit
+  -A, --forward-agent   forward your local SSH agent to the shell session
+  -- <ssh args ...>     pass remaining args to ssh (only with the bootstrap)
+  -h, --help            print this help and exit
+  -V, --version         print the version and exit
+
+Examples:
+  noissh user@host                 # interactive shell
+  noissh user@host uname -a        # run one command, then exit
+  noissh --ssh user@host           # force the SSH bootstrap
+  noissh user@host -L 8080:localhost:80
+
+Docs: https://github.com/gedigi/noissh#documentation",
+        ver = env!("CARGO_PKG_VERSION"),
+    );
+}
+
 fn parse_args() -> Args {
     let mut a = Args {
         ssh: false,
@@ -108,6 +151,14 @@ fn parse_args() -> Args {
             break;
         }
         match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                exit(0);
+            }
+            "-V" | "--version" => {
+                println!("noissh {}", env!("CARGO_PKG_VERSION"));
+                exit(0);
+            }
             "--ssh" => a.ssh = true,
             "--direct" => a.direct = true,
             "--no-install" => a.no_install = true,

@@ -37,6 +37,35 @@ struct Args {
     verbose: bool,
 }
 
+fn print_help() {
+    println!(
+        "noisshd {ver} — the noissh server daemon
+
+Usage:
+  noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--command CMD ...]
+  noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
+
+Modes:
+  standalone (default)  persistent key + authorized_keys; serves many sessions.
+  --one-shot            ephemeral key, trust one client key, serve one session,
+                        then exit. Used by the client's SSH bootstrap.
+
+Options:
+  --listen ADDR         UDP listen address (default 0.0.0.0:51820)
+  --bind ADDR           one-shot: UDP bind address (default 0.0.0.0:0)
+  --key PATH            server keypair path (standalone)
+  --authorized-keys P   authorized client keys path (standalone)
+  --authorize B64       one-shot: the single client public key to trust
+  --command CMD ...     run CMD instead of a login shell (rest of argv)
+  -v, --verbose         log session lifecycle events
+  -h, --help            print this help and exit
+  -V, --version         print the version and exit
+
+Docs: https://github.com/gedigi/noissh#documentation",
+        ver = env!("CARGO_PKG_VERSION"),
+    );
+}
+
 fn parse_args() -> Args {
     let mut a = Args {
         one_shot: false,
@@ -51,6 +80,14 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                exit(0);
+            }
+            "-V" | "--version" => {
+                println!("noisshd {}", env!("CARGO_PKG_VERSION"));
+                exit(0);
+            }
             "--one-shot" => a.one_shot = true,
             "-v" | "--verbose" => a.verbose = true,
             "--listen" => a.listen = it.next(),

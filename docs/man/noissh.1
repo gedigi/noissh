@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-06-19" "noissh 0.4.9" "User Commands"
+.TH NOISSH 1 "2026-06-19" "noissh 0.4.10" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -186,6 +186,12 @@ With
 .BR \-\-ssh ,
 pass all remaining arguments verbatim to
 .BR ssh (1).
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
 .SH AUTHENTICATION
 On first contact the server's static public key is pinned (trust on first use)
 in

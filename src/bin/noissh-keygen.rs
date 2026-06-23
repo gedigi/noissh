@@ -45,6 +45,10 @@ fn run() -> Result<(), RuntimeError> {
                 println!("{USAGE}");
                 return Ok(());
             }
+            "--version" | "-V" => {
+                println!("noissh-keygen {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "--key" => match it.next() {
                 Some(p) => key_path = Some(PathBuf::from(p)),
                 None => {
