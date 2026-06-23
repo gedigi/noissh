@@ -1,4 +1,4 @@
-//! Real-socket end-to-end test of `--exec`: the client opens an exec stream for
+//! Real-socket end-to-end test of remote commands: the client opens an exec stream for
 //! a command; the server runs it under pipes and streams stdout, stderr, and the
 //! exit code back. Driven via `ClientCore` so output and the code can be asserted
 //! without touching process stdio.

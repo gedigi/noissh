@@ -24,6 +24,11 @@ pub struct Grid {
     saved: Option<(usize, usize, Cell)>,
     alt_screen: bool,
     alt_saved: Option<Vec<Cell>>,
+
+    // Transient terminal-query replies (DSR/DA) queued for write-back to the
+    // shell. Not part of the rendered screen: excluded from `render_eq` and
+    // drained by the server each tick, so clones into history are always empty.
+    responses: Vec<u8>,
 }
 
 impl Grid {
@@ -45,7 +50,13 @@ impl Grid {
             saved: None,
             alt_screen: false,
             alt_saved: None,
+            responses: Vec::new(),
         }
+    }
+
+    /// Drain queued terminal-query replies (DSR/DA) for write-back to the shell.
+    pub fn take_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.responses)
     }
 
     #[inline]
@@ -564,6 +575,35 @@ impl Perform for Grid {
             'm' => self.set_sgr(params),
             'h' if private => self.set_private_mode(arg_raw(params, 0, 0), true),
             'l' if private => self.set_private_mode(arg_raw(params, 0, 0), false),
+            // Device Status Report. A shell's line editor queries this at startup
+            // and blocks until it gets a reply; without one the prompt only
+            // appears after the first keystroke. The reply is written back to the
+            // shell by the server (it is not screen output).
+            'n' => match (private, arg_raw(params, 0, 0)) {
+                (false, 5) => self.responses.extend_from_slice(b"\x1b[0n"), // terminal OK
+                (_, 6) => {
+                    // Cursor Position Report: ESC[<row>;<col>R (1-based). The DEC
+                    // private form (ESC[?6n, DECXCPR) expects a leading '?'.
+                    let report = format!(
+                        "\x1b[{}{};{}R",
+                        if private { "?" } else { "" },
+                        self.cursor_row + 1,
+                        self.cursor_col + 1
+                    );
+                    self.responses.extend_from_slice(report.as_bytes());
+                }
+                _ => {}
+            },
+            // Device Attributes — also queried at startup by some shells/prompts.
+            'c' if intermediates.first() == Some(&b'>') => {
+                // Secondary DA: terminal id / firmware. Report a VT100-class
+                // terminal (Pp=0), which is enough to unblock a line editor.
+                self.responses.extend_from_slice(b"\x1b[>0;0;0c");
+            }
+            'c' if intermediates.is_empty() => {
+                // Primary DA: identify as a VT100 with Advanced Video Option.
+                self.responses.extend_from_slice(b"\x1b[?1;2c");
+            }
             _ => {}
         }
     }
@@ -633,6 +673,11 @@ impl Terminal {
         &self.grid
     }
 
+    /// Drain queued terminal-query replies (DSR/DA) for write-back to the shell.
+    pub fn take_responses(&mut self) -> Vec<u8> {
+        self.grid.take_responses()
+    }
+
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.grid.resize(rows, cols);
     }
@@ -674,6 +719,41 @@ mod tests {
         let t = run(b"a\tb");
         // 'a' at col 0, tab -> col 8, 'b' at col 8
         assert_eq!(t.screen().cell(0, 8).ch, 'b');
+    }
+
+    #[test]
+    fn dsr_cursor_position_report_is_answered() {
+        // A real shell's line editor queries the cursor position (ESC[6n) at
+        // startup and waits for the reply before drawing its prompt. We must
+        // answer with ESC[<row>;<col>R (1-based).
+        let mut t = Terminal::new(10, 40);
+        t.advance(b"hello"); // cursor now at row 1, col 6 (1-based)
+        t.advance(b"\x1b[6n");
+        assert_eq!(t.take_responses(), b"\x1b[1;6R");
+        // Draining returns it once.
+        assert!(t.take_responses().is_empty());
+    }
+
+    #[test]
+    fn dsr_status_report_is_answered() {
+        let mut t = Terminal::new(10, 40);
+        t.advance(b"\x1b[5n");
+        assert_eq!(t.take_responses(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn primary_device_attributes_is_answered() {
+        // ESC[c (or ESC[0c) — primary DA. Reply as a VT100-class terminal.
+        let mut t = Terminal::new(10, 40);
+        t.advance(b"\x1b[c");
+        assert_eq!(t.take_responses(), b"\x1b[?1;2c");
+    }
+
+    #[test]
+    fn secondary_device_attributes_is_answered() {
+        let mut t = Terminal::new(10, 40);
+        t.advance(b"\x1b[>c");
+        assert_eq!(t.take_responses(), b"\x1b[>0;0;0c");
     }
 
     #[test]

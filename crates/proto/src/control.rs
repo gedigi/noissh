@@ -39,7 +39,7 @@ pub enum ControlMsg {
     RemoteForward { bind_port: u16, target: String },
     /// Client → server: the client is done; tear the session down now (rather
     /// than waiting for the idle-reap grace). Sent on clean completion of a
-    /// non-interactive task (e.g. `--exec` or a file transfer).
+    /// non-interactive task (e.g. a remote command or a file transfer).
     Bye,
 }
 

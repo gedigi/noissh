@@ -454,6 +454,14 @@ impl ServerCore {
                         Ok(n) => {
                             if let Some(shell) = &mut sess.shell {
                                 shell.feed_output(&buf[..n]);
+                                // Answer terminal queries (DSR/DA) the shell sent
+                                // by writing the replies straight back to its
+                                // input, so a line editor doesn't stall its first
+                                // prompt waiting for a response.
+                                let reply = shell.take_responses();
+                                if !reply.is_empty() {
+                                    let _ = pty.write(&reply);
+                                }
                             }
                         }
                         Err(PtyError::WouldBlock) => break, // no data ready now
@@ -637,7 +645,7 @@ pub struct Server {
     /// (session, stream id).
     agent_conns:
         HashMap<(SessionId, u64), crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
-    /// Running `--exec` commands, keyed by (session, stdin/stdout stream id).
+    /// Running remote commands, keyed by (session, stdin/stdout stream id).
     execs: HashMap<(SessionId, u64), ExecState>,
 }
 
@@ -647,7 +655,7 @@ enum XferState {
     Get(crate::xfer::FileSource),
 }
 
-/// Server side of a running `--exec` command. `err_id` is the separate stream
+/// Server side of a running remote command. `err_id` is the separate stream
 /// carrying the command's stderr to the client.
 struct ExecState {
     proc: crate::exec::ExecProc,
@@ -1073,7 +1081,7 @@ impl Server {
             }
         }
 
-        // Pump `--exec` commands: command stdout → its stream, stderr → the
+        // Pump remote commands: command stdout → its stream, stderr → the
         // sibling stream, client stream → command stdin, exit code on close.
         // Drop any whose session has gone away (kill the child first).
         let ekeys: Vec<(SessionId, u64)> = self.execs.keys().copied().collect();

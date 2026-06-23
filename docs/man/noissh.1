@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-06-19" "noissh 0.4.4" "User Commands"
+.TH NOISSH 1 "2026-06-19" "noissh 0.4.9" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -12,9 +12,8 @@ noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .RB [ \-\-no\-install ]
 .RB [ \-D
 .IR SPEC ]
-.RB [ \-\-exec
-.IR CMD ]
 .RI [ user @] host
+.RI [ command "" ...]
 .RB [ \-\-
 .IR "ssh args" ...]
 .SH DESCRIPTION
@@ -135,14 +134,18 @@ host and port each client requests, resolved via the server. The proxy speaks
 SOCKS5 (no authentication) and SOCKS4/4a, CONNECT only. May be repeated. Implies
 forward\-only (no shell).
 .TP
-.BI \-\-exec " CMD"
-Run
-.I CMD
-on the server non\-interactively instead of opening a shell, then exit. The
+.I command ...
+Any words after
+.RI [ user @] host
+are run as a single command on the server non\-interactively (ssh\-style) instead
+of opening a shell, then exit. The words are joined and interpreted by the remote
+shell, so quoting, globs, pipes, and redirections take effect there. The
 command's standard output and standard error are streamed separately to yours,
 your standard input is forwarded until EOF, and noissh exits with the command's
 exit status. Output is byte\-for\-byte (no PTY/terminal processing), so it is safe
-to redirect or pipe. Mutually exclusive with an interactive shell. Refused by a
+to redirect or pipe. The remote command's own flags are not parsed by
+.BR noissh .
+Mutually exclusive with an interactive shell. Refused by a
 standalone daemon configured with a
 .B \-\-user
 privilege drop.
@@ -219,7 +222,7 @@ Dynamic SOCKS proxy on a local port:
 .B noissh --ssh user@server -D 1080
 .TP
 Run a single remote command:
-.B noissh --ssh user@server --exec "uname -a"
+.B noissh --ssh user@server uname -a
 .TP
 Interactive shell with agent forwarding:
 .B noissh --ssh user@server -A

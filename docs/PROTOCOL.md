@@ -113,7 +113,7 @@ bytes. Signed integers use zig-zag varint encoding.
 | `0x20` | `Control` | `data: bytes` (a control message, section 6) |
 
 `StreamKind`: `0 = Session`, `1 = Forward` (`-L`/`-R`/`-D`), `2 = FileTransfer`
-(`--put`/`--get`), `3 = Agent` (`-A`), `4 = Exec` (`--exec`).
+(`--put`/`--get`), `3 = Agent` (`-A`), `4 = Exec` (trailing `noissh user@host <cmd>`).
 
 Unknown frame types and truncated fields are hard decode errors (the whole
 datagram is dropped). The decoder is fuzzed and never panics on arbitrary input.

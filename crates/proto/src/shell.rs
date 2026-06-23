@@ -62,6 +62,14 @@ impl ServerShell {
         self.term.advance(bytes);
     }
 
+    /// Drain terminal-query replies (DSR/DA) the emulator produced while parsing
+    /// output. These must be written back to the shell's input: a line editor
+    /// blocks on these at startup, so without them the prompt only renders after
+    /// the first keystroke.
+    pub fn take_responses(&mut self) -> Vec<u8> {
+        self.term.take_responses()
+    }
+
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.term.resize(rows, cols);
     }

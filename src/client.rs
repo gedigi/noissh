@@ -144,7 +144,7 @@ impl ClientCore {
 
     /// Queue a `Bye` so the server tears the session down promptly (best-effort;
     /// the server's idle reap is the fallback if it's lost). Sent on clean
-    /// completion of a one-shot task like `--exec` or a file transfer.
+    /// completion of a one-shot task like a remote command or a file transfer.
     pub fn send_bye(&mut self) {
         self.pending_control.push(Frame::Control {
             data: ControlMsg::Bye.encode(),

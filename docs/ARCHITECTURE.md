@@ -57,7 +57,7 @@ crates/
   pty/         PTY allocation + login-shell launching (safe, via pty-process)
   proto/       handshake driver, control channel, state-sync plane, xfer request
 src/           runtime (client/server cores + UDP drivers), config, tty, ssh,
-               forward (TCP/Unix), socks (-D), exec (--exec), xfer (file I/O)
+               forward (TCP/Unix), socks (-D), exec (remote command), xfer (file I/O)
 src/bin/       noissh (client), noisshd (server), noissh-keygen (key tool)
 ```
 
@@ -138,6 +138,13 @@ it just applies cell/cursor diffs and paints predictions on top. Prediction is
 **adaptive** — it only displays once the server has confirmed an echo, which
 naturally suppresses predictions at non-echoing prompts (passwords).
 
+Because the emulator is authoritative, it also answers the terminal-status
+queries a shell's line editor sends at startup — cursor-position report
+(`ESC[6n`) and device attributes (`ESC[c`/`ESC[>c`) — by writing the reply
+straight back to the shell. A line editor blocks on these before drawing its
+first prompt, so answering them is what makes the prompt appear immediately
+rather than after the first keystroke.
+
 ## Reliable streams and the SSH-rich feature set
 
 Alongside the latest-wins interactive plane, `transport::StreamMux` provides
@@ -157,8 +164,9 @@ concurrently with the shell:
   renamed on success.
 - **Agent forwarding** — `-A` exposes `SSH_AUTH_SOCK` on the server, tunnelling
   agent connections back to the client's local agent.
-- **Remote command execution** — `--exec` runs a command under pipes (byte-exact
-  stdout, separate stderr, exit code in the stream's close status).
+- **Remote command execution** — a trailing `noissh user@host <cmd>` runs a
+  command under pipes (byte-exact stdout, separate stderr, exit code in the
+  stream's close status).
 
 The handshake is padded/floored to prevent UDP reflection/amplification (see
 [PROTOCOL.md](PROTOCOL.md) and [SECURITY.md](SECURITY.md)).

@@ -50,8 +50,9 @@ struct Args {
     forward_agent: bool,
     /// Disable auto-installing noisshd on the remote during `--ssh` bootstrap.
     no_install: bool,
-    /// Run a non-interactive remote command instead of an interactive shell.
-    exec: Option<String>,
+    /// Trailing positional command (ssh-style: `noissh host cmd args...`). Empty
+    /// means an interactive shell.
+    command: Vec<String>,
     /// Force a direct UDP connection only (never fall back to the SSH bootstrap).
     direct: bool,
     /// Pin the bootstrapped server's UDP port (so it can be opened in a firewall)
@@ -92,23 +93,24 @@ fn parse_args() -> Args {
         transfer: None,
         forward_agent: false,
         no_install: false,
-        exec: None,
+        command: Vec::new(),
         direct: false,
         server_port: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
+        // ssh-style: once the host is known, the rest is the remote command,
+        // verbatim (so its own flags aren't parsed by noissh). `--` is still the
+        // escape that introduces ssh passthrough args.
+        if a.target.is_some() && arg != "--" {
+            a.command.push(arg);
+            a.command.extend(it.by_ref());
+            break;
+        }
         match arg.as_str() {
             "--ssh" => a.ssh = true,
             "--direct" => a.direct = true,
             "--no-install" => a.no_install = true,
-            "--exec" => {
-                if let Some(c) = it.next() {
-                    a.exec = Some(c);
-                } else {
-                    eprintln!("noissh: --exec wants a command string");
-                }
-            }
             "-A" | "--forward-agent" => a.forward_agent = true,
             "--port" => {
                 if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
@@ -174,8 +176,10 @@ fn parse_args() -> Args {
             },
             "--" => a.ssh_args = it.by_ref().collect(),
             other => {
-                if a.target.is_none() {
+                if a.target.is_none() && !other.starts_with('-') {
                     a.target = Some(other.to_string());
+                } else {
+                    eprintln!("noissh: ignoring unknown option {other:?}");
                 }
             }
         }
@@ -198,7 +202,7 @@ fn run() -> Result<(), RuntimeError> {
     let forward_only = !args.local_forwards.is_empty()
         || !args.remote_forwards.is_empty()
         || !args.dynamic_forwards.is_empty();
-    let want_shell = !forward_only && args.transfer.is_none() && args.exec.is_none();
+    let want_shell = !forward_only && args.transfer.is_none() && args.command.is_empty();
     // Agent forwarding only applies to an interactive shell; it needs a local
     // agent ($SSH_AUTH_SOCK) to bridge to.
     let agent_sock = if args.forward_agent && want_shell {
@@ -326,8 +330,10 @@ fn run() -> Result<(), RuntimeError> {
         save_known_hosts(&kh_path, client.core().known_hosts())?;
     }
 
-    if let Some(cmd) = args.exec {
-        let code = client.run_exec(&cmd)?;
+    if !args.command.is_empty() {
+        // ssh-style: run the trailing command and exit with its status. The args
+        // are joined and run via the remote shell (so quoting/redirs behave).
+        let code = client.run_exec(&args.command.join(" "))?;
         exit(code);
     } else if let Some((req, local)) = args.transfer {
         client.run_transfer(&req, &local)?;

@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9]
+
+### Fixed
+
+- **The prompt now appears immediately — no need to press Enter first.** A
+  shell's line editor queries the terminal at startup (cursor-position report,
+  `ESC[6n`, and device-attributes, `ESC[c`) and blocks until it gets a reply
+  before drawing the prompt. The server-side emulator now answers these queries
+  by writing the reply back to the shell, so the first prompt renders right away
+  instead of waiting for a keystroke (whose bytes were previously being consumed
+  as the missing reply).
+
+### Changed
+
+- **Remote commands are now ssh-style positional arguments.** Run a one-off
+  command with `noissh user@host <cmd> [args...]` instead of the old `--exec`
+  flag (which has been removed). Everything after the host is taken as the
+  command verbatim — its own flags are not parsed by noissh — and is joined and
+  run by the remote shell, so quoting, globs, pipes, and redirections behave as
+  expected. As before, output is byte-exact, stderr is kept separate, and noissh
+  exits with the command's status. Omit the command for an interactive shell.
+
 ## [0.4.8]
 
 ### Fixed

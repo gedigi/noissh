@@ -278,11 +278,11 @@ forward-only (no shell), and all forwards may be combined.
 
 ## Remote command execution
 
-`--exec "command"` runs a single command non-interactively on the server
-instead of opening a shell:
+Anything you put after the host is run as a single command non-interactively on
+the server (ssh-style) instead of opening a shell:
 
 ```sh
-noissh --ssh user@server --exec "uname -a"
+noissh --ssh user@server uname -a
 ```
 
 The command's stdout and stderr are streamed separately to yours, your stdin is
@@ -291,10 +291,18 @@ byte-for-byte (no PTY/terminal mangling), so it is safe to redirect into a file
 or use in a pipeline:
 
 ```sh
-noissh --ssh user@server --exec "tar czf - /etc" > etc.tar.gz
+noissh --ssh user@server tar czf - /etc > etc.tar.gz
 ```
 
-Like file transfer and agent forwarding, `--exec` is refused by a standalone
+The trailing words are joined and run by the remote shell, so quoting, globs,
+pipes, and redirections are interpreted there — quote them to protect them from
+your local shell when needed:
+
+```sh
+noissh --ssh user@server 'echo $HOME && uname -a'
+```
+
+Like file transfer and agent forwarding, a remote command is refused by a standalone
 daemon configured with a `--user` privilege drop (see
 [Security](SECURITY.md)); use the SSH-bootstrap model or run the daemon as the
 target user.
@@ -348,7 +356,7 @@ is `0600`, so other local users on the server cannot reach your forwarded agent.
 ### `noissh`
 
 ```
-noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--exec CMD] [-A] [user@]host [-- <ssh args>]
+noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--put SPEC] [--get SPEC] [-A] [user@]host [command ...] [-- <ssh args>]
   --ssh           force the SSH bootstrap (skip the direct probe)
   --direct        direct connection only; never fall back to SSH
   --port N        UDP port for direct connection (default 51820)
@@ -357,12 +365,17 @@ noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC]
   -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
   -R RPORT:HOST:PORT   remote forward (repeatable); implies forward-only
   -D [BIND:]PORT       dynamic SOCKS forward (repeatable); implies forward-only
-  --exec CMD           run CMD on the server non-interactively, then exit
   --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
   --get REMOTE:LOCAL   download REMOTE to LOCAL, then exit (no shell)
   -A, --forward-agent  forward your local auth agent to the shell session
+  command ...     run this command on the server non-interactively (ssh-style),
+                  then exit with its status; omit it for an interactive shell
   -- <args>       pass remaining args to ssh (only with --ssh)
 ```
+
+Everything after `[user@]host` is treated as the remote command, verbatim — its
+own flags are not parsed by noissh. Use `--` before the host's trailing position
+only to pass arguments to `ssh` during the bootstrap.
 
 Port forwarding rides the same resilient session. `-R` listeners bind to
 loopback on the server (forwarded ports are not exposed to the network); `-D`

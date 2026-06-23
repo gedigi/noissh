@@ -72,7 +72,7 @@ impl Write for TtyWriter {
 }
 
 /// Write every byte to `fd`, waiting out `EWOULDBLOCK` (for a possibly
-/// non-blocking stdout/stderr). Used for raw command output (`--exec`).
+/// non-blocking stdout/stderr). Used for raw remote-command output.
 pub fn write_all_fd(fd: std::os::fd::BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
     use nix::errno::Errno;
     while !buf.is_empty() {

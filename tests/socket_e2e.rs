@@ -95,6 +95,106 @@ fn e2e_shell_output_over_udp() {
 }
 
 #[test]
+fn e2e_initial_prompt_appears_without_input() {
+    // Regression: an interactive shell prints its prompt with NO trailing newline
+    // and then blocks reading a line. The client must SEE that prompt without the
+    // user typing anything (the bug was "I have to hit Enter to see the prompt").
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "test");
+
+    let srv = spawn_server(
+        authorized,
+        server_kp,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // Print a prompt (no newline), then block on read — exactly the
+            // shape of a real shell sitting at its first prompt.
+            "printf 'PROMPT> '; read _x; printf 'AFTER\\n'".into(),
+        ],
+    );
+
+    let mut client = Client::connect(
+        &client_kp,
+        KnownHosts::new(),
+        format!("127.0.0.1:{}", srv.addr.port()),
+        srv.addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+    )
+    .unwrap();
+
+    // Pump only (never type): the prompt must arrive purely from server output.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        client.pump_once().unwrap();
+        if client.core().screen().row_text(0).contains("PROMPT>") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial prompt never arrived without input"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(client.core().screen().row_text(0), "PROMPT>");
+}
+
+#[test]
+fn e2e_prompt_after_cursor_query_appears_without_input() {
+    // The real bug: a shell's line editor emits a cursor-position query (ESC[6n)
+    // at startup and BLOCKS reading the reply before drawing its prompt. If the
+    // server never answers, the prompt only appears once the user hits a key
+    // (which is misread as the reply). Here the "shell" queries, reads the 6-byte
+    // reply (ESC[1;1R), then prints its prompt — all without any client input.
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "test");
+
+    let srv = spawn_server(
+        authorized,
+        server_kp,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // Put the tty in raw mode (as a real line editor does), query the
+            // cursor position, consume the exact 6-byte reply from the pty, then
+            // print the prompt. Blocks forever at `dd` if the query is unanswered.
+            "stty raw -echo 2>/dev/null; printf '\\033[6n'; dd bs=1 count=6 >/dev/null 2>&1; printf 'PROMPT> '; sleep 0.3".into(),
+        ],
+    );
+
+    let mut client = Client::connect(
+        &client_kp,
+        KnownHosts::new(),
+        format!("127.0.0.1:{}", srv.addr.port()),
+        srv.addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        client.pump_once().unwrap();
+        if client.core().screen().row_text(0).contains("PROMPT>") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "prompt never arrived: cursor-position query went unanswered"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(client.core().screen().row_text(0), "PROMPT>");
+}
+
+#[test]
 fn e2e_survives_client_rebind_roaming() {
     let server_kp = generate_keypair().unwrap();
     let client_kp = generate_keypair().unwrap();

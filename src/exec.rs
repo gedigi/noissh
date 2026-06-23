@@ -1,7 +1,8 @@
-//! Server-side execution of a non-interactive remote command (`--exec`).
+//! Server-side execution of a non-interactive remote command (the trailing
+//! `noissh user@host <cmd>`).
 //!
 //! Unlike the interactive shell (which allocates a PTY and syncs a terminal
-//! screen), `--exec` runs the command under plain pipes so stdout stays byte-for
+//! screen), a remote command runs under plain pipes so stdout stays byte-for
 //! byte intact (no line-discipline `\n`→`\r\n` translation) — suitable for
 //! piping output into a file. stdout and stderr are kept separate; the exit code
 //! is reported when the command finishes.
@@ -51,7 +52,7 @@ fn status_code(s: std::process::ExitStatus) -> i32 {
     s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
 }
 
-/// A running `--exec` command with non-blocking pipe ends.
+/// A running remote command with non-blocking pipe ends.
 pub struct ExecProc {
     child: Child,
     stdin: Option<ChildStdin>,
