@@ -217,12 +217,17 @@ fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), Runtime
     // neither is available. `$HOME` is expanded by the remote shell.
     // Single-quote the URL in the remote command (defence in depth: the version
     // is a numeric compile-time constant, but quoting keeps it inert regardless).
+    //
+    // Download to a temp file rather than piping `curl | sh`: a pipe reports the
+    // pipeline's exit status (the shell's), so a failed download (e.g. a 404 or
+    // network error) would be masked as success. `set -e` then aborts on a failed
+    // fetch so the caller actually sees the failure.
     let remote = format!(
-        "if command -v curl >/dev/null 2>&1; then \
-           curl -fsSL '{installer}' | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
-         elif command -v wget >/dev/null 2>&1; then \
-           wget -qO- '{installer}' | NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes; \
-         else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi"
+        "set -e; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; \
+         if command -v curl >/dev/null 2>&1; then curl -fsSL '{installer}' -o \"$tmp\"; \
+         elif command -v wget >/dev/null 2>&1; then wget -qO \"$tmp\" '{installer}'; \
+         else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi; \
+         NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh \"$tmp\" --yes"
     );
     let mut cmd = Command::new(ssh_prog());
     cmd.args(extra_ssh_args);
@@ -268,9 +273,7 @@ pub fn bootstrap(
         extra_ssh_args,
         bind_port,
     )? {
-        Attempt::Connected(b) => {
-            maybe_offer_upgrade(target, client_pubkey, extra_ssh_args, bind_port, offer, b)
-        }
+        Attempt::Connected(b) => maybe_offer_upgrade(target, extra_ssh_args, offer, b),
         Attempt::NotFound if auto_install && is_default_server_cmd(remote_server_cmd) => {
             // It may already be installed at our known location but simply not on
             // the non-interactive PATH — try that before re-downloading.
@@ -281,14 +284,7 @@ pub fn bootstrap(
                 extra_ssh_args,
                 bind_port,
             )? {
-                return maybe_offer_upgrade(
-                    target,
-                    client_pubkey,
-                    extra_ssh_args,
-                    bind_port,
-                    offer,
-                    b,
-                );
+                return maybe_offer_upgrade(target, extra_ssh_args, offer, b);
             }
             eprintln!(
                 "noissh: noisshd is not installed on {}; installing it over SSH…",
@@ -315,14 +311,15 @@ pub fn bootstrap(
 }
 
 /// If the connected server reports a version older than this client's, ask the
-/// user (default No) whether to upgrade the remote `noisshd` now. On "yes",
-/// reinstall and reconnect to the upgraded server; otherwise keep the existing
-/// connection. Never prompts when stdin isn't a terminal (scripts/pipelines).
+/// user (default No) whether to upgrade the remote `noisshd`. On "yes", install
+/// the new binary so it takes effect on the *next* connection, and keep using
+/// the already-live session now. We deliberately do NOT reconnect here: the
+/// current one-shot is still holding the pinned UDP port, so a fresh one-shot
+/// would be pushed onto an ephemeral (possibly firewalled) port. Never prompts
+/// when stdin isn't a terminal (scripts/pipelines).
 fn maybe_offer_upgrade(
     target: &str,
-    client_pubkey: &[u8],
     extra_ssh_args: &[String],
-    bind_port: Option<u16>,
     offer: bool,
     b: Bootstrap,
 ) -> Result<Bootstrap, RuntimeError> {
@@ -342,35 +339,16 @@ fn maybe_offer_upgrade(
     if !prompt_yes_no(&question) {
         return Ok(b); // keep the existing (older) server
     }
-    // If the install itself fails (fast: no curl/wget, network error), the
-    // original one-shot is almost certainly still within its grace window, so
-    // fall back to it and connect to the existing version.
-    if install_remote(target, extra_ssh_args).is_err() {
-        eprintln!("noissh: upgrade install failed; continuing with the existing v{remote_v}.");
-        return Ok(b);
-    }
-    // Reconnect to the freshly-installed server. We deliberately do NOT fall back
-    // to the original `b` here: prompt think-time plus the install have very
-    // likely exhausted the original one-shot's grace window, so its endpoint is
-    // probably dead. The install succeeded, so a re-run will connect cleanly.
-    match attempt(
-        target,
-        &installed_noisshd_cmd(),
-        client_pubkey,
-        extra_ssh_args,
-        bind_port,
-    )? {
-        Attempt::Connected(nb) => {
-            eprintln!("noissh: noisshd upgraded; connecting…");
-            Ok(nb)
-        }
-        _ => {
-            eprintln!(
-                "noissh: upgraded noisshd, but reconnecting to it failed; re-run noissh to connect."
-            );
-            Err(RuntimeError::SshBootstrap)
+    match install_remote(target, extra_ssh_args) {
+        Ok(()) => eprintln!(
+            "noissh: noisshd upgraded; the new version takes effect on your next connection. \
+             Using the current session now."
+        ),
+        Err(_) => {
+            eprintln!("noissh: upgrade install failed; continuing with the existing v{remote_v}.")
         }
     }
+    Ok(b)
 }
 
 /// Ask a yes/no question on the terminal, defaulting to No. Returns false

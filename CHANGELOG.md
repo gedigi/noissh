@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.12]
+
+### Fixed
+
+- **Accepting a remote-`noisshd` upgrade keeps you connected.** The upgrade
+  offer (added in 0.4.11) no longer reconnects through the still-busy pinned UDP
+  port, which could land the new server on an ephemeral, firewalled port and time
+  out. Accepting now installs the new binary so it takes effect on your *next*
+  connection and keeps using the current session right away.
+- **Remote install/upgrade failures are no longer silently masked.** The
+  auto-installer downloads to a temp file (with `set -e`) instead of piping
+  `curl … | sh`, whose exit status reflected the shell, not the download — so a
+  404 or network error during install is now reported as a failure instead of
+  appearing to succeed.
+
 ## [0.4.11]
 
 ### Added
