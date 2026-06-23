@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.11]
+
+### Added
+
+- **Optional upgrade of an outdated remote `noisshd`.** The one-shot server now
+  reports its version during the SSH bootstrap. If the remote `noisshd` is older
+  than the connecting client, noissh asks — `[y/N]`, defaulting to no — whether
+  to upgrade it before continuing. Declining keeps the existing remote version
+  and connects to it as before; accepting reinstalls via the published installer
+  and reconnects. The prompt is skipped when stdin is not a terminal (so scripts
+  never block) and when `--no-install` is set. Servers older than v0.4.11 don't
+  report a version, so no prompt is shown for them until they're upgraded once.
+
 ## [0.4.10]
 
 ### Added

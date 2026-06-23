@@ -118,6 +118,14 @@ opt out, in which case a missing `noisshd` simply fails as before. (The install
 step needs either `curl` or `wget` on the remote; if neither is present it fails
 with a clear message.)
 
+If the remote `noisshd` is already installed but older than your client, noissh
+asks whether to upgrade it — `[y/N]`, defaulting to no. Decline and it connects to
+the existing version as usual; accept and it reinstalls via the same installer and
+reconnects to the upgraded server. The prompt never appears when stdin is not a
+terminal (so scripts don't block) or when `--no-install` is set. A `noisshd` older
+than v0.4.11 doesn't report its version, so you won't be prompted for it until it
+has been upgraded once.
+
 `--server-cmd` sets the remote command if `noisshd` is not on the default `PATH`
 (e.g. `--server-cmd /opt/noissh/bin/noisshd`). Everything after `--` is passed
 straight to `ssh` (e.g. `-- -p 2222 -i ~/.ssh/id_ed25519`).

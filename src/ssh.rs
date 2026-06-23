@@ -36,6 +36,60 @@ pub fn parse_connect_line(line: &str) -> Option<(u16, Vec<u8>)> {
     Some((port, pubkey))
 }
 
+/// Prefix the one-shot server prints to announce its version (so a newer client
+/// can offer to upgrade an older remote `noisshd`).
+pub const VERSION_PREFIX: &str = "NOISSH VERSION";
+
+/// Format the version line: `NOISSH VERSION <semver>`.
+pub fn version_line(version: &str) -> String {
+    format!("{VERSION_PREFIX} {version}")
+}
+
+/// Parse a version line, returning the announced version string.
+pub fn parse_version_line(line: &str) -> Option<String> {
+    let mut it = line.split_whitespace();
+    if it.next()? != "NOISSH" || it.next()? != "VERSION" {
+        return None;
+    }
+    let v = it.next()?;
+    // Reject anything that isn't a short, dotted numeric-ish version: it must
+    // start with a digit and contain only version-ish characters. This is a
+    // defence against a server banner injecting control characters/escape
+    // sequences that we'd otherwise interpolate into the upgrade prompt.
+    if !v.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    if v.len() > 32
+        || !v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// Leading-digit numeric value of a single version component (`"11-rc1"` → 11).
+fn version_component(part: &str) -> u32 {
+    let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or(0)
+}
+
+/// Parse a dotted version into a (major, minor, patch) tuple for comparison.
+fn version_triple(v: &str) -> (u32, u32, u32) {
+    let mut it = v.split('.');
+    (
+        version_component(it.next().unwrap_or("0")),
+        version_component(it.next().unwrap_or("0")),
+        version_component(it.next().unwrap_or("0")),
+    )
+}
+
+/// Whether `remote` is a strictly older version than `ours`.
+fn version_is_older(remote: &str, ours: &str) -> bool {
+    version_triple(remote) < version_triple(ours)
+}
+
 /// Split a `[user@]host` target into its host part for address resolution.
 pub fn host_of(target: &str) -> &str {
     match target.rsplit_once('@') {
@@ -48,6 +102,9 @@ pub fn host_of(target: &str) -> &str {
 pub struct Bootstrap {
     pub server_addr: SocketAddr,
     pub server_pubkey: Vec<u8>,
+    /// The remote `noisshd`'s announced version, if it reported one (servers
+    /// before v0.4.11 do not, in which case this is `None`).
+    pub server_version: Option<String>,
 }
 
 /// Outcome of a single bootstrap attempt.
@@ -127,9 +184,13 @@ fn attempt(
             .to_socket_addrs()?
             .next()
             .ok_or(RuntimeError::SshBootstrap)?;
+        // The server prints its version just before the connect line; absent on
+        // pre-v0.4.11 servers, in which case we simply can't offer an upgrade.
+        let server_version = stdout.lines().rev().find_map(parse_version_line);
         return Ok(Attempt::Connected(Bootstrap {
             server_addr,
             server_pubkey,
+            server_version,
         }));
     }
     if looks_like_missing_command(&output) {
@@ -199,6 +260,7 @@ pub fn bootstrap(
     auto_install: bool,
     bind_port: Option<u16>,
 ) -> Result<Bootstrap, RuntimeError> {
+    let offer = auto_install && is_default_server_cmd(remote_server_cmd);
     match attempt(
         target,
         remote_server_cmd,
@@ -206,7 +268,9 @@ pub fn bootstrap(
         extra_ssh_args,
         bind_port,
     )? {
-        Attempt::Connected(b) => Ok(b),
+        Attempt::Connected(b) => {
+            maybe_offer_upgrade(target, client_pubkey, extra_ssh_args, bind_port, offer, b)
+        }
         Attempt::NotFound if auto_install && is_default_server_cmd(remote_server_cmd) => {
             // It may already be installed at our known location but simply not on
             // the non-interactive PATH — try that before re-downloading.
@@ -217,7 +281,14 @@ pub fn bootstrap(
                 extra_ssh_args,
                 bind_port,
             )? {
-                return Ok(b);
+                return maybe_offer_upgrade(
+                    target,
+                    client_pubkey,
+                    extra_ssh_args,
+                    bind_port,
+                    offer,
+                    b,
+                );
             }
             eprintln!(
                 "noissh: noisshd is not installed on {}; installing it over SSH…",
@@ -231,6 +302,7 @@ pub fn bootstrap(
                 extra_ssh_args,
                 bind_port,
             )? {
+                // Just installed the latest — no upgrade offer here.
                 Attempt::Connected(b) => {
                     eprintln!("noissh: noisshd installed; connecting…");
                     Ok(b)
@@ -240,6 +312,81 @@ pub fn bootstrap(
         }
         _ => Err(RuntimeError::SshBootstrap),
     }
+}
+
+/// If the connected server reports a version older than this client's, ask the
+/// user (default No) whether to upgrade the remote `noisshd` now. On "yes",
+/// reinstall and reconnect to the upgraded server; otherwise keep the existing
+/// connection. Never prompts when stdin isn't a terminal (scripts/pipelines).
+fn maybe_offer_upgrade(
+    target: &str,
+    client_pubkey: &[u8],
+    extra_ssh_args: &[String],
+    bind_port: Option<u16>,
+    offer: bool,
+    b: Bootstrap,
+) -> Result<Bootstrap, RuntimeError> {
+    let ours = env!("CARGO_PKG_VERSION");
+    let older = b
+        .server_version
+        .as_deref()
+        .is_some_and(|v| version_is_older(v, ours));
+    if !(offer && older) {
+        return Ok(b);
+    }
+    let remote_v = b.server_version.as_deref().unwrap_or("?");
+    let question = format!(
+        "noissh: noisshd on {} is v{remote_v}, but this client is v{ours}. Upgrade it now?",
+        host_of(target)
+    );
+    if !prompt_yes_no(&question) {
+        return Ok(b); // keep the existing (older) server
+    }
+    // If the install itself fails (fast: no curl/wget, network error), the
+    // original one-shot is almost certainly still within its grace window, so
+    // fall back to it and connect to the existing version.
+    if install_remote(target, extra_ssh_args).is_err() {
+        eprintln!("noissh: upgrade install failed; continuing with the existing v{remote_v}.");
+        return Ok(b);
+    }
+    // Reconnect to the freshly-installed server. We deliberately do NOT fall back
+    // to the original `b` here: prompt think-time plus the install have very
+    // likely exhausted the original one-shot's grace window, so its endpoint is
+    // probably dead. The install succeeded, so a re-run will connect cleanly.
+    match attempt(
+        target,
+        &installed_noisshd_cmd(),
+        client_pubkey,
+        extra_ssh_args,
+        bind_port,
+    )? {
+        Attempt::Connected(nb) => {
+            eprintln!("noissh: noisshd upgraded; connecting…");
+            Ok(nb)
+        }
+        _ => {
+            eprintln!(
+                "noissh: upgraded noisshd, but reconnecting to it failed; re-run noissh to connect."
+            );
+            Err(RuntimeError::SshBootstrap)
+        }
+    }
+}
+
+/// Ask a yes/no question on the terminal, defaulting to No. Returns false
+/// (without prompting) when stdin is not a terminal, so scripts never block.
+fn prompt_yes_no(question: &str) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!("{question} [y/N]: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }
 
 /// Detach from the controlling SSH session so the server survives `ssh`
@@ -293,6 +440,34 @@ mod tests {
     fn host_extraction() {
         assert_eq!(host_of("user@example.com"), "example.com");
         assert_eq!(host_of("example.com"), "example.com");
+    }
+
+    #[test]
+    fn version_line_roundtrips() {
+        let line = version_line("0.4.11");
+        assert_eq!(parse_version_line(&line).as_deref(), Some("0.4.11"));
+        assert!(parse_version_line("NOISSH CONNECT 5 AAAA").is_none());
+        assert!(parse_version_line("random banner").is_none());
+        // Hardening: must start with a digit, be short, and version-ish only.
+        assert!(parse_version_line("NOISSH VERSION evil").is_none());
+        assert!(parse_version_line(&format!("NOISSH VERSION 0.{}", "9".repeat(40))).is_none());
+        assert!(parse_version_line("NOISSH VERSION 0.4\x1b[31m.1").is_none());
+        assert_eq!(
+            parse_version_line("NOISSH VERSION 1.2.3-rc4").as_deref(),
+            Some("1.2.3-rc4")
+        );
+    }
+
+    #[test]
+    fn version_ordering() {
+        assert!(version_is_older("0.4.9", "0.4.10"));
+        assert!(version_is_older("0.3.0", "0.4.0"));
+        assert!(version_is_older("0.4.10", "1.0.0"));
+        assert!(!version_is_older("0.4.10", "0.4.10")); // equal is not older
+        assert!(!version_is_older("0.4.11", "0.4.10")); // newer is not older
+        assert!(!version_is_older("1.0.0", "0.9.9"));
+        // Tolerates non-numeric suffixes by reading leading digits per component.
+        assert!(version_is_older("0.4.9-rc1", "0.4.10"));
     }
 
     #[test]

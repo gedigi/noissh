@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-06-19" "noissh 0.4.10" "User Commands"
+.TH NOISSH 1 "2026-06-19" "noissh 0.4.11" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -82,7 +82,14 @@ is set. The install step requires
 .BR curl (1)
 or
 .BR wget (1)
-on the remote.
+on the remote. If the remote
+.B noisshd
+is already installed but reports an older version than this client, noissh asks
+(default no) whether to upgrade it before continuing; declining keeps the
+existing remote version. The prompt is skipped when stdin is not a terminal and
+when
+.B \-\-no\-install
+is given.
 .TP
 .B \-\-no\-install
 Disable the automatic remote install performed by

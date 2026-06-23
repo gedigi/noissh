@@ -220,7 +220,10 @@ fn run_one_shot(args: Args) -> Result<(), RuntimeError> {
     };
     let port = server.local_addr()?.port();
 
-    // Hand the port + pubkey back over SSH, then detach so SSH can return.
+    // Announce our version (so a newer client can offer to upgrade an older
+    // remote), then hand the port + pubkey back over SSH and detach. The connect
+    // line is printed last so it remains the final parseable line.
+    println!("{}", ssh::version_line(env!("CARGO_PKG_VERSION")));
     println!("{}", ssh::connect_line(port, &keypair.public));
     use std::io::Write;
     std::io::stdout().flush().ok();
