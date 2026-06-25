@@ -33,6 +33,24 @@ fn noissh_help_and_version() {
 }
 
 #[test]
+fn noissh_no_args_prints_usage_not_bootstrap_error() {
+    // Running `noissh` with no host must explain that a host is required and
+    // point at --help, NOT emit a misleading "SSH bootstrap failed" (it never
+    // got far enough to bootstrap anything).
+    let bin = env!("CARGO_BIN_EXE_noissh");
+    let (code, out) = run(bin, &[]);
+    assert_eq!(code, 2, "no-args should exit 2 (usage error): {out}");
+    assert!(
+        out.contains("no host given") && out.contains("--help"),
+        "no-args should print a usage hint: {out}"
+    );
+    assert!(
+        !out.contains("SSH bootstrap failed"),
+        "no-args must not report a bootstrap failure: {out}"
+    );
+}
+
+#[test]
 fn noisshd_help_and_version() {
     let bin = env!("CARGO_BIN_EXE_noisshd");
     let (code, out) = run(bin, &["--help"]);

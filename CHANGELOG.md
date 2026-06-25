@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.13]
+
+### Fixed
+
+- **Running `noissh` with no host now prints a clear usage error.** Previously it
+  reported a misleading "SSH bootstrap failed: no connect line from remote
+  noisshd" — it had never actually tried to bootstrap; there was simply no host
+  to connect to. It now prints `noissh: no host given`, a one-line usage summary,
+  and a pointer to `--help`, and exits with status 2.
+
 ## [0.4.12]
 
 ### Fixed

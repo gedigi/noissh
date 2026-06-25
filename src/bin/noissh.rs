@@ -240,7 +240,15 @@ fn parse_args() -> Args {
 
 fn run() -> Result<(), RuntimeError> {
     let args = parse_args();
-    let target = args.target.clone().ok_or(RuntimeError::SshBootstrap)?;
+    let Some(target) = args.target.clone() else {
+        // No host to connect to. This is a usage error, not a bootstrap failure —
+        // say so plainly and point at --help rather than emitting a confusing
+        // "SSH bootstrap failed" (we never got far enough to bootstrap anything).
+        eprintln!(
+            "noissh: no host given\nusage: noissh [OPTIONS] [user@]host [command ...]\nTry 'noissh --help' for more information."
+        );
+        exit(2);
+    };
 
     let dir = config_dir();
     let keypair = load_or_generate_keypair(&dir.join("id"))?;
