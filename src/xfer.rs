@@ -3,8 +3,9 @@
 //! reliable, authenticated stream the bytes ride on.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Reads a local file in chunks to feed into a session stream (the sending end
 /// of a `Put` on the client, or a `Get` on the server).
@@ -89,6 +90,120 @@ impl Drop for FileSink {
         // untouched; clean up the temp file.
         if !self.finalized {
             let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn progress_line_with_and_without_total() {
+        let s = progress_line(512 * 1024, Some(1024 * 1024));
+        assert!(s.contains("50.0%"), "{s}");
+        assert!(s.contains("512.0 KB") && s.contains("1.0 MB"), "{s}");
+        // Unknown total: no percentage, just the running count.
+        let s = progress_line(2048, None);
+        assert!(s.contains("2.0 KB transferred"), "{s}");
+        // Never exceeds 100% even if done overshoots.
+        let s = progress_line(2048, Some(1024));
+        assert!(s.contains("100.0%"), "{s}");
+    }
+}
+
+/// Format a byte count in human-readable units (e.g. `4.5 MB`).
+pub fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} {}", UNITS[0])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Render a one-line progress string for `done` of `total` bytes (total `None`
+/// when the size isn't known, e.g. a download). Pure, so it's unit-testable.
+pub fn progress_line(done: u64, total: Option<u64>) -> String {
+    match total {
+        Some(t) if t > 0 => {
+            let pct = ((done as f64 / t as f64) * 100.0).min(100.0);
+            format!(
+                "{:>5.1}%  {} / {}",
+                pct,
+                human_bytes(done),
+                human_bytes(t)
+            )
+        }
+        _ => format!("{} transferred", human_bytes(done)),
+    }
+}
+
+/// A throttled, TTY-only transfer progress reporter. Writes a single carriage-
+/// return-updated line to stderr; does nothing when stderr is not a terminal, so
+/// scripts and pipelines stay clean.
+pub struct Progress {
+    total: Option<u64>,
+    done: u64,
+    last_draw: Instant,
+    enabled: bool,
+    label: String,
+}
+
+impl Progress {
+    /// Create a reporter for an operation moving `total` bytes (or `None` if
+    /// unknown). `label` is a short prefix like `"↑ report.pdf"`.
+    pub fn new(label: impl Into<String>, total: Option<u64>) -> Self {
+        Progress {
+            total,
+            done: 0,
+            last_draw: Instant::now() - Duration::from_secs(1),
+            enabled: std::io::stderr().is_terminal(),
+            label: label.into(),
+        }
+    }
+
+    /// Record `n` more bytes transferred and redraw if enough time has passed.
+    pub fn add(&mut self, n: u64) {
+        self.done += n;
+        if self.enabled && self.last_draw.elapsed() >= Duration::from_millis(100) {
+            self.draw();
+            self.last_draw = Instant::now();
+        }
+    }
+
+    fn draw(&self) {
+        // \r returns to column 0; trailing spaces clear any shorter prior line.
+        eprint!("\r{}  {}        ", self.label, progress_line(self.done, self.total));
+        let _ = std::io::stderr().flush();
+    }
+
+    /// Finish the progress line (final draw + newline) if it was active.
+    pub fn finish(&self) {
+        if self.enabled {
+            // Force a final 100%/total draw, then move off the line.
+            eprint!(
+                "\r{}  {}        \n",
+                self.label,
+                progress_line(self.done, self.total)
+            );
+            let _ = std::io::stderr().flush();
         }
     }
 }
