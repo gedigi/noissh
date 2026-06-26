@@ -94,34 +94,6 @@ impl Drop for FileSink {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn human_bytes_units() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.0 KB");
-        assert_eq!(human_bytes(1536), "1.5 KB");
-        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
-    }
-
-    #[test]
-    fn progress_line_with_and_without_total() {
-        let s = progress_line(512 * 1024, Some(1024 * 1024));
-        assert!(s.contains("50.0%"), "{s}");
-        assert!(s.contains("512.0 KB") && s.contains("1.0 MB"), "{s}");
-        // Unknown total: no percentage, just the running count.
-        let s = progress_line(2048, None);
-        assert!(s.contains("2.0 KB transferred"), "{s}");
-        // Never exceeds 100% even if done overshoots.
-        let s = progress_line(2048, Some(1024));
-        assert!(s.contains("100.0%"), "{s}");
-    }
-}
-
 /// Format a byte count in human-readable units (e.g. `4.5 MB`).
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -144,12 +116,7 @@ pub fn progress_line(done: u64, total: Option<u64>) -> String {
     match total {
         Some(t) if t > 0 => {
             let pct = ((done as f64 / t as f64) * 100.0).min(100.0);
-            format!(
-                "{:>5.1}%  {} / {}",
-                pct,
-                human_bytes(done),
-                human_bytes(t)
-            )
+            format!("{:>5.1}%  {} / {}", pct, human_bytes(done), human_bytes(t))
         }
         _ => format!("{} transferred", human_bytes(done)),
     }
@@ -190,7 +157,11 @@ impl Progress {
 
     fn draw(&self) {
         // \r returns to column 0; trailing spaces clear any shorter prior line.
-        eprint!("\r{}  {}        ", self.label, progress_line(self.done, self.total));
+        eprint!(
+            "\r{}  {}        ",
+            self.label,
+            progress_line(self.done, self.total)
+        );
         let _ = std::io::stderr().flush();
     }
 
@@ -205,5 +176,33 @@ impl Progress {
             );
             let _ = std::io::stderr().flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn progress_line_with_and_without_total() {
+        let s = progress_line(512 * 1024, Some(1024 * 1024));
+        assert!(s.contains("50.0%"), "{s}");
+        assert!(s.contains("512.0 KB") && s.contains("1.0 MB"), "{s}");
+        // Unknown total: no percentage, just the running count.
+        let s = progress_line(2048, None);
+        assert!(s.contains("2.0 KB transferred"), "{s}");
+        // Never exceeds 100% even if done overshoots.
+        let s = progress_line(2048, Some(1024));
+        assert!(s.contains("100.0%"), "{s}");
     }
 }

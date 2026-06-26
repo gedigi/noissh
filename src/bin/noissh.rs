@@ -303,7 +303,10 @@ fn run() -> Result<(), RuntimeError> {
         let mut known = load_known_hosts(&kh_path)?;
         let removed = known.remove_matching(host);
         if removed.is_empty() {
-            eprintln!("noissh: no pinned host key for {host:?} in {}", kh_path.display());
+            eprintln!(
+                "noissh: no pinned host key for {host:?} in {}",
+                kh_path.display()
+            );
         } else {
             save_known_hosts(&kh_path, &known)?;
             eprintln!("noissh: removed pinned host key(s): {}", removed.join(", "));
@@ -411,12 +414,14 @@ fn run() -> Result<(), RuntimeError> {
         } else if try_direct {
             eprintln!(
                 "noissh: trying a direct UDP session to {label} first (pinned: {})",
-                if known.get(&label).is_some() { "yes" } else { "no" }
+                if known.get(&label).is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
         } else {
-            eprintln!(
-                "noissh: no pin for {label}; going straight to the SSH bootstrap"
-            );
+            eprintln!("noissh: no pin for {label}; going straight to the SSH bootstrap");
         }
     }
 

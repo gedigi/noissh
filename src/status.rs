@@ -15,8 +15,8 @@
 
 use std::time::Duration;
 
-use term::cell::{Cell, Color, flags};
 use term::Grid;
+use term::cell::{Cell, Color, flags};
 
 /// The local escape/detach prefix: `Ctrl-^` (Ctrl-Shift-6, byte 0x1e). Chosen
 /// to match Mosh and because it's virtually never sent by normal terminal use.

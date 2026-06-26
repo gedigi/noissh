@@ -29,6 +29,12 @@ laptop going to sleep.
   restarts, **reconnect and you're back in the same running session.**
 - **It feels instant.** Your keystrokes show up immediately, even on a laggy or
   lossy connection, instead of waiting for a round trip to the server.
+- **It tells you what's happening.** When the link goes quiet, a status line
+  shows `last contact Ns ago — reconnecting…` so you're never staring at a frozen
+  screen, and a local detach key (`Ctrl-^ .`) cleanly drops a wedged session.
+- **It knows your `~/.ssh/config`.** Host aliases (`HostName`, `User`, `Port`,
+  `ProxyJump`, …) work just like they do with `ssh`. Authorize a key for direct
+  connections with `--copy-id`, like `ssh-copy-id`.
 - **It tunnels too.** Local, remote, and dynamic SOCKS **port forwarding**
   (`-L`/`-R`/`-D`) ride the same resilient, encrypted session.
 - **It runs commands.** Run a single remote command non-interactively, ssh-style

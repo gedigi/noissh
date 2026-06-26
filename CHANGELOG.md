@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A feature/UX pass closing the biggest gaps against everyday `ssh`/Mosh use.
+
+### Added
+
+- **Connection-status overlay.** When the link goes quiet (roaming, Wi-Fi↔cellular
+  handoff, a dead spot), the interactive client now shows a Mosh-style banner on
+  the top row — `[noissh] last contact N s ago — reconnecting…  (Ctrl-^ . to
+  quit)`. It appears only after the link is silent past the keepalive interval
+  (so a healthy idle session never flashes it), counts up once a second, and
+  clears the instant contact resumes. While stale, keepalives speed up so
+  recovery is detected within about a second.
+- **Detach / escape key.** `Ctrl-^` is a local escape prefix: `Ctrl-^ .` or
+  `Ctrl-^ q` disconnects cleanly (restores the terminal and exits 0) so a wedged
+  client no longer means killing the terminal window; `Ctrl-^ Ctrl-^` sends a
+  literal `Ctrl-^`.
+- **`~/.ssh/config` interop.** Host aliases now work for the resilient UDP leg,
+  not just the SSH bootstrap: noissh reads `HostName`/`User`/`Port` for the
+  target alias so `noissh myalias` resolves the same way `ssh myalias` does.
+  (ProxyJump, IdentityFile, and the rest continue to be handled by `ssh` itself
+  during the bootstrap.)
+- **`--copy-id`.** Installs your public key into the remote `authorized_keys`
+  over SSH (the direct-mode equivalent of `ssh-copy-id`), so setting up a
+  standing-daemon direct connection no longer means hand-copying keys.
+- **`--forget-host HOST`.** Removes the pinned server key(s) for a host so
+  recovering from an intentional server re-key no longer means hand-editing
+  `known_hosts` (the equivalent of `ssh-keygen -R`).
+- **`-v` / `--verbose`.** Narrates the connection sequence (direct probe, DNS
+  resolution, handshake, SSH bootstrap) to diagnose the most common failure —
+  a connect that hangs because the UDP port is blocked.
+- **File-transfer progress.** `--put`/`--get` now show a live progress line
+  (percentage and sizes on upload; running byte count on download). It is
+  TTY-only, so scripts and pipelines stay clean.
+
+### Known limitations
+
+- **Scrollback.** Like Mosh, noissh paints a live picture of the remote screen,
+  so your terminal's native scrollback does not capture content that scrolls off
+  the top. Run `tmux` or `screen` on the server for scrollback (and an even
+  stronger detach story). See the User Guide.
+- **Windows client.** The client is Unix-only (it needs a PTY and POSIX terminal
+  handling). Windows support is tracked as future work; see the User Guide.
+
 ## [0.4.14]
 
 A user-experience pass driven by a full UX audit (static review + live testing).

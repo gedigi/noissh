@@ -88,9 +88,7 @@ fn noissh_forget_host_removes_pin() {
     let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     std::fs::write(
         &kh,
-        format!(
-            "example.com:51820 noissh-x25519 {k}\nother.com:51820 noissh-x25519 {k}\n"
-        ),
+        format!("example.com:51820 noissh-x25519 {k}\nother.com:51820 noissh-x25519 {k}\n"),
     )
     .unwrap();
 
@@ -101,7 +99,10 @@ fn noissh_forget_host_removes_pin() {
         .expect("spawn");
     assert_eq!(out.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("removed"), "should report removal: {stderr}");
+    assert!(
+        stderr.contains("removed"),
+        "should report removal: {stderr}"
+    );
 
     let remaining = std::fs::read_to_string(&kh).unwrap();
     assert!(
