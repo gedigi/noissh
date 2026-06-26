@@ -165,8 +165,14 @@ fn is_default_server_cmd(remote_server_cmd: &[String]) -> bool {
 }
 
 /// Run one bootstrap attempt against `remote_server_cmd`.
+///
+/// `udp_host` is the host the Noise/UDP session should be addressed to — it may
+/// differ from `host_of(target)` when the target is an ssh_config alias whose
+/// real address is in `HostName`. `ssh` itself still receives the original
+/// `target`, so it applies the user's `~/.ssh/config` (ProxyJump, Port, …).
 fn attempt(
     target: &str,
+    udp_host: &str,
     remote_server_cmd: &[String],
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
@@ -198,7 +204,7 @@ fn attempt(
     // server-controlled banner from injecting a forged connect line earlier in
     // the stream.
     if let Some((port, server_pubkey)) = stdout.lines().rev().find_map(parse_connect_line) {
-        let host = host_of(target);
+        let host = udp_host;
         let server_addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
             RuntimeError::BadAddress(format!(
                 "connected over SSH but could not resolve {host}:{port} for the UDP session"
@@ -281,6 +287,7 @@ fn installed_noisshd_cmd() -> Vec<String> {
 /// server command is the default), install it over SSH and retry once.
 pub fn bootstrap(
     target: &str,
+    udp_host: &str,
     remote_server_cmd: &[String],
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
@@ -290,6 +297,7 @@ pub fn bootstrap(
     let offer = auto_install && is_default_server_cmd(remote_server_cmd);
     match attempt(
         target,
+        udp_host,
         remote_server_cmd,
         client_pubkey,
         extra_ssh_args,
@@ -301,6 +309,7 @@ pub fn bootstrap(
             // the non-interactive PATH — try that before re-downloading.
             if let Attempt::Connected(b) = attempt(
                 target,
+                udp_host,
                 &installed_noisshd_cmd(),
                 client_pubkey,
                 extra_ssh_args,
@@ -315,6 +324,7 @@ pub fn bootstrap(
             install_remote(target, extra_ssh_args)?;
             match attempt(
                 target,
+                udp_host,
                 &installed_noisshd_cmd(),
                 client_pubkey,
                 extra_ssh_args,

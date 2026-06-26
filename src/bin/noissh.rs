@@ -382,7 +382,18 @@ fn run() -> Result<(), RuntimeError> {
     // Connect: unless told otherwise, try a direct UDP session to a standing
     // noisshd first; if that doesn't answer (no daemon), fall back to the SSH
     // bootstrap automatically. `--ssh` forces bootstrap; `--direct` forbids it.
-    let host = ssh::host_of(&target).to_string();
+    //
+    // Resolve the target's host through ~/.ssh/config so an alias works for the
+    // Noise/UDP leg too: `ssh` honours the user's config for the bootstrap, but
+    // noissh resolves the UDP address itself, so without this an alias whose real
+    // address is in `HostName` would never connect over UDP. The original target
+    // is still handed to `ssh` (which applies ProxyJump/Port/User from the config).
+    let alias = ssh::host_of(&target).to_string();
+    let host_cfg = noissh::sshconfig::resolve_default(&alias);
+    let host = host_cfg.hostname.clone().unwrap_or_else(|| alias.clone());
+    if args.verbose && host != alias {
+        eprintln!("noissh: ~/.ssh/config: {alias} → HostName {host}");
+    }
     let mut client = None;
 
     let label = format!("{host}:{}", args.port);
@@ -478,6 +489,7 @@ fn run() -> Result<(), RuntimeError> {
         }
         let boot = ssh::bootstrap(
             &target,
+            &host,
             std::slice::from_ref(&args.server_cmd),
             &keypair.public,
             &args.ssh_args,

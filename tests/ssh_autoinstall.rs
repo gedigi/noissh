@@ -59,6 +59,7 @@ fn bootstrap_installs_missing_noisshd_then_connects() {
 
     let boot = ssh::bootstrap(
         "127.0.0.1",
+        "127.0.0.1",
         &["noisshd".to_string()],
         &client_kp.public,
         &[],
