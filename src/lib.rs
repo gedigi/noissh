@@ -13,6 +13,7 @@ pub mod forward;
 pub mod server;
 pub mod socks;
 pub mod ssh;
+pub mod status;
 pub mod tty;
 pub mod xfer;
 

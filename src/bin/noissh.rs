@@ -565,6 +565,14 @@ fn run() -> Result<(), RuntimeError> {
 
 /// How often to send a keepalive while otherwise idle.
 const KEEPALIVE: Duration = Duration::from_secs(3);
+/// A faster keepalive cadence once the link looks stale, so a recovered network
+/// (Wi-Fi↔cellular handoff, NAT rebind) is detected within about a second.
+const STALE_KEEPALIVE: Duration = Duration::from_secs(1);
+/// Time since last contact after which we treat the link as stale: probe more
+/// often and wake every second so the status counter ticks.
+const STALE_AFTER: Duration = Duration::from_secs(2);
+/// Maximum idle poll wait while stale (keeps the "last contact" counter live).
+const STALE_POLL: Duration = Duration::from_secs(1);
 /// Poll wakeup while there is unacked data to (re)transmit.
 const ACTIVE_POLL: Duration = Duration::from_millis(40);
 /// How long to probe for a direct (standing-daemon) UDP session before falling
@@ -599,6 +607,12 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     let mut last_size = terminal_size();
     let mut inbuf = [0u8; 4096];
     let mut next_keepalive = Instant::now() + KEEPALIVE;
+    // Last time we heard an authenticated datagram from the server. Drives the
+    // status overlay ("last contact N s ago") and the adaptive keepalive below.
+    let mut last_contact = Instant::now();
+    // Detach-key state machine: carries the "saw Ctrl-^, awaiting command"
+    // state across reads (the prefix and its command can arrive separately).
+    let mut esc_pending = false;
 
     // Restore the terminal if we're killed by a signal: register a flag for
     // SIGTERM/SIGINT/SIGHUP; the signal interrupts poll(), we observe the flag,
@@ -623,12 +637,17 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
         }
         // Wait for the socket or stdin to be ready, or a timer to fire. This is
         // event-driven: idle sessions wake only to keepalive, not in a busy loop.
+        let since_contact = last_contact.elapsed();
+        let stale = since_contact >= STALE_AFTER;
         let timeout = if client.core().has_outgoing() {
             ACTIVE_POLL
         } else {
-            next_keepalive
+            let base = next_keepalive
                 .saturating_duration_since(Instant::now())
-                .min(KEEPALIVE)
+                .min(KEEPALIVE);
+            // When the link looks stale, wake at least once a second so the
+            // "last contact N s ago" counter ticks and we probe more often.
+            if stale { base.min(STALE_POLL) } else { base }
         };
         {
             let sock = client.socket().as_fd();
@@ -646,22 +665,50 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
             let _ = poll(&mut fds, PollTimeout::from(ms));
         }
 
-        // Network: drain everything ready.
-        while client.recv_and_handle()? {}
+        // Network: drain everything ready. Any datagram from the server counts as
+        // contact and resets the staleness clock that drives the status overlay.
+        let mut heard = false;
+        while client.recv_and_handle()? {
+            heard = true;
+        }
+        if heard {
+            last_contact = Instant::now();
+        }
 
         // Service SSH agent forwarding (open/bridge/pump), if enabled.
         if client.agent_enabled() {
             client.pump_agent();
         }
 
-        // Local keystrokes.
+        // Local keystrokes. Filter the detach prefix (Ctrl-^) out of the stream:
+        // forward ordinary input to the remote shell, and quit cleanly on the
+        // detach command (Ctrl-^ then '.' or 'q').
+        let mut quit = false;
         loop {
             match stdin.lock().read(&mut inbuf) {
                 Ok(0) => break,
-                Ok(n) => client.core_mut().type_input(&inbuf[..n]),
+                Ok(n) => {
+                    let outcome = noissh::status::process_input(&mut esc_pending, &inbuf[..n]);
+                    if !outcome.forward.is_empty() {
+                        client.core_mut().type_input(&outcome.forward);
+                    }
+                    if outcome.quit {
+                        quit = true;
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
+        }
+        if quit {
+            // Tell the server we're done (best-effort) so the session tears down
+            // promptly, restore the terminal, and exit cleanly.
+            client.core_mut().send_bye();
+            let _ = client.flush();
+            stdout.write_all(b"\x1b[?25h\r\n")?;
+            stdout.flush()?;
+            drop(_raw);
+            exit(0);
         }
 
         // Local resize.
@@ -674,14 +721,24 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
 
         client.flush()?;
 
-        // Keepalive.
+        // Keepalive. Probe faster while the link is stale so recovery (and the
+        // overlay clearing) happens within ~1 s of the network returning.
         if Instant::now() >= next_keepalive {
             client.send_keepalive()?;
-            next_keepalive = Instant::now() + KEEPALIVE;
+            let interval = if last_contact.elapsed() >= STALE_AFTER {
+                STALE_KEEPALIVE
+            } else {
+                KEEPALIVE
+            };
+            next_keepalive = Instant::now() + interval;
         }
 
-        // Render the predicted overlay.
-        let overlay = client.core().overlay();
+        // Render the predicted overlay, with a connection-status banner stamped
+        // on the top row when the link has gone quiet (roaming / network loss).
+        let mut overlay = client.core().overlay();
+        if let Some(banner) = noissh::status::status_banner(last_contact.elapsed()) {
+            noissh::status::stamp_status(&mut overlay, &banner);
+        }
         renderer.paint(&overlay, &mut stdout)?;
 
         if let Some(status) = client.core().exit_status() {
