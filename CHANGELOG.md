@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.14]
+
+A user-experience pass driven by a full UX audit (static review + live testing).
+
+### Fixed
+
+- **No more "random screen refresh."** The renderer repainted the cursor on every
+  event-loop wakeup (each keepalive/ack), emitting a hide→move→show cycle even
+  when nothing changed — visible as flicker on an idle screen. It now does
+  nothing when the frame is unchanged and only toggles cursor visibility when it
+  actually changes. (Measured: cursor hide/show on a 9 s idle session dropped
+  from 26 to 2.)
+- **Clear, actionable error messages.** Many errors were vague or reused a single
+  catch-all. Now:
+  - `noissh` with no host explains what to do and shows an example (exit 2).
+  - SSH-bootstrap failures surface `ssh`'s own diagnostic (auth denied, host
+    unreachable, …) instead of a generic "no connect line".
+  - `noisshd --one-shot` without `--authorize`, and other CLI mistakes, are
+    reported as usage errors (exit 2), not "SSH bootstrap failed".
+  - An invalid `--listen`/`--bind` address says so, instead of "malformed key
+    file".
+  - A host-key mismatch now tells you exactly how to recover (which file/line to
+    remove) when you intentionally re-keyed the server.
+  - A stray blank line before each error (a stray `\r\n`) is gone.
+- **The terminal is always restored on exit.** Cursor visibility and text
+  attributes are reset whenever raw mode ends (normal exit, signal, or error), so
+  a full-screen program can't leave your shell with a hidden cursor.
+- **The client advertises your real `$TERM`** instead of always claiming
+  `xterm-256color`.
+
+### Changed
+
+- **Invalid command-line arguments now fail loudly.** A malformed `-L`/`-R`/`-D`
+  or `--put`/`--get` spec, a non-numeric `--port`, or an unknown option is a
+  usage error (exit 2) with a concrete example, instead of being silently ignored
+  (which previously could drop you into an unexpected interactive shell).
+- **First-run and trust-on-first-use are no longer silent.** Generating your key
+  on first run prints its location and public key (so you can authorize it), and
+  pinning a server's key on first direct connection is announced.
+
+### Added
+
+- **`-h`/`--help` works everywhere** and now notes that options precede the host.
+- **`noisshd --user NAME`** drops sessions to a target user (the privilege-drop
+  mode the docs described but the daemon didn't expose).
+- **An optional `config` file** (`~/.config/noissh/config`) sets the default
+  `port` for direct connections; `noissh-keygen` gained `-V`/`--version`.
+
 ## [0.4.13]
 
 ### Fixed

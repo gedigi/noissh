@@ -44,10 +44,35 @@ fn noissh_no_args_prints_usage_not_bootstrap_error() {
         out.contains("no host given") && out.contains("--help"),
         "no-args should print a usage hint: {out}"
     );
+    // It must tell the user HOW to fix it — show a concrete example invocation.
     assert!(
-        !out.contains("SSH bootstrap failed"),
+        out.contains("noissh user@example.com"),
+        "no-args should show an example: {out}"
+    );
+    assert!(
+        !out.contains("SSH bootstrap failed") && !out.contains("connect line"),
         "no-args must not report a bootstrap failure: {out}"
     );
+}
+
+#[test]
+fn noissh_invalid_args_fail_loudly() {
+    let bin = env!("CARGO_BIN_EXE_noissh");
+    // Each of these is a usage mistake that must exit 2 with a helpful message,
+    // not be silently ignored (which used to drop the user into a shell).
+    for args in [
+        &["--port", "abc", "host"][..],
+        &["--put", "missing-colon", "host"][..],
+        &["-L", "8080", "host"][..],
+        &["-x", "host"][..],
+    ] {
+        let (code, out) = run(bin, args);
+        assert_eq!(code, 2, "{args:?} should exit 2, got {code}: {out}");
+        assert!(
+            out.to_lowercase().contains("noissh:"),
+            "{args:?} should print a noissh error: {out}"
+        );
+    }
 }
 
 #[test]

@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-06-19" "noissh 0.4.13" "User Commands"
+.TH NOISSH 1 "2026-06-19" "noissh 0.4.14" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -10,8 +10,19 @@ noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .RB [ \-\-server\-cmd
 .IR CMD ]
 .RB [ \-\-no\-install ]
+.RB [ \-\-server\-port
+.IR N ]
+.RB [ \-L
+.IR SPEC ]
+.RB [ \-R
+.IR SPEC ]
 .RB [ \-D
 .IR SPEC ]
+.RB [ \-\-put
+.IR SPEC ]
+.RB [ \-\-get
+.IR SPEC ]
+.RB [ \-A ]
 .RI [ user @] host
 .RI [ command "" ...]
 .RB [ \-\-
@@ -225,20 +236,20 @@ Connect via SSH bootstrap:
 Direct connection on a custom port:
 .B noissh --port 51820 user@server
 .TP
-Upload a file:
-.B noissh user@server --put ./report.pdf:/home/user/report.pdf
+Upload a file (options precede the host):
+.B noissh --put ./report.pdf:/home/user/report.pdf user@server
 .TP
 Download a file:
-.B noissh user@server --get /var/log/app.log:./app.log
+.B noissh --get /var/log/app.log:./app.log user@server
 .TP
 Dynamic SOCKS proxy on a local port:
-.B noissh --ssh user@server -D 1080
+.B noissh --ssh -D 1080 user@server
 .TP
-Run a single remote command:
+Run a single remote command (the command follows the host):
 .B noissh --ssh user@server uname -a
 .TP
 Interactive shell with agent forwarding:
-.B noissh --ssh user@server -A
+.B noissh --ssh -A user@server
 .SH SEE ALSO
 .BR noisshd (1),
 .BR ssh (1)

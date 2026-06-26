@@ -78,7 +78,13 @@ impl ClientCore {
             server_addr,
             rows,
             cols,
-            term: "xterm-256color".to_string(),
+            // Advertise the user's actual terminal type so the remote shell and
+            // programs render correctly (colours, key sequences), falling back to
+            // a safe modern default when $TERM is unset.
+            term: std::env::var("TERM")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "xterm-256color".to_string()),
             established: false,
             server_static: None,
             exited: None,

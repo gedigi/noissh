@@ -26,6 +26,7 @@ Usage:
                                creating it if missing, then print the public
                                key line `noissh-x25519 <base64>`
   noissh-keygen --help         print this help
+  noissh-keygen --version      print the version
 
 Paste the printed line into a server's authorized_keys to authorize this key.";
 

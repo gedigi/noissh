@@ -18,7 +18,10 @@ use std::time::Duration;
 
 use auth::{KnownHosts, PublicKey};
 use noissh::client::Client;
-use noissh::config::{config_dir, load_known_hosts, load_or_generate_keypair, save_known_hosts};
+use noissh::config::{
+    config_dir, config_file_path, load_config, load_known_hosts, load_or_generate_keypair,
+    save_known_hosts,
+};
 use noissh::tty::{RawMode, Renderer, TtyWriter, terminal_size};
 use noissh::{RuntimeError, ssh};
 use predict::DisplayMode;
@@ -26,8 +29,35 @@ use proto::XferRequest;
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("\r\nnoissh: {e}");
-        exit(1);
+        report_error(&e);
+        // Usage errors get the conventional exit status 2; everything else 1.
+        exit(match e {
+            RuntimeError::Usage(_) => 2,
+            _ => 1,
+        });
+    }
+}
+
+/// Print a user-facing error. Most variants are self-describing; a host-key
+/// mismatch gets concrete recovery steps (it needs the known_hosts path, which
+/// lives here in the binary, not in the library error).
+fn report_error(e: &RuntimeError) {
+    match e {
+        RuntimeError::HostKeyMismatch(label) => {
+            let kh = config_dir().join("known_hosts");
+            eprintln!(
+                "noissh: the host key for {label} has changed — this could be a man-in-the-middle, \
+                 so the connection was aborted.\n  \
+                 If you intentionally reinstalled or re-keyed the server, remove the line for \
+                 {label} from {} and reconnect.\n  \
+                 Otherwise, do not proceed until you trust the network path to the host.",
+                kh.display()
+            );
+        }
+        RuntimeError::Usage(m) => {
+            eprintln!("noissh: {m}\nRun 'noissh --help' for all options.");
+        }
+        _ => eprintln!("noissh: {e}"),
     }
 }
 
@@ -116,17 +146,45 @@ Examples:
   noissh user@host                 # interactive shell
   noissh user@host uname -a        # run one command, then exit
   noissh --ssh user@host           # force the SSH bootstrap
-  noissh user@host -L 8080:localhost:80
+  noissh -L 8080:localhost:80 user@host   # options go before the host
+
+Note: options must come before the host; anything after the host is the remote
+command.
 
 Docs: https://github.com/gedigi/noissh#documentation",
         ver = env!("CARGO_PKG_VERSION"),
     );
 }
 
+/// Print a usage error and exit with the conventional status 2. Used for
+/// command-line mistakes so they fail loudly instead of silently doing something
+/// surprising (e.g. dropping a malformed forward and opening a shell instead).
+fn usage_exit(msg: &str) -> ! {
+    eprintln!("noissh: {msg}\nRun 'noissh --help' for all options.");
+    exit(2);
+}
+
+/// Require a port-number value for `flag`, exiting with a usage error otherwise.
+fn port_value(v: Option<String>, flag: &str) -> u16 {
+    match v {
+        Some(s) => s.parse::<u16>().ok().filter(|&p| p > 0).unwrap_or_else(|| {
+            usage_exit(&format!("{flag} wants a port number (1-65535), got {s:?}"))
+        }),
+        None => usage_exit(&format!("{flag} requires a port number")),
+    }
+}
+
+/// Require a string value for `flag`, exiting with a usage error otherwise.
+fn string_value(v: Option<String>, flag: &str) -> String {
+    v.unwrap_or_else(|| usage_exit(&format!("{flag} requires a value")))
+}
+
 fn parse_args() -> Args {
+    // The optional config file supplies defaults; explicit flags override them.
+    let cfg = load_config(&config_file_path());
     let mut a = Args {
         ssh: false,
-        port: 51820,
+        port: cfg.port.unwrap_or(51820),
         target: None,
         server_cmd: "noisshd".to_string(),
         ssh_args: Vec::new(),
@@ -163,44 +221,21 @@ fn parse_args() -> Args {
             "--direct" => a.direct = true,
             "--no-install" => a.no_install = true,
             "-A" | "--forward-agent" => a.forward_agent = true,
-            "--port" => {
-                if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
-                    a.port = p;
-                }
-            }
-            "--server-cmd" => {
-                if let Some(c) = it.next() {
-                    a.server_cmd = c;
-                }
-            }
-            "--server-port" => {
-                if let Some(p) = it.next().and_then(|s| s.parse().ok()) {
-                    a.server_port = Some(p);
-                } else {
-                    eprintln!("noissh: --server-port wants a port number");
-                }
-            }
-            "-L" => {
-                if let Some(spec) = it.next().as_deref().and_then(parse_forward) {
-                    a.local_forwards.push(spec);
-                } else {
-                    eprintln!("noissh: ignoring malformed -L spec (want LPORT:HOST:PORT)");
-                }
-            }
-            "-R" => {
-                if let Some(spec) = it.next().as_deref().and_then(parse_forward) {
-                    a.remote_forwards.push(spec);
-                } else {
-                    eprintln!("noissh: ignoring malformed -R spec (want RPORT:HOST:PORT)");
-                }
-            }
-            "-D" => {
-                if let Some(spec) = it.next().as_deref().and_then(parse_dynamic) {
-                    a.dynamic_forwards.push(spec);
-                } else {
-                    eprintln!("noissh: ignoring malformed -D spec (want [BIND:]PORT)");
-                }
-            }
+            "--port" => a.port = port_value(it.next(), "--port"),
+            "--server-cmd" => a.server_cmd = string_value(it.next(), "--server-cmd"),
+            "--server-port" => a.server_port = Some(port_value(it.next(), "--server-port")),
+            "-L" => match it.next().as_deref().and_then(parse_forward) {
+                Some(spec) => a.local_forwards.push(spec),
+                None => usage_exit("-L wants LPORT:HOST:PORT (e.g. -L 8080:localhost:80)"),
+            },
+            "-R" => match it.next().as_deref().and_then(parse_forward) {
+                Some(spec) => a.remote_forwards.push(spec),
+                None => usage_exit("-R wants RPORT:HOST:PORT (e.g. -R 9000:localhost:22)"),
+            },
+            "-D" => match it.next().as_deref().and_then(parse_dynamic) {
+                Some(spec) => a.dynamic_forwards.push(spec),
+                None => usage_exit("-D wants [BIND:]PORT (e.g. -D 1080)"),
+            },
             "--put" => match it.next().as_deref().and_then(|s| s.split_once(':')) {
                 Some((local, remote)) if !local.is_empty() && !remote.is_empty() => {
                     let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
@@ -212,7 +247,7 @@ fn parse_args() -> Args {
                         local.to_string(),
                     ));
                 }
-                _ => eprintln!("noissh: --put wants LOCAL:REMOTE"),
+                _ => usage_exit("--put wants LOCAL:REMOTE (e.g. --put ./file.txt:/tmp/file.txt)"),
             },
             "--get" => match it.next().as_deref().and_then(|s| s.split_once(':')) {
                 Some((remote, local)) if !remote.is_empty() && !local.is_empty() => {
@@ -223,14 +258,14 @@ fn parse_args() -> Args {
                         local.to_string(),
                     ));
                 }
-                _ => eprintln!("noissh: --get wants REMOTE:LOCAL"),
+                _ => usage_exit("--get wants REMOTE:LOCAL (e.g. --get /var/log/app.log:./app.log)"),
             },
             "--" => a.ssh_args = it.by_ref().collect(),
             other => {
                 if a.target.is_none() && !other.starts_with('-') {
                     a.target = Some(other.to_string());
                 } else {
-                    eprintln!("noissh: ignoring unknown option {other:?}");
+                    usage_exit(&format!("unknown option {other:?}"));
                 }
             }
         }
@@ -242,16 +277,35 @@ fn run() -> Result<(), RuntimeError> {
     let args = parse_args();
     let Some(target) = args.target.clone() else {
         // No host to connect to. This is a usage error, not a bootstrap failure —
-        // say so plainly and point at --help rather than emitting a confusing
+        // say what to do, with an example, rather than emitting a confusing
         // "SSH bootstrap failed" (we never got far enough to bootstrap anything).
-        eprintln!(
-            "noissh: no host given\nusage: noissh [OPTIONS] [user@]host [command ...]\nTry 'noissh --help' for more information."
-        );
-        exit(2);
+        return Err(RuntimeError::Usage(
+            "no host given. Specify the host to connect to, for example:\n  \
+             noissh user@example.com            # interactive shell\n  \
+             noissh user@example.com uname -a   # run one command"
+                .to_string(),
+        ));
     };
 
     let dir = config_dir();
-    let keypair = load_or_generate_keypair(&dir.join("id"))?;
+    let id_path = dir.join("id");
+    // First-run: tell the user a key was created and show its public half, so a
+    // direct (non-bootstrap) setup isn't a silent dead end ("what's my key?").
+    let first_run = !id_path.exists();
+    let keypair = load_or_generate_keypair(&id_path)?;
+    if first_run {
+        eprintln!(
+            "noissh: generated a new identity key at {}",
+            id_path.display()
+        );
+        eprintln!(
+            "        your public key (add to a server's authorized_keys for direct connections):"
+        );
+        eprintln!(
+            "        {}",
+            PublicKey::from_bytes(&keypair.public)?.to_text()
+        );
+    }
     let kh_path = dir.join("known_hosts");
 
     let (cols, rows) = terminal_size();
@@ -314,16 +368,27 @@ fn run() -> Result<(), RuntimeError> {
                 // (unless the user demanded a direct connection).
                 Err(RuntimeError::Timeout) if !args.direct => {
                     eprintln!(
-                        "noissh: the server on udp/{} didn't answer; bootstrapping over SSH…",
+                        "noissh: no direct response from {host}:{}; bootstrapping over SSH…",
                         args.port
                     );
+                }
+                // Under `--direct` a timeout is terminal (no SSH fallback) — give
+                // a direct-mode-specific explanation instead of a bare timeout.
+                Err(RuntimeError::Timeout) => {
+                    return Err(RuntimeError::BadAddress(format!(
+                        "no response from {host}:{} on UDP. Is noisshd running there with that \
+                         port reachable? (drop --direct to bootstrap it over SSH.)",
+                        args.port
+                    )));
                 }
                 // A real failure (e.g. host-key mismatch) must not silently
                 // trigger an SSH bootstrap that would re-pin a key.
                 Err(e) => return Err(e),
             }
         } else if args.direct {
-            return Err(RuntimeError::SshBootstrap); // can't resolve, can't fall back
+            return Err(RuntimeError::BadAddress(format!(
+                "could not resolve host {host:?}"
+            )));
         }
     }
 
@@ -369,23 +434,29 @@ fn run() -> Result<(), RuntimeError> {
             .map_err(|e| {
                 // The SSH side worked but the UDP session didn't establish — the
                 // most common cause is the server's UDP port being unreachable
-                // (firewall/NAT). Point the user at the fix.
-                if matches!(e, RuntimeError::Timeout) {
-                    eprintln!(
-                        "noissh: connected over SSH but the UDP session to {host}:{udp_port} \
-                         timed out — that UDP port is likely blocked by a firewall/NAT. \
-                         Open it (or pick an open one with --server-port N) and retry."
-                    );
+                // (firewall/NAT). Replace the bare timeout with the actionable
+                // explanation (a single message, not a hint + generic line).
+                match e {
+                    RuntimeError::Timeout => RuntimeError::BadAddress(format!(
+                        "connected over SSH but the UDP session to {host}:{udp_port} timed out — \
+                         that UDP port is likely blocked by a firewall/NAT. Open it (or pick an \
+                         open one with --server-port N) and retry."
+                    )),
+                    other => other,
                 }
-                e
             })?,
         );
     }
 
     let mut client = client.expect("a client was established");
 
-    // Persist any newly-pinned host key (direct-mode TOFU).
+    // Persist any newly-pinned host key (direct-mode TOFU). Announce the pin so
+    // trust-on-first-use is a visible event the user can notice, like ssh does.
     if client.core().known_hosts_dirty() {
+        eprintln!(
+            "noissh: trusting host key for {label} on first use (pinned in {})",
+            kh_path.display()
+        );
         save_known_hosts(&kh_path, client.core().known_hosts())?;
     }
 

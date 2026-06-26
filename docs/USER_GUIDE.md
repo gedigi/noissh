@@ -241,15 +241,17 @@ typo never prevents startup). A missing file just means "all defaults".
 ```
 # ~/.config/noissh/config
 port = 51820
-term = xterm-256color
 ```
 
 Recognized keys:
 
 | Key | Type | Meaning |
 |---|---|---|
-| `port` | number | default UDP port for direct connections |
-| `term` | string | `$TERM` value to advertise to the remote shell |
+| `port` | number | default UDP port for direct connections (a `--port` flag overrides it) |
+
+The terminal type advertised to the remote shell is taken from your `$TERM`
+environment variable (falling back to `xterm-256color` if it is unset), so it
+does not need a config entry.
 
 ## Port forwarding
 
@@ -259,10 +261,10 @@ forward-only (no shell), like a `-N`-style session.
 
 ```sh
 # Local: localhost:8080 (your machine) -> 10.0.0.5:80 (reachable from the server)
-noissh --ssh user@server -L 8080:10.0.0.5:80
+noissh --ssh -L 8080:10.0.0.5:80 user@server
 
 # Remote: server:9000 -> localhost:3000 (on your machine)
-noissh --ssh user@server -R 9000:localhost:3000
+noissh --ssh -R 9000:localhost:3000 user@server
 ```
 
 `-R` listeners bind to loopback on the server, so forwarded ports are not
@@ -275,10 +277,10 @@ to whatever host:port each client requests, resolved via the server:
 
 ```sh
 # SOCKS proxy on localhost:1080
-noissh --ssh user@server -D 1080
+noissh --ssh -D 1080 user@server
 
 # bind a specific address
-noissh --ssh user@server -D 127.0.0.1:1080
+noissh --ssh -D 127.0.0.1:1080 user@server
 ```
 
 Point a SOCKS-aware application at the proxy and its connections exit from the
@@ -325,10 +327,10 @@ with an interactive shell or with `-L`/`-R`.
 
 ```sh
 # upload: local file -> remote path
-noissh --ssh user@server --put ./report.pdf /home/user/report.pdf
+noissh --ssh --put ./report.pdf:/home/user/report.pdf user@server
 
 # download: remote file -> local path
-noissh --ssh user@server --get /var/log/app.log ./app.log
+noissh --ssh --get /var/log/app.log:./app.log user@server
 ```
 
 The spec is split on the **first** colon. For `--put` the order is
@@ -348,7 +350,7 @@ that remote `git`/`ssh` can use the keys on your machine without copying them to
 the server:
 
 ```sh
-noissh --ssh user@server -A          # long form: --forward-agent
+noissh --ssh -A user@server          # long form: --forward-agent
 ```
 
 The server exposes an `SSH_AUTH_SOCK` in the shell's environment; connections to
@@ -366,10 +368,11 @@ is `0600`, so other local users on the server cannot reach your forwarded agent.
 ### `noissh`
 
 ```
-noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--put SPEC] [--get SPEC] [-A] [user@]host [command ...] [-- <ssh args>]
+noissh [OPTIONS] [user@]host [command ...] [-- <ssh args>]
   --ssh           force the SSH bootstrap (skip the direct probe)
   --direct        direct connection only; never fall back to SSH
   --port N        UDP port for direct connection (default 51820)
+  --server-port N pin the bootstrapped server's UDP port (firewall-friendly)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   --no-install    do not auto-install noisshd on the remote if it is missing
   -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
@@ -378,10 +381,14 @@ noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC]
   --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
   --get REMOTE:LOCAL   download REMOTE to LOCAL, then exit (no shell)
   -A, --forward-agent  forward your local auth agent to the shell session
+  -h, --help      print usage and exit
+  -V, --version   print the version and exit
   command ...     run this command on the server non-interactively (ssh-style),
                   then exit with its status; omit it for an interactive shell
   -- <args>       pass remaining args to ssh (only with --ssh)
 ```
+
+All options must come before the host.
 
 Everything after `[user@]host` is treated as the remote command, verbatim — its
 own flags are not parsed by noissh. Use `--` before the host's trailing position
@@ -395,25 +402,30 @@ CONNECT only.
 ### `noisshd`
 
 ```
-noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--command CMD ...] [-v]
+noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--user NAME] [--command CMD ...] [-v]
 noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
   --listen ADDR        bind address (default 0.0.0.0:51820)
   -v, --verbose        log session lifecycle (established/ended, active count)
                        and fatal socket errors
   --key PATH           static key file (default <config>/noisshd_key)
   --authorized-keys P  authorized_keys file (default <config>/authorized_keys)
+  --user NAME          drop sessions to this user (requires root); file transfer,
+                       agent forwarding, and exec are refused in this mode
   --command CMD ...    run this command instead of the login shell
   --one-shot           ephemeral key, serve one session, then exit (SSH bootstrap)
   --authorize <b64>    the single client key to trust in one-shot mode
   --bind ADDR          bind address in one-shot mode (default 0.0.0.0:0)
+  -h, --help           print usage and exit
+  -V, --version        print the version and exit
 ```
 
 ### `noissh-keygen`
 
 ```
 noissh-keygen [--key PATH]
-  --key PATH   keypair file to ensure/print (default <config>/id)
-  --help       print usage
+  --key PATH      keypair file to ensure/print (default <config>/id)
+  -h, --help      print usage
+  -V, --version   print the version
 ```
 
 Ensures the keypair exists (creating it `0600` if missing) and prints its public

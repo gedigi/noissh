@@ -1,4 +1,4 @@
-.TH NOISSHD 1 "2026-06-19" "noissh 0.4.13" "System Administration"
+.TH NOISSHD 1 "2026-06-19" "noissh 0.4.14" "System Administration"
 .SH NAME
 noisshd \- resilient remote shell over the Noise Protocol Framework (server)
 .SH SYNOPSIS
@@ -9,6 +9,8 @@ noisshd \- resilient remote shell over the Noise Protocol Framework (server)
 .IR PATH ]
 .RB [ \-\-authorized\-keys
 .IR PATH ]
+.RB [ \-\-user
+.IR NAME ]
 .RB [ \-\-command
 .IR "CMD ..." ]
 .RB [ \-v ]
@@ -57,6 +59,15 @@ Authorized client keys (default <config>/authorized_keys).
 .BI \-\-command " CMD ..."
 Run this command instead of the login shell (the remaining arguments form the
 command). Useful for restricted or scripted sessions.
+.TP
+.BI \-\-user " NAME"
+Standalone mode only: drop each session to user
+.I NAME
+(uid/gid) before exec. Requires running
+.B noisshd
+as root. File transfer, agent forwarding, and remote\-command exec are refused in
+this mode, because the daemon process itself does not drop privileges; prefer the
+SSH bootstrap (or run the daemon as the target user) for full multi\-user use.
 .TP
 .B \-\-one\-shot
 Ephemeral key; serve a single session, then exit.

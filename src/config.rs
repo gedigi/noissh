@@ -149,8 +149,6 @@ pub fn config_file_path() -> PathBuf {
 pub struct Config {
     /// Default UDP port for direct connections.
     pub port: Option<u16>,
-    /// `$TERM` value to advertise to the remote shell.
-    pub term: Option<String>,
 }
 
 /// Parse a simple config file. The format is one setting per line as either
@@ -182,14 +180,12 @@ pub fn load_config(path: &Path) -> Config {
         if value.is_empty() {
             continue;
         }
-        match key {
-            "port" => {
-                if let Ok(p) = value.parse::<u16>() {
-                    cfg.port = Some(p);
-                }
-            }
-            "term" => cfg.term = Some(value.to_string()),
-            _ => {} // unknown key: ignore
+        // Only `port` is recognized today; unknown keys are ignored so a config
+        // written for a newer version never aborts startup.
+        if key == "port"
+            && let Ok(p) = value.parse::<u16>()
+        {
+            cfg.port = Some(p);
         }
     }
     cfg
@@ -226,10 +222,10 @@ mod tests {
 
     #[test]
     fn config_parses_valid_lines_both_separators() {
+        // Both `key = value` and `key value` separators work; unknown keys ignored.
         let path = write_temp_config("valid", "port = 2222\nterm xterm-256color\n");
         let cfg = load_config(&path);
         assert_eq!(cfg.port, Some(2222));
-        assert_eq!(cfg.term.as_deref(), Some("xterm-256color"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -239,7 +235,6 @@ mod tests {
         let path = write_temp_config("comments", body);
         let cfg = load_config(&path);
         assert_eq!(cfg.port, Some(51820));
-        assert_eq!(cfg.term, None);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -249,18 +244,16 @@ mod tests {
         let cfg = load_config(&path);
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.port, None);
-        assert_eq!(cfg.term, None);
     }
 
     #[test]
     fn config_ignores_bad_and_unknown_lines() {
         // Bad port value, unknown key, bare key with no value, and a junk line
-        // are all skipped; the one valid line still takes effect.
-        let body = "port = not-a-number\nunknown = whatever\nbareword\n=novalue\nterm = vt100\n";
+        // are all skipped without aborting the parse.
+        let body = "port = not-a-number\nunknown = whatever\nbareword\n=novalue\n";
         let path = write_temp_config("bad", body);
         let cfg = load_config(&path);
         assert_eq!(cfg.port, None); // bad value ignored, no default applied here
-        assert_eq!(cfg.term.as_deref(), Some("vt100"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -1,6 +1,6 @@
 # noissh Security Model
 
-> **Status:** noissh is new software (v0.1). The protocol and code have **not**
+> **Status:** noissh is new software (v0.4.x). The protocol and code have **not**
 > been independently audited. Do not rely on it for high-stakes use yet. Reports
 > of security issues are welcome — see [Reporting](#reporting).
 

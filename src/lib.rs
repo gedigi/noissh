@@ -23,26 +23,41 @@ pub use server::{Server, ServerCore};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    #[error("io: {0}")]
+    #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("noise: {0}")]
+    #[error("encryption error: {0}")]
     Noise(#[from] noise_core::NoiseError),
-    #[error("transport: {0}")]
+    #[error("transport error: {0}")]
     Transport(#[from] transport::TransportError),
-    #[error("handshake: {0}")]
+    #[error("handshake error: {0}")]
     HandshakeDriver(#[from] proto::HandshakeError),
-    #[error("auth parse: {0}")]
+    #[error("could not parse a key: {0}")]
     Auth(#[from] auth::AuthError),
-    #[error("handshake protocol error")]
+    #[error(
+        "handshake failed — the server rejected the connection. Check that your key is in the \
+         server's authorized_keys (run noissh-keygen to see your public key)."
+    )]
     Handshake,
-    #[error("HOST KEY MISMATCH for {0} — possible man-in-the-middle; aborting")]
+    /// Carries the host:port label; the binary's error printer appends the
+    /// known_hosts path and the recovery steps (it knows the config location).
+    #[error("host key changed for {0} — possible man-in-the-middle; aborting")]
     HostKeyMismatch(String),
-    #[error("malformed key file")]
+    #[error("malformed key file (expected lines 'private <base64>' and 'public <base64>')")]
     BadKeyFile,
-    #[error("operation timed out")]
+    #[error("the connection timed out")]
     Timeout,
-    #[error("SSH bootstrap failed: no connect line from remote noisshd")]
-    SshBootstrap,
+    /// A bad or unresolvable network address, with a complete user-facing reason.
+    #[error("{0}")]
+    BadAddress(String),
+    /// An SSH-bootstrap failure carrying a complete, user-facing reason (often the
+    /// remote `ssh`/installer's own error text, or "no connect line" when the
+    /// remote server started but printed nothing parseable).
+    #[error("{0}")]
+    SshFailed(String),
+    /// A command-line usage error with a complete, user-facing message. The
+    /// binary's printer exits with status 2 for these.
+    #[error("{0}")]
+    Usage(String),
     #[error("file transfer failed: {0}")]
     Transfer(String),
     #[error("remote command failed: {0}")]

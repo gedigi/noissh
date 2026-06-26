@@ -114,7 +114,26 @@ enum Attempt {
     /// The remote `noisshd` command was not found (likely not installed).
     NotFound,
     /// Some other failure (no connect line, but not a missing-command signal).
-    Failed,
+    /// Carries the remote `ssh`/server's own diagnostic (its last stderr line),
+    /// so the user sees the real cause (auth denied, host unreachable, …) rather
+    /// than a generic message.
+    Failed(String),
+}
+
+/// Extract the most useful diagnostic line from a failed `ssh` invocation: the
+/// last non-empty stderr line (where ssh prints "Permission denied", "Could not
+/// resolve hostname", etc.), falling back to a generic note.
+fn failure_reason(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| format!("the SSH bootstrap failed: {l}"))
+        .unwrap_or_else(|| {
+            "the SSH bootstrap failed (ssh produced no output — check your SSH access to the host)"
+                .to_string()
+        })
 }
 
 /// The `ssh` program, overridable via `$NOISSH_SSH` (tests / custom transports).
@@ -180,10 +199,11 @@ fn attempt(
     // the stream.
     if let Some((port, server_pubkey)) = stdout.lines().rev().find_map(parse_connect_line) {
         let host = host_of(target);
-        let server_addr = (host, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or(RuntimeError::SshBootstrap)?;
+        let server_addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+            RuntimeError::BadAddress(format!(
+                "connected over SSH but could not resolve {host}:{port} for the UDP session"
+            ))
+        })?;
         // The server prints its version just before the connect line; absent on
         // pre-v0.4.11 servers, in which case we simply can't offer an upgrade.
         let server_version = stdout.lines().rev().find_map(parse_version_line);
@@ -196,7 +216,7 @@ fn attempt(
     if looks_like_missing_command(&output) {
         Ok(Attempt::NotFound)
     } else {
-        Ok(Attempt::Failed)
+        Ok(Attempt::Failed(failure_reason(&output)))
     }
 }
 
@@ -239,7 +259,9 @@ fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), Runtime
     if status.success() {
         Ok(())
     } else {
-        Err(RuntimeError::SshBootstrap)
+        Err(RuntimeError::SshFailed(
+            "failed to install noisshd on the remote (see the installer output above)".to_string(),
+        ))
     }
 }
 
@@ -303,10 +325,21 @@ pub fn bootstrap(
                     eprintln!("noissh: noisshd installed; connecting…");
                     Ok(b)
                 }
-                _ => Err(RuntimeError::SshBootstrap),
+                Attempt::Failed(reason) => Err(RuntimeError::SshFailed(reason)),
+                Attempt::NotFound => Err(RuntimeError::SshFailed(
+                    "installed noisshd but it still could not be launched on the remote"
+                        .to_string(),
+                )),
             }
         }
-        _ => Err(RuntimeError::SshBootstrap),
+        Attempt::Failed(reason) => Err(RuntimeError::SshFailed(reason)),
+        // `noisshd` is missing but we were told not to install it (or a custom
+        // --server-cmd was given, so we won't auto-install over it).
+        Attempt::NotFound => Err(RuntimeError::SshFailed(format!(
+            "noisshd was not found on {}. Install it there, or omit --no-install / --server-cmd to \
+             let noissh install it over SSH.",
+            host_of(target)
+        ))),
     }
 }
 
