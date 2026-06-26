@@ -88,6 +88,14 @@ struct Args {
     /// Pin the bootstrapped server's UDP port (so it can be opened in a firewall)
     /// instead of an ephemeral one.
     server_port: Option<u16>,
+    /// Narrate the connection sequence (direct probe, handshake, bootstrap) to
+    /// stderr — for diagnosing "hangs at connect" (usually a blocked UDP port).
+    verbose: bool,
+    /// `--forget-host HOST`: remove the pinned server key(s) for HOST and exit.
+    forget_host: Option<String>,
+    /// `--copy-id`: install our public key into the remote authorized_keys over
+    /// SSH, then exit.
+    copy_id: bool,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -138,6 +146,11 @@ Options:
   --put LOCAL:REMOTE    upload LOCAL to REMOTE, then exit
   --get REMOTE:LOCAL    download REMOTE to LOCAL, then exit
   -A, --forward-agent   forward your local SSH agent to the shell session
+  --copy-id             install your public key into the remote authorized_keys
+                        over SSH (like ssh-copy-id), then exit
+  --forget-host HOST    remove the pinned server key(s) for HOST, then exit
+                        (recovers from an intentional server re-key)
+  -v, --verbose         narrate the connection sequence (diagnose connect hangs)
   -- <ssh args ...>     pass remaining args to ssh (only with the bootstrap)
   -h, --help            print this help and exit
   -V, --version         print the version and exit
@@ -197,6 +210,9 @@ fn parse_args() -> Args {
         command: Vec::new(),
         direct: false,
         server_port: None,
+        verbose: false,
+        forget_host: None,
+        copy_id: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -219,6 +235,9 @@ fn parse_args() -> Args {
             }
             "--ssh" => a.ssh = true,
             "--direct" => a.direct = true,
+            "-v" | "--verbose" => a.verbose = true,
+            "--copy-id" => a.copy_id = true,
+            "--forget-host" => a.forget_host = Some(string_value(it.next(), "--forget-host")),
             "--no-install" => a.no_install = true,
             "-A" | "--forward-agent" => a.forward_agent = true,
             "--port" => a.port = port_value(it.next(), "--port"),
@@ -275,6 +294,23 @@ fn parse_args() -> Args {
 
 fn run() -> Result<(), RuntimeError> {
     let args = parse_args();
+
+    // `--forget-host HOST`: a maintenance action that needs no connection. Remove
+    // every pinned label for HOST (any port) and persist, so recovering from an
+    // intentional server re-key doesn't mean hand-editing known_hosts.
+    if let Some(host) = &args.forget_host {
+        let kh_path = config_dir().join("known_hosts");
+        let mut known = load_known_hosts(&kh_path)?;
+        let removed = known.remove_matching(host);
+        if removed.is_empty() {
+            eprintln!("noissh: no pinned host key for {host:?} in {}", kh_path.display());
+        } else {
+            save_known_hosts(&kh_path, &known)?;
+            eprintln!("noissh: removed pinned host key(s): {}", removed.join(", "));
+        }
+        return Ok(());
+    }
+
     let Some(target) = args.target.clone() else {
         // No host to connect to. This is a usage error, not a bootstrap failure —
         // say what to do, with an example, rather than emitting a confusing
@@ -307,6 +343,19 @@ fn run() -> Result<(), RuntimeError> {
         );
     }
     let kh_path = dir.join("known_hosts");
+
+    // `--copy-id`: push our public key into the remote authorized_keys over SSH
+    // (the direct-mode equivalent of ssh-copy-id), then exit. Needs no UDP/Noise
+    // session — it's pure setup so a later direct connection is authorized.
+    if args.copy_id {
+        let line = PublicKey::from_bytes(&keypair.public)?.to_text();
+        ssh::copy_id(&target, &line, &args.ssh_args)?;
+        eprintln!(
+            "noissh: {target} can now authorize direct connections from this key.\n  \
+             Connect with: noissh {target}"
+        );
+        return Ok(());
+    }
 
     let (cols, rows) = terminal_size();
 
@@ -345,12 +394,30 @@ fn run() -> Result<(), RuntimeError> {
     // direct probe would either mis-pin its key or spuriously mismatch.
     let try_direct = args.direct || (!args.ssh && known.get(&label).is_some());
 
+    if args.verbose {
+        if args.ssh {
+            eprintln!("noissh: --ssh given; skipping the direct probe");
+        } else if try_direct {
+            eprintln!(
+                "noissh: trying a direct UDP session to {label} first (pinned: {})",
+                if known.get(&label).is_some() { "yes" } else { "no" }
+            );
+        } else {
+            eprintln!(
+                "noissh: no pin for {label}; going straight to the SSH bootstrap"
+            );
+        }
+    }
+
     if try_direct {
         if let Some(addr) = (host.as_str(), args.port)
             .to_socket_addrs()
             .ok()
             .and_then(|mut a| a.next())
         {
+            if args.verbose {
+                eprintln!("noissh: resolved {host} to {addr}; sending Noise handshake (UDP)…");
+            }
             match Client::connect_with(
                 &keypair,
                 known,
@@ -363,7 +430,12 @@ fn run() -> Result<(), RuntimeError> {
                 agent_sock.clone(),
                 DIRECT_CONNECT_TIMEOUT,
             ) {
-                Ok(c) => client = Some(c),
+                Ok(c) => {
+                    if args.verbose {
+                        eprintln!("noissh: direct session established to {label}");
+                    }
+                    client = Some(c)
+                }
                 // The known standing server didn't answer: fall back to SSH
                 // (unless the user demanded a direct connection).
                 Err(RuntimeError::Timeout) if !args.direct => {
@@ -399,6 +471,11 @@ fn run() -> Result<(), RuntimeError> {
         // covers both direct and bootstrapped sessions. The server falls back to
         // an ephemeral port only if it's already taken.
         let server_port = args.server_port.unwrap_or(args.port);
+        if args.verbose {
+            eprintln!(
+                "noissh: SSH bootstrap → launching noisshd on {target} (server UDP port {server_port})…"
+            );
+        }
         let boot = ssh::bootstrap(
             &target,
             std::slice::from_ref(&args.server_cmd),
@@ -415,6 +492,12 @@ fn run() -> Result<(), RuntimeError> {
         // handshake: an attacker who can't produce the SSH-delivered key can't
         // impersonate the server.
         let udp_port = boot.server_addr.port();
+        if args.verbose {
+            eprintln!(
+                "noissh: SSH bootstrap done; server at {} — opening Noise/UDP session…",
+                boot.server_addr
+            );
+        }
         let label = format!("{host}:{udp_port}");
         let mut boot_known = KnownHosts::new();
         boot_known.check_or_add(&label, &PublicKey::from_bytes(&boot.server_pubkey)?);

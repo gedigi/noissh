@@ -400,6 +400,56 @@ fn prompt_yes_no(question: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }
 
+/// Install the client's public key into the remote `authorized_keys` over SSH,
+/// like `ssh-copy-id`. Creates `~/.config/noissh` (`0700`) and
+/// `authorized_keys` (`0600`) if needed and appends the key only if it isn't
+/// already present (idempotent). `pubkey_line` is the full `noissh-x25519
+/// <base64>` text; it contains only key-type and base64 characters, so
+/// single-quoting it in the remote command keeps it inert.
+///
+/// Returns `Ok(())` on success (whether newly added or already present). Errors
+/// if the SSH invocation itself fails (auth denied, host unreachable, …).
+pub fn copy_id(
+    target: &str,
+    pubkey_line: &str,
+    extra_ssh_args: &[String],
+) -> Result<(), RuntimeError> {
+    // Defence in depth: the key line is only `noissh-x25519 <base64>`, but reject
+    // anything with a single quote or control character so it can never break out
+    // of the single-quoted remote string.
+    if pubkey_line.contains('\'') || pubkey_line.chars().any(|c| c.is_control()) {
+        return Err(RuntimeError::SshFailed(
+            "refusing to copy a key line containing quotes or control characters".to_string(),
+        ));
+    }
+    // `dir=${XDG_CONFIG_HOME:-$HOME/.config}/noissh` mirrors the client/server
+    // config_dir() logic so the key lands where noisshd actually reads it. Use
+    // grep -qxF for an exact, fixed-string, whole-line match to avoid duplicates.
+    let remote = format!(
+        "set -e; dir=\"${{XDG_CONFIG_HOME:-$HOME/.config}}/noissh\"; \
+         mkdir -p \"$dir\"; chmod 700 \"$dir\" 2>/dev/null || true; \
+         ak=\"$dir/authorized_keys\"; touch \"$ak\"; chmod 600 \"$ak\" 2>/dev/null || true; \
+         if grep -qxF '{pubkey_line}' \"$ak\"; then echo 'noissh: key already authorized'; \
+         else echo '{pubkey_line}' >> \"$ak\"; echo 'noissh: key added'; fi"
+    );
+    let mut cmd = Command::new(ssh_prog());
+    cmd.args(extra_ssh_args);
+    cmd.arg("--"); // terminate ssh option parsing (target may start with `-`)
+    cmd.arg(target);
+    cmd.arg(remote);
+    let output = cmd.output()?;
+    if output.status.success() {
+        // Surface the remote's "key added" / "already authorized" line.
+        let msg = String::from_utf8_lossy(&output.stdout);
+        for line in msg.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            eprintln!("{line}");
+        }
+        Ok(())
+    } else {
+        Err(RuntimeError::SshFailed(failure_reason(&output)))
+    }
+}
+
 /// Detach from the controlling SSH session so the server survives `ssh`
 /// returning. Uses the `daemonize` crate (double fork + `setsid` + stdio
 /// redirected to `/dev/null`). Call AFTER the
