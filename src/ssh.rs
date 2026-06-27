@@ -394,6 +394,38 @@ fn maybe_offer_upgrade(
     Ok(b)
 }
 
+/// For a directly-connected session (no SSH bootstrap): if the standing daemon's
+/// `server_version` is older than this client, offer — default No — to upgrade it
+/// over SSH. On yes, install the new binary; because a standing daemon keeps
+/// running the old binary until restarted (and we can't know how it's
+/// supervised), we say so rather than pretend it took effect. Never prompts when
+/// stdin isn't a terminal.
+pub fn maybe_offer_direct_upgrade(target: &str, extra_ssh_args: &[String], server_version: &str) {
+    let ours = env!("CARGO_PKG_VERSION");
+    if !version_is_older(server_version, ours) {
+        return;
+    }
+    let question = format!(
+        "noissh: noisshd on {} is v{server_version}, but this client is v{ours}. Upgrade it now?",
+        host_of(target)
+    );
+    if !prompt_yes_no(&question) {
+        return;
+    }
+    match install_remote(target, extra_ssh_args) {
+        Ok(()) => eprintln!(
+            "noissh: installed noisshd v{ours} on {}. Restart the running daemon to apply it; \
+             the current session keeps using v{server_version}.",
+            host_of(target)
+        ),
+        Err(_) => {
+            eprintln!(
+                "noissh: upgrade install failed; continuing with the existing v{server_version}."
+            )
+        }
+    }
+}
+
 /// Ask a yes/no question on the terminal, defaulting to No. Returns false
 /// (without prompting) when stdin is not a terminal, so scripts never block.
 fn prompt_yes_no(question: &str) -> bool {

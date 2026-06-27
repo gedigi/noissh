@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2]
+
+### Added
+
+- **Direct connections can now offer to upgrade an outdated standing daemon.**
+  The server announces its version in the session (a new `ServerVersion` control
+  message sent right after the handshake), so a direct connection — not just the
+  SSH bootstrap — notices when the remote `noisshd` is older than your client and
+  offers the same `[y/N]` upgrade. Accepting installs the new binary over SSH;
+  since a standing daemon keeps running the old binary until restarted, noissh
+  tells you to restart it (e.g. `systemctl --user restart noisshd`) rather than
+  pretending it took effect. The check runs only on interactive connections to a
+  real terminal (scripts, transfers, and forwards are never paused) and is
+  skipped by `--no-install`. Servers older than v0.5.2 don't announce a version,
+  so they're simply not prompted until upgraded once.
+
 ## [0.5.1]
 
 ### Added

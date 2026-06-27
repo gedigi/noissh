@@ -11,7 +11,7 @@
 //!   noissh --direct [--port N] [user@]host
 //!       Direct only — never fall back to SSH.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::ToSocketAddrs;
 use std::process::exit;
 use std::time::Duration;
@@ -398,6 +398,10 @@ fn run() -> Result<(), RuntimeError> {
         eprintln!("noissh: ~/.ssh/config: {alias} → HostName {host}");
     }
     let mut client = None;
+    // Whether we reached the server by a direct UDP connection (vs the SSH
+    // bootstrap). Only direct connections do the in-session version check below;
+    // the bootstrap already learns the version from the connect line.
+    let mut connected_direct = false;
 
     let label = format!("{host}:{}", args.port);
     let known = load_known_hosts(&kh_path)?;
@@ -450,7 +454,8 @@ fn run() -> Result<(), RuntimeError> {
                     if args.verbose {
                         eprintln!("noissh: direct session established to {label}");
                     }
-                    client = Some(c)
+                    client = Some(c);
+                    connected_direct = true;
                 }
                 // The known standing server didn't answer: fall back to SSH
                 // (unless the user demanded a direct connection).
@@ -560,6 +565,20 @@ fn run() -> Result<(), RuntimeError> {
         save_known_hosts(&kh_path, client.core().known_hosts())?;
     }
 
+    // On a direct interactive connection, learn the standing daemon's version
+    // (sent in-session) and, if it's older than us, offer to upgrade it — the
+    // same prompt the SSH bootstrap gives. Gated to interactive + a real terminal
+    // so scripts/transfers/forwards never pause; the brief wait is hidden by the
+    // terminal setup that follows. `--no-install` opts out.
+    if connected_direct
+        && want_shell
+        && !args.no_install
+        && std::io::stdin().is_terminal()
+        && let Some(remote_v) = client.wait_for_server_version(DIRECT_VERSION_WAIT)
+    {
+        ssh::maybe_offer_direct_upgrade(&target, &args.ssh_args, &remote_v);
+    }
+
     if !args.command.is_empty() {
         // ssh-style: run the trailing command and exit with its status. The args
         // are joined and run via the remote shell (so quoting/redirs behave).
@@ -598,6 +617,11 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Handshake timeout for the SSH-bootstrapped session (the server is freshly
 /// launched and known to be there).
 const BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a direct interactive connection waits for the server's in-session
+/// version announcement before giving up the upgrade check. A v0.5.2+ daemon
+/// sends it within ~1 RTT (the wait ends early); only a pre-v0.5.2 daemon, which
+/// never sends one, waits the whole window — and only on interactive connects.
+const DIRECT_VERSION_WAIT: Duration = Duration::from_millis(400);
 
 fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};

@@ -32,6 +32,9 @@ struct ServerSession {
     exit_ticks: u32,
     /// Reliable stream multiplexer (port forwarding etc.) for this session.
     mux: StreamMux,
+    /// Whether we have sent our [`ControlMsg::ServerVersion`] to this client yet
+    /// (sent once, just after the session is established).
+    version_sent: bool,
 }
 
 /// How many ticks to keep retransmitting the Exit notice before reclaiming a
@@ -250,6 +253,7 @@ impl ServerCore {
                 exit_status: None,
                 exit_ticks: 0,
                 mux: StreamMux::new(false),
+                version_sent: false,
             };
             if let Some(old_sid) = existing
                 && let Some(mut old) = self.sessions.remove(&old_sid)
@@ -444,6 +448,19 @@ impl ServerCore {
                 }
                 finished.push(sid);
                 continue;
+            }
+            // Announce our version once, so a directly-connected client can offer
+            // to upgrade an outdated standing daemon (the bootstrap learns the
+            // version from the connect line; this is the equivalent over the
+            // session). Best-effort: if the seal fails it is retried next tick.
+            if !sess.version_sent
+                && let Some(addr) = sess.session.peer_addr()
+                && let Ok(pkt) = sess.session.seal(&[Frame::Control {
+                    data: ControlMsg::ServerVersion(env!("CARGO_PKG_VERSION").to_string()).encode(),
+                }])
+            {
+                out.push((addr, pkt));
+                sess.version_sent = true;
             }
             // Drain available PTY output.
             if let Some(pty) = &mut sess.pty {

@@ -55,6 +55,42 @@ fn spawn_server(
 }
 
 #[test]
+fn e2e_server_announces_version_in_session() {
+    // The server sends its version over the session right after the handshake, so
+    // a direct connection can notice an outdated standing daemon (no SSH bootstrap
+    // needed). The client should learn the server's version without any input.
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "test");
+
+    let srv = spawn_server(
+        authorized,
+        server_kp,
+        vec!["/bin/sh".into(), "-c".into(), "sleep 0.5".into()],
+    );
+
+    let mut client = Client::connect(
+        &client_kp,
+        KnownHosts::new(),
+        format!("127.0.0.1:{}", srv.addr.port()),
+        srv.addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+    )
+    .unwrap();
+
+    let got = client.wait_for_server_version(Duration::from_secs(3));
+    // The test binary and the server share the workspace version.
+    assert_eq!(got.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        client.core().server_version(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn e2e_shell_output_over_udp() {
     let server_kp = generate_keypair().unwrap();
     let client_kp = generate_keypair().unwrap();

@@ -162,8 +162,13 @@ color: [0]                | [1][index u8] | [2][r u8][g u8][b u8]
 0x02 Resize        : cols varint, rows varint
 0x03 Exit          : status zigzag varint
 0x06 RemoteForward : bind_port varint, target string   (client→server, -R)
+0x07 Bye           : (no payload)                       (client→server)
+0x08 ServerVersion : version string                     (server→client)
 ```
 
+`ServerVersion` is sent once just after the session is established, so a direct
+connection can notice an outdated standing daemon and offer to upgrade it (the
+same check the SSH bootstrap makes from the connect line).
 `OpenShell`'s `agent` byte requests SSH agent forwarding (`-A`). Strings are
 `varint length` + UTF-8 bytes. (Tags `0x04`/`0x05` are reserved — they were a
 never-wired second-factor prompt/response, since removed.)

@@ -41,6 +41,11 @@ pub enum ControlMsg {
     /// than waiting for the idle-reap grace). Sent on clean completion of a
     /// non-interactive task (e.g. a remote command or a file transfer).
     Bye,
+    /// Server → client: the server's version, sent once just after the session
+    /// is established. Lets a direct connection notice an outdated standing
+    /// daemon and offer to upgrade it — the same check the SSH bootstrap does
+    /// from the connect line, but over the session so it works without bootstrap.
+    ServerVersion(String),
 }
 
 const M_OPEN_SHELL: u8 = 1;
@@ -49,6 +54,7 @@ const M_EXIT: u8 = 3;
 // Tags 4 and 5 were a never-wired second-factor prompt/response; left reserved.
 const M_REMOTE_FORWARD: u8 = 6;
 const M_BYE: u8 = 7;
+const M_SERVER_VERSION: u8 = 8;
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u64);
@@ -106,6 +112,10 @@ impl ControlMsg {
                 put_str(&mut out, target);
             }
             ControlMsg::Bye => out.push(M_BYE),
+            ControlMsg::ServerVersion(v) => {
+                out.push(M_SERVER_VERSION);
+                put_str(&mut out, v);
+            }
         }
         out
     }
@@ -142,6 +152,7 @@ impl ControlMsg {
                 ControlMsg::RemoteForward { bind_port, target }
             }
             M_BYE => ControlMsg::Bye,
+            M_SERVER_VERSION => ControlMsg::ServerVersion(get_str(buf, &mut pos)?),
             other => return Err(ControlError::Unknown(other)),
         })
     }
@@ -181,6 +192,8 @@ mod tests {
             target: "127.0.0.1:80".into(),
         });
         roundtrip(ControlMsg::Bye);
+        roundtrip(ControlMsg::ServerVersion("0.5.2".into()));
+        roundtrip(ControlMsg::ServerVersion(String::new()));
     }
 
     #[test]

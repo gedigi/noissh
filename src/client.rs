@@ -47,6 +47,9 @@ pub struct ClientCore {
     remote_forwards: Vec<(u16, String)>,
     remote_forward_ticks: u32,
     known_hosts_dirty: bool,
+    /// The server's version, learned from its [`ControlMsg::ServerVersion`] after
+    /// the session is established (a pre-v0.5.2 server never sends one).
+    server_version: Option<String>,
 }
 
 /// Bound on OpenShell retransmissions, so a shell that produces no screen output
@@ -99,6 +102,7 @@ impl ClientCore {
             remote_forwards: Vec::new(),
             remote_forward_ticks: 0,
             known_hosts_dirty: false,
+            server_version: None,
         };
         Ok((core, first))
     }
@@ -132,6 +136,11 @@ impl ClientCore {
 
     pub fn known_hosts_dirty(&self) -> bool {
         self.known_hosts_dirty
+    }
+
+    /// The server's announced version, if it sent one (pre-v0.5.2 servers don't).
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 
     /// Queue locally-typed bytes.
@@ -232,11 +241,11 @@ impl ClientCore {
                     self.need_ack = true;
                 }
                 Frame::Ack { seq } => self.shell.on_input_ack(seq),
-                Frame::Control { data } => {
-                    if let Ok(ControlMsg::Exit { status }) = ControlMsg::decode(&data) {
-                        self.exited = Some(status);
-                    }
-                }
+                Frame::Control { data } => match ControlMsg::decode(&data) {
+                    Ok(ControlMsg::Exit { status }) => self.exited = Some(status),
+                    Ok(ControlMsg::ServerVersion(v)) => self.server_version = Some(v),
+                    _ => {}
+                },
                 f @ (Frame::StreamOpen { .. }
                 | Frame::StreamData { .. }
                 | Frame::StreamAck { .. }
@@ -1102,6 +1111,31 @@ impl Client {
     pub fn pump_once(&mut self) -> Result<(), RuntimeError> {
         self.recv_and_handle()?;
         self.flush()
+    }
+
+    /// Pump the established session for up to `timeout`, returning as soon as the
+    /// server announces its version (or the deadline passes). Lets a direct
+    /// connection learn whether a standing daemon is outdated before entering the
+    /// session. Returns `None` for a pre-v0.5.2 server (which never announces).
+    pub fn wait_for_server_version(&mut self, timeout: Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.core.server_version().is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // Block for at most a short slice per iteration, so this can never
+            // become a busy-spin regardless of the socket's blocking mode. (The
+            // caller enters the interactive loop next, which reconfigures the
+            // socket, so we needn't restore the timeout.)
+            let _ = self
+                .socket
+                .set_read_timeout(Some(remaining.min(Duration::from_millis(20))));
+            if self.pump_once().is_err() {
+                break;
+            }
+        }
+        self.core.server_version().map(str::to_string)
     }
 }
 
