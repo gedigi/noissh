@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-06-19" "noissh 0.4.13" "User Commands"
+.TH NOISSH 1 "2026-06-19" "noissh 0.4.14" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -10,8 +10,23 @@ noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .RB [ \-\-server\-cmd
 .IR CMD ]
 .RB [ \-\-no\-install ]
+.RB [ \-\-server\-port
+.IR N ]
+.RB [ \-L
+.IR SPEC ]
+.RB [ \-R
+.IR SPEC ]
 .RB [ \-D
 .IR SPEC ]
+.RB [ \-\-put
+.IR SPEC ]
+.RB [ \-\-get
+.IR SPEC ]
+.RB [ \-A ]
+.RB [ \-\-copy\-id ]
+.RB [ \-\-forget\-host
+.IR HOST ]
+.RB [ \-v ]
 .RI [ user @] host
 .RI [ command "" ...]
 .RB [ \-\-
@@ -188,6 +203,31 @@ can use your local keys without copying them to the server. Requires
 to be set locally; if it is unset, noissh warns and continues without agent
 forwarding.
 .TP
+.B \-\-copy\-id
+Install this client's public key into the remote
+.I authorized_keys
+over SSH (the direct\-mode equivalent of
+.BR ssh\-copy\-id (1)),
+then exit. The key is appended to
+.I ~/.config/noissh/authorized_keys
+on the server (created 0600, its directory 0700) only if not already present.
+After this, a direct connection from this key is authorized.
+.TP
+.BI \-\-forget\-host " HOST"
+Remove the pinned server key(s) for
+.I HOST
+from
+.IR ~/.config/noissh/known_hosts ,
+then exit. Every label for the host (any port) is removed. Use this to recover
+from an intentional server re\-key (the equivalent of
+.B ssh\-keygen \-R
+for noissh).
+.TP
+.BR \-v ", " \-\-verbose
+Narrate the connection sequence (direct probe, host resolution, handshake, SSH
+bootstrap) to standard error. Useful for diagnosing a connect that hangs,
+usually because the server's UDP port is blocked by a firewall or NAT.
+.TP
 .BI \-\- " ssh args"
 With
 .BR \-\-ssh ,
@@ -199,6 +239,57 @@ Print a usage summary and exit.
 .TP
 .BR \-V ", " \-\-version
 Print the version and exit.
+.SH STATUS AND DETACHING
+While an interactive session's link is healthy you see a normal shell. If it
+goes quiet (roaming, a network change, or a dead spot), a status banner appears
+on the top row \(em
+.RI \[lq] "[noissh] last contact N s ago \(em reconnecting... (Ctrl-^ . to quit)" \[rq]
+\(em and clears the moment contact resumes. It only appears after the link has
+been silent longer than the keepalive interval, so a healthy idle session never
+shows it.
+.PP
+.B Ctrl-^
+(Control\-Shift\-6) is a local escape prefix:
+.B Ctrl-^
+then
+.B .
+(or
+.BR q )
+disconnects and exits cleanly;
+.B Ctrl-^
+then
+.B Ctrl-^
+sends one literal
+.B Ctrl-^
+to the remote shell.
+.SH HOST ALIASES
+noissh honours the relevant keys of your
+.IR ~/.ssh/config :
+a
+.B Host
+alias's
+.BR HostName ,
+.BR User ,
+and
+.B Port
+are applied to both the SSH bootstrap (by
+.BR ssh (1)
+itself, so
+.BR ProxyJump ,
+.BR IdentityFile ,
+etc. also apply) and the resilient Noise/UDP session, for which noissh resolves
+the alias's
+.B HostName
+as the UDP destination.
+.SH NOTES
+noissh renders a live picture of the remote screen, so your terminal's native
+scrollback does not capture lines that scroll off the top (as with
+.BR mosh (1)).
+Run
+.BR tmux (1)
+or
+.BR screen (1)
+on the server for scrollback. The client is Unix\-only.
 .SH AUTHENTICATION
 On first contact the server's static public key is pinned (trust on first use)
 in
@@ -225,20 +316,26 @@ Connect via SSH bootstrap:
 Direct connection on a custom port:
 .B noissh --port 51820 user@server
 .TP
-Upload a file:
-.B noissh user@server --put ./report.pdf:/home/user/report.pdf
+Upload a file (options precede the host):
+.B noissh --put ./report.pdf:/home/user/report.pdf user@server
 .TP
 Download a file:
-.B noissh user@server --get /var/log/app.log:./app.log
+.B noissh --get /var/log/app.log:./app.log user@server
 .TP
 Dynamic SOCKS proxy on a local port:
-.B noissh --ssh user@server -D 1080
+.B noissh --ssh -D 1080 user@server
 .TP
-Run a single remote command:
+Run a single remote command (the command follows the host):
 .B noissh --ssh user@server uname -a
 .TP
 Interactive shell with agent forwarding:
-.B noissh --ssh user@server -A
+.B noissh --ssh -A user@server
+.TP
+Authorize this key on a server for direct connections:
+.B noissh --copy-id user@server
+.TP
+Recover after an intentional server re-key:
+.B noissh --forget-host server
 .SH SEE ALSO
 .BR noisshd (1),
 .BR ssh (1)

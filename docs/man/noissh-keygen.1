@@ -1,4 +1,4 @@
-.TH NOISSH-KEYGEN 1 "2026-06-19" "noissh 0.4.13" "User Commands"
+.TH NOISSH-KEYGEN 1 "2026-06-19" "noissh 0.4.14" "User Commands"
 .SH NAME
 noissh\-keygen \- ensure a noissh static keypair exists and print its public key
 .SH SYNOPSIS
@@ -7,6 +7,8 @@ noissh\-keygen \- ensure a noissh static keypair exists and print its public key
 .IR PATH ]
 .br
 .B noissh\-keygen \-\-help
+.br
+.B noissh\-keygen \-\-version
 .SH DESCRIPTION
 .B noissh\-keygen
 ensures a long\-term static keypair exists for noissh and prints its public key
@@ -43,6 +45,9 @@ unless overridden by the platform's config directory).
 .TP
 .B \-\-help
 Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
 .SH FILES
 .TP
 .I ~/.config/noissh/id

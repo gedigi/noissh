@@ -4,6 +4,98 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A feature/UX pass closing the biggest gaps against everyday `ssh`/Mosh use.
+
+### Added
+
+- **Connection-status overlay.** When the link goes quiet (roaming, Wi-Fi↔cellular
+  handoff, a dead spot), the interactive client now shows a Mosh-style banner on
+  the top row — `[noissh] last contact N s ago — reconnecting…  (Ctrl-^ . to
+  quit)`. It appears only after the link is silent past the keepalive interval
+  (so a healthy idle session never flashes it), counts up once a second, and
+  clears the instant contact resumes. While stale, keepalives speed up so
+  recovery is detected within about a second.
+- **Detach / escape key.** `Ctrl-^` is a local escape prefix: `Ctrl-^ .` or
+  `Ctrl-^ q` disconnects cleanly (restores the terminal and exits 0) so a wedged
+  client no longer means killing the terminal window; `Ctrl-^ Ctrl-^` sends a
+  literal `Ctrl-^`.
+- **`~/.ssh/config` interop.** Host aliases now work for the resilient UDP leg,
+  not just the SSH bootstrap: noissh reads `HostName`/`User`/`Port` for the
+  target alias so `noissh myalias` resolves the same way `ssh myalias` does.
+  (ProxyJump, IdentityFile, and the rest continue to be handled by `ssh` itself
+  during the bootstrap.)
+- **`--copy-id`.** Installs your public key into the remote `authorized_keys`
+  over SSH (the direct-mode equivalent of `ssh-copy-id`), so setting up a
+  standing-daemon direct connection no longer means hand-copying keys.
+- **`--forget-host HOST`.** Removes the pinned server key(s) for a host so
+  recovering from an intentional server re-key no longer means hand-editing
+  `known_hosts` (the equivalent of `ssh-keygen -R`).
+- **`-v` / `--verbose`.** Narrates the connection sequence (direct probe, DNS
+  resolution, handshake, SSH bootstrap) to diagnose the most common failure —
+  a connect that hangs because the UDP port is blocked.
+- **File-transfer progress.** `--put`/`--get` now show a live progress line
+  (percentage and sizes on upload; running byte count on download). It is
+  TTY-only, so scripts and pipelines stay clean.
+
+### Known limitations
+
+- **Scrollback.** Like Mosh, noissh paints a live picture of the remote screen,
+  so your terminal's native scrollback does not capture content that scrolls off
+  the top. Run `tmux` or `screen` on the server for scrollback (and an even
+  stronger detach story). See the User Guide.
+- **Windows client.** The client is Unix-only (it needs a PTY and POSIX terminal
+  handling). Windows support is tracked as future work; see the User Guide.
+
+## [0.4.14]
+
+A user-experience pass driven by a full UX audit (static review + live testing).
+
+### Fixed
+
+- **No more "random screen refresh."** The renderer repainted the cursor on every
+  event-loop wakeup (each keepalive/ack), emitting a hide→move→show cycle even
+  when nothing changed — visible as flicker on an idle screen. It now does
+  nothing when the frame is unchanged and only toggles cursor visibility when it
+  actually changes. (Measured: cursor hide/show on a 9 s idle session dropped
+  from 26 to 2.)
+- **Clear, actionable error messages.** Many errors were vague or reused a single
+  catch-all. Now:
+  - `noissh` with no host explains what to do and shows an example (exit 2).
+  - SSH-bootstrap failures surface `ssh`'s own diagnostic (auth denied, host
+    unreachable, …) instead of a generic "no connect line".
+  - `noisshd --one-shot` without `--authorize`, and other CLI mistakes, are
+    reported as usage errors (exit 2), not "SSH bootstrap failed".
+  - An invalid `--listen`/`--bind` address says so, instead of "malformed key
+    file".
+  - A host-key mismatch now tells you exactly how to recover (which file/line to
+    remove) when you intentionally re-keyed the server.
+  - A stray blank line before each error (a stray `\r\n`) is gone.
+- **The terminal is always restored on exit.** Cursor visibility and text
+  attributes are reset whenever raw mode ends (normal exit, signal, or error), so
+  a full-screen program can't leave your shell with a hidden cursor.
+- **The client advertises your real `$TERM`** instead of always claiming
+  `xterm-256color`.
+
+### Changed
+
+- **Invalid command-line arguments now fail loudly.** A malformed `-L`/`-R`/`-D`
+  or `--put`/`--get` spec, a non-numeric `--port`, or an unknown option is a
+  usage error (exit 2) with a concrete example, instead of being silently ignored
+  (which previously could drop you into an unexpected interactive shell).
+- **First-run and trust-on-first-use are no longer silent.** Generating your key
+  on first run prints its location and public key (so you can authorize it), and
+  pinning a server's key on first direct connection is announced.
+
+### Added
+
+- **`-h`/`--help` works everywhere** and now notes that options precede the host.
+- **`noisshd --user NAME`** drops sessions to a target user (the privilege-drop
+  mode the docs described but the daemon didn't expose).
+- **An optional `config` file** (`~/.config/noissh/config`) sets the default
+  `port` for direct connections; `noissh-keygen` gained `-V`/`--version`.
+
 ## [0.4.13]
 
 ### Fixed

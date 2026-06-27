@@ -44,10 +44,86 @@ fn noissh_no_args_prints_usage_not_bootstrap_error() {
         out.contains("no host given") && out.contains("--help"),
         "no-args should print a usage hint: {out}"
     );
+    // It must tell the user HOW to fix it — show a concrete example invocation.
     assert!(
-        !out.contains("SSH bootstrap failed"),
+        out.contains("noissh user@example.com"),
+        "no-args should show an example: {out}"
+    );
+    assert!(
+        !out.contains("SSH bootstrap failed") && !out.contains("connect line"),
         "no-args must not report a bootstrap failure: {out}"
     );
+}
+
+#[test]
+fn noissh_invalid_args_fail_loudly() {
+    let bin = env!("CARGO_BIN_EXE_noissh");
+    // Each of these is a usage mistake that must exit 2 with a helpful message,
+    // not be silently ignored (which used to drop the user into a shell).
+    for args in [
+        &["--port", "abc", "host"][..],
+        &["--put", "missing-colon", "host"][..],
+        &["-L", "8080", "host"][..],
+        &["-x", "host"][..],
+    ] {
+        let (code, out) = run(bin, args);
+        assert_eq!(code, 2, "{args:?} should exit 2, got {code}: {out}");
+        assert!(
+            out.to_lowercase().contains("noissh:"),
+            "{args:?} should print a noissh error: {out}"
+        );
+    }
+}
+
+#[test]
+fn noissh_forget_host_removes_pin() {
+    // `--forget-host` removes a pinned server key without connecting, so a
+    // re-keyed server can be re-trusted without hand-editing known_hosts.
+    let bin = env!("CARGO_BIN_EXE_noissh");
+    let dir = std::env::temp_dir().join(format!("noissh-forget-test-{}", std::process::id()));
+    let cfgdir = dir.join("noissh");
+    std::fs::create_dir_all(&cfgdir).unwrap();
+    let kh = cfgdir.join("known_hosts");
+    // base64 of 32 zero bytes — a valid (if all-zero) noissh-x25519 public key.
+    let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    std::fs::write(
+        &kh,
+        format!("example.com:51820 noissh-x25519 {k}\nother.com:51820 noissh-x25519 {k}\n"),
+    )
+    .unwrap();
+
+    let out = Command::new(bin)
+        .args(["--forget-host", "example.com"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("removed"),
+        "should report removal: {stderr}"
+    );
+
+    let remaining = std::fs::read_to_string(&kh).unwrap();
+    assert!(
+        !remaining.contains("example.com"),
+        "forgotten host should be gone: {remaining}"
+    );
+    assert!(
+        remaining.contains("other.com"),
+        "other hosts must be preserved: {remaining}"
+    );
+
+    // Forgetting an unknown host is a no-op success with a clear message.
+    let out = Command::new(bin)
+        .args(["--forget-host", "nope.example"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no pinned host key"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

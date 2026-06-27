@@ -199,6 +199,45 @@ impl KnownHosts {
         self.hosts.get(host)
     }
 
+    /// Iterate the pinned `(host, key)` entries in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &PublicKey)> {
+        self.hosts.iter()
+    }
+
+    /// Number of pinned hosts.
+    pub fn len(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// Whether any hosts are pinned.
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
+    /// Remove the pin for an exact host label (e.g. `host:51820`), returning the
+    /// key that was removed if there was one. Used to recover from an intentional
+    /// server re-key without hand-editing `known_hosts`.
+    pub fn remove(&mut self, host: &str) -> Option<PublicKey> {
+        self.hosts.remove(host)
+    }
+
+    /// Remove every pin whose label matches `host` or `host:<port>` (any port),
+    /// returning the labels removed. Lets `--forget-host example.com` clear the
+    /// pin regardless of which port it was stored under.
+    pub fn remove_matching(&mut self, host: &str) -> Vec<String> {
+        let prefix = format!("{host}:");
+        let to_remove: Vec<String> = self
+            .hosts
+            .keys()
+            .filter(|label| label.as_str() == host || label.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for label in &to_remove {
+            self.hosts.remove(label);
+        }
+        to_remove
+    }
+
     /// TOFU check. On first contact the key is recorded and `New` returned.
     /// On a later visit, `Match` or `Mismatch` is returned without mutating.
     pub fn check_or_add(&mut self, host: &str, key: &PublicKey) -> Tofu {
@@ -291,6 +330,24 @@ mod tests {
         let parsed = KnownHosts::parse(&text);
         assert_eq!(parsed.get("a.example"), Some(&key(1)));
         assert_eq!(parsed.get("b.example:9999"), Some(&key(2)));
+    }
+
+    #[test]
+    fn known_hosts_remove_exact_and_matching() {
+        let mut kh = KnownHosts::new();
+        kh.check_or_add("a.example:51820", &key(1));
+        kh.check_or_add("a.example:2222", &key(2));
+        kh.check_or_add("b.example:51820", &key(3));
+        // Exact removal.
+        assert_eq!(kh.remove("a.example:51820"), Some(key(1)));
+        assert_eq!(kh.remove("a.example:51820"), None);
+        // Port-agnostic removal clears every label for the host.
+        let removed = kh.remove_matching("a.example");
+        assert_eq!(removed, vec!["a.example:2222".to_string()]);
+        assert_eq!(kh.get("a.example:2222"), None);
+        // Other hosts are untouched, and the host name isn't a prefix false-match.
+        assert_eq!(kh.get("b.example:51820"), Some(&key(3)));
+        assert!(kh.remove_matching("a").is_empty());
     }
 
     #[test]

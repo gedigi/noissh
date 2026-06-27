@@ -46,6 +46,7 @@ fn ssh_bootstrap_then_session() {
     // Bootstrap: the fake ssh launches noisshd --one-shot locally.
     let boot = ssh::bootstrap(
         "127.0.0.1",
+        "127.0.0.1",
         &[noisshd.to_string()],
         &client_kp.public,
         &[],

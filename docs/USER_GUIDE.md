@@ -13,6 +13,8 @@ This guide covers installing, connecting, configuring, and troubleshooting.
 - [Connecting](#connecting)
   - [Direct connection (the first attempt)](#direct-connection-the-first-attempt)
   - [SSH bootstrap (the automatic fallback)](#ssh-bootstrap-the-automatic-fallback)
+- [During a session: roaming, the status line, and detaching](#during-a-session-roaming-the-status-line-and-detaching)
+- [Host aliases (`~/.ssh/config`)](#host-aliases-sshconfig)
 - [Running the server](#running-the-server)
   - [Running noisshd under systemd](#running-noisshd-under-systemd)
 - [Keys & trust](#keys--trust)
@@ -23,6 +25,8 @@ This guide covers installing, connecting, configuring, and troubleshooting.
 - [Remote command execution](#remote-command-execution)
 - [File transfer](#file-transfer)
 - [Agent forwarding](#agent-forwarding)
+- [Scrollback and long output](#scrollback-and-long-output)
+- [Windows](#windows)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
 
@@ -137,6 +141,52 @@ permits SSH but blocks arbitrary inbound UDP, pin the server to a port you've
 opened with `--server-port N` (e.g. `noissh --server-port 51820 user@host`), then
 open that UDP port in the firewall.
 
+## During a session: roaming, the status line, and detaching
+
+A noissh session rides out network changes on its own — close the laptop, switch
+from Wi-Fi to cellular, walk through a dead spot — and resumes when connectivity
+returns, no reconnect needed.
+
+While the link is healthy you see a normal shell. If it goes quiet (you've
+moved networks, or the path is down), a status banner appears on the top row so
+you know what's happening rather than staring at a frozen screen:
+
+```
+[noissh] last contact 6s ago — reconnecting…  (Ctrl-^ . to quit)
+```
+
+It only appears after the link has been silent a little longer than the
+keepalive interval (so a healthy idle session never shows it), counts up once a
+second, and disappears the instant contact resumes. There is nothing to do — the
+session reconnects itself.
+
+**The detach key.** `Ctrl-^` (Control-Shift-6) is a local escape prefix:
+
+- `Ctrl-^` then `.` (or `q`) — disconnect now and exit cleanly. Use this to get
+  your local prompt back if the server is unreachable and you don't want to wait.
+- `Ctrl-^` then `Ctrl-^` — send one literal `Ctrl-^` to the remote shell.
+
+Because the prefix is intercepted locally, you can always quit a wedged session
+without killing your terminal window.
+
+## Host aliases (`~/.ssh/config`)
+
+noissh honours your existing `~/.ssh/config`. A `Host` alias's `HostName`,
+`User`, and `Port` are applied to **both** legs of a connection — the SSH
+bootstrap (handled by `ssh` itself, so `ProxyJump`, `IdentityFile`, and the rest
+work too) and the resilient Noise/UDP session (noissh resolves the alias's
+`HostName` for the UDP address). So if this is in your `~/.ssh/config`:
+
+```
+Host prod
+    HostName 203.0.113.10
+    User deploy
+    Port 2222
+```
+
+then `noissh prod` connects to `deploy@203.0.113.10` just like `ssh prod` would.
+Run with `-v` to see the resolved host.
+
 ## Running the server
 
 ### Standalone daemon
@@ -198,6 +248,32 @@ Homebrew/deb packaging placeholders.
 This mirrors SSH's `known_hosts` / `authorized_keys` model, but with Noise static
 keys.
 
+### Authorizing your key with `--copy-id`
+
+For a standing-daemon **direct** connection the server must have your public key
+in its `authorized_keys`. Instead of copying it by hand, push it over your
+existing SSH access (the equivalent of `ssh-copy-id`):
+
+```sh
+noissh --copy-id user@server
+```
+
+This appends your public key to `~/.config/noissh/authorized_keys` on the server
+(creating the file `0600` and its directory `0700` if needed), skipping it if
+it's already there, then exits. Afterwards `noissh user@server` can connect
+directly. (The SSH bootstrap path authorizes your key automatically per session,
+so `--copy-id` is only needed for direct mode.)
+
+### Re-keyed a server? `--forget-host`
+
+If you intentionally reinstall or re-key a server, its pinned key no longer
+matches and the next connect aborts with `HOST KEY MISMATCH`. Drop the stale pin
+(the equivalent of `ssh-keygen -R`) and reconnect:
+
+```sh
+noissh --forget-host server      # removes every pinned label for "server"
+```
+
 ### Generating your key with noissh-keygen
 
 `noissh-keygen` ensures your static keypair exists and prints its public key line
@@ -241,15 +317,17 @@ typo never prevents startup). A missing file just means "all defaults".
 ```
 # ~/.config/noissh/config
 port = 51820
-term = xterm-256color
 ```
 
 Recognized keys:
 
 | Key | Type | Meaning |
 |---|---|---|
-| `port` | number | default UDP port for direct connections |
-| `term` | string | `$TERM` value to advertise to the remote shell |
+| `port` | number | default UDP port for direct connections (a `--port` flag overrides it) |
+
+The terminal type advertised to the remote shell is taken from your `$TERM`
+environment variable (falling back to `xterm-256color` if it is unset), so it
+does not need a config entry.
 
 ## Port forwarding
 
@@ -259,10 +337,10 @@ forward-only (no shell), like a `-N`-style session.
 
 ```sh
 # Local: localhost:8080 (your machine) -> 10.0.0.5:80 (reachable from the server)
-noissh --ssh user@server -L 8080:10.0.0.5:80
+noissh --ssh -L 8080:10.0.0.5:80 user@server
 
 # Remote: server:9000 -> localhost:3000 (on your machine)
-noissh --ssh user@server -R 9000:localhost:3000
+noissh --ssh -R 9000:localhost:3000 user@server
 ```
 
 `-R` listeners bind to loopback on the server, so forwarded ports are not
@@ -275,10 +353,10 @@ to whatever host:port each client requests, resolved via the server:
 
 ```sh
 # SOCKS proxy on localhost:1080
-noissh --ssh user@server -D 1080
+noissh --ssh -D 1080 user@server
 
 # bind a specific address
-noissh --ssh user@server -D 127.0.0.1:1080
+noissh --ssh -D 127.0.0.1:1080 user@server
 ```
 
 Point a SOCKS-aware application at the proxy and its connections exit from the
@@ -325,15 +403,31 @@ with an interactive shell or with `-L`/`-R`.
 
 ```sh
 # upload: local file -> remote path
-noissh --ssh user@server --put ./report.pdf /home/user/report.pdf
+noissh --ssh --put ./report.pdf:/home/user/report.pdf user@server
 
 # download: remote file -> local path
-noissh --ssh user@server --get /var/log/app.log ./app.log
+noissh --ssh --get /var/log/app.log:./app.log user@server
 ```
 
 The spec is split on the **first** colon. For `--put` the order is
 `LOCAL:REMOTE`; for `--get` it is `REMOTE:LOCAL`. Files on the server are read
 and written as the user you log in as, exactly like a normal login.
+
+On a terminal, a live progress line shows how the transfer is going (a
+percentage and byte counts when uploading, where the size is known up front; a
+running byte count when downloading). It is suppressed when output is redirected,
+so scripts and pipelines stay clean.
+
+A transfer moves a **single file**. For a whole directory, stream a tar over a
+remote command, which rides the same resilient session:
+
+```sh
+# download a directory tree
+noissh --ssh user@server tar czf - /etc > etc.tar.gz
+
+# upload a directory tree
+tar czf - ./src | noissh --ssh user@server 'tar xzf - -C /target'
+```
 
 Integrity is guaranteed by the reliable, authenticated (AEAD) stream the bytes
 ride on, so there is no separate checksum step. If the source cannot be read
@@ -348,7 +442,7 @@ that remote `git`/`ssh` can use the keys on your machine without copying them to
 the server:
 
 ```sh
-noissh --ssh user@server -A          # long form: --forward-agent
+noissh --ssh -A user@server          # long form: --forward-agent
 ```
 
 The server exposes an `SSH_AUTH_SOCK` in the shell's environment; connections to
@@ -366,10 +460,11 @@ is `0600`, so other local users on the server cannot reach your forwarded agent.
 ### `noissh`
 
 ```
-noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC] [-R SPEC] [-D SPEC] [--put SPEC] [--get SPEC] [-A] [user@]host [command ...] [-- <ssh args>]
+noissh [OPTIONS] [user@]host [command ...] [-- <ssh args>]
   --ssh           force the SSH bootstrap (skip the direct probe)
   --direct        direct connection only; never fall back to SSH
   --port N        UDP port for direct connection (default 51820)
+  --server-port N pin the bootstrapped server's UDP port (firewall-friendly)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   --no-install    do not auto-install noisshd on the remote if it is missing
   -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
@@ -378,10 +473,18 @@ noissh [--ssh] [--direct] [--port N] [--server-cmd CMD] [--no-install] [-L SPEC]
   --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
   --get REMOTE:LOCAL   download REMOTE to LOCAL, then exit (no shell)
   -A, --forward-agent  forward your local auth agent to the shell session
+  --copy-id       install your public key into the remote authorized_keys over
+                  SSH (like ssh-copy-id), then exit
+  --forget-host H remove the pinned server key(s) for host H, then exit
+  -v, --verbose   narrate the connection sequence (diagnose connect hangs)
+  -h, --help      print usage and exit
+  -V, --version   print the version and exit
   command ...     run this command on the server non-interactively (ssh-style),
                   then exit with its status; omit it for an interactive shell
   -- <args>       pass remaining args to ssh (only with --ssh)
 ```
+
+All options must come before the host.
 
 Everything after `[user@]host` is treated as the remote command, verbatim — its
 own flags are not parsed by noissh. Use `--` before the host's trailing position
@@ -395,29 +498,63 @@ CONNECT only.
 ### `noisshd`
 
 ```
-noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--command CMD ...] [-v]
+noisshd [--listen ADDR] [--key PATH] [--authorized-keys PATH] [--user NAME] [--command CMD ...] [-v]
 noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
   --listen ADDR        bind address (default 0.0.0.0:51820)
   -v, --verbose        log session lifecycle (established/ended, active count)
                        and fatal socket errors
   --key PATH           static key file (default <config>/noisshd_key)
   --authorized-keys P  authorized_keys file (default <config>/authorized_keys)
+  --user NAME          drop sessions to this user (requires root); file transfer,
+                       agent forwarding, and exec are refused in this mode
   --command CMD ...    run this command instead of the login shell
   --one-shot           ephemeral key, serve one session, then exit (SSH bootstrap)
   --authorize <b64>    the single client key to trust in one-shot mode
   --bind ADDR          bind address in one-shot mode (default 0.0.0.0:0)
+  -h, --help           print usage and exit
+  -V, --version        print the version and exit
 ```
 
 ### `noissh-keygen`
 
 ```
 noissh-keygen [--key PATH]
-  --key PATH   keypair file to ensure/print (default <config>/id)
-  --help       print usage
+  --key PATH      keypair file to ensure/print (default <config>/id)
+  -h, --help      print usage
+  -V, --version   print the version
 ```
 
 Ensures the keypair exists (creating it `0600` if missing) and prints its public
 key line `noissh-x25519 <base64>` to stdout.
+
+## Scrollback and long output
+
+noissh shows a *live picture* of the remote screen (this is what lets it shrug
+off packet loss — only the latest screen matters). The trade-off, shared with
+Mosh, is that your terminal's native scrollback does not capture lines that
+scroll off the top: scrolling up in your terminal shows your local history, not
+the remote session's.
+
+For real scrollback, run a terminal multiplexer on the server and use its copy
+mode:
+
+```sh
+noissh user@server
+tmux new -A -s main     # or: screen
+# tmux: Ctrl-b [ then PgUp to scroll; q to exit copy mode
+```
+
+This also gives you server-side session persistence that survives even a client
+reinstall, complementing noissh's network resilience.
+
+## Windows
+
+The noissh **client** is Unix-only today (Linux and macOS): it relies on a PTY
+and POSIX terminal handling that the Windows console does not provide directly.
+Windows support (e.g. via ConPTY, or through WSL) is tracked as future work. In
+the meantime, the client runs well under **WSL**, and the **server** (`noisshd`)
+targets Unix hosts. If Windows support matters to you, please open or 👍 an
+issue so it can be prioritised.
 
 ## Troubleshooting
 
@@ -426,9 +563,14 @@ key line `noissh-x25519 <base64>` to stdout.
   SSH bootstrap: the ephemeral port range). TCP-only reachability (SSH works but
   noissh hangs) is the classic symptom of a blocked UDP path.
 - **`HOST KEY MISMATCH`.** The server's key changed since you first connected.
-  If this is expected (server reinstall), remove the host's line from
-  `~/.config/noissh/known_hosts`; otherwise treat it as a potential
-  man-in-the-middle and investigate.
+  If this is expected (server reinstall), drop the stale pin with
+  `noissh --forget-host <host>` (or remove the host's line from
+  `~/.config/noissh/known_hosts`) and reconnect; otherwise treat it as a
+  potential man-in-the-middle and investigate.
+- **It hangs at connect and you're not sure why.** Re-run with `-v`: it narrates
+  each step (direct probe, DNS resolution, handshake, SSH bootstrap) so you can
+  see where it stalls. A stall right after the handshake starts is the classic
+  blocked-UDP symptom above.
 - **`--ssh` fails with "no connect line".** The remote `noisshd` could not be
   launched. Normally noissh auto-installs it on first connect; if you passed
   `--no-install`, or the install step could not run (e.g. the remote has neither

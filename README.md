@@ -29,6 +29,12 @@ laptop going to sleep.
   restarts, **reconnect and you're back in the same running session.**
 - **It feels instant.** Your keystrokes show up immediately, even on a laggy or
   lossy connection, instead of waiting for a round trip to the server.
+- **It tells you what's happening.** When the link goes quiet, a status line
+  shows `last contact Ns ago — reconnecting…` so you're never staring at a frozen
+  screen, and a local detach key (`Ctrl-^ .`) cleanly drops a wedged session.
+- **It knows your `~/.ssh/config`.** Host aliases (`HostName`, `User`, `Port`,
+  `ProxyJump`, …) work just like they do with `ssh`. Authorize a key for direct
+  connections with `--copy-id`, like `ssh-copy-id`.
 - **It tunnels too.** Local, remote, and dynamic SOCKS **port forwarding**
   (`-L`/`-R`/`-D`) ride the same resilient, encrypted session.
 - **It runs commands.** Run a single remote command non-interactively, ssh-style
@@ -121,25 +127,26 @@ Authorize a client by adding its public key (printed on first run, stored at
 
 ```sh
 # Local: localhost:8080 (your machine) -> 10.0.0.5:80 (reachable from the server)
-noissh --ssh user@server -L 8080:10.0.0.5:80
+noissh --ssh -L 8080:10.0.0.5:80 user@server
 
 # Remote: server:9000 -> localhost:3000 (on your machine)
-noissh --ssh user@server -R 9000:localhost:3000
+noissh --ssh -R 9000:localhost:3000 user@server
 
 # Dynamic: a local SOCKS proxy on :1080 whose connections tunnel via the server
-noissh --ssh user@server -D 1080
+noissh --ssh -D 1080 user@server
 ```
 
-Adding `-L`/`-R`/`-D` makes the session forward-only (no shell), like `ssh -N`.
+Options go before the host; adding `-L`/`-R`/`-D` makes the session forward-only
+(no shell), like `ssh -N`.
 
 **Copying files** rides the same session — no separate transfer tool:
 
 ```sh
 # Upload local -> remote
-noissh --ssh user@server --put ./report.pdf:/home/user/report.pdf
+noissh --ssh --put ./report.pdf:/home/user/report.pdf user@server
 
 # Download remote -> local
-noissh --ssh user@server --get /var/log/app.log:./app.log
+noissh --ssh --get /var/log/app.log:./app.log user@server
 ```
 
 **Running a single command** non-interactively, with byte-exact output:
@@ -148,14 +155,14 @@ noissh --ssh user@server --get /var/log/app.log:./app.log
 noissh --ssh user@server uname -a
 ```
 
-Anything after the host is the remote command (ssh-style). It streams the
-command's stdout and stderr separately and exits with its exit code, so it's safe
-to use in scripts and pipelines.
+Anything after the host is the remote command (ssh-style); options like `-L` go
+*before* the host. It streams the command's stdout and stderr separately and
+exits with its exit code, so it's safe to use in scripts and pipelines.
 
 **Agent forwarding** (`-A`) lets remote `git`/`ssh` use your local keys:
 
 ```sh
-noissh --ssh user@server -A
+noissh --ssh -A user@server
 ```
 
 Full walkthrough, configuration, and troubleshooting:

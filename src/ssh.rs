@@ -114,7 +114,26 @@ enum Attempt {
     /// The remote `noisshd` command was not found (likely not installed).
     NotFound,
     /// Some other failure (no connect line, but not a missing-command signal).
-    Failed,
+    /// Carries the remote `ssh`/server's own diagnostic (its last stderr line),
+    /// so the user sees the real cause (auth denied, host unreachable, …) rather
+    /// than a generic message.
+    Failed(String),
+}
+
+/// Extract the most useful diagnostic line from a failed `ssh` invocation: the
+/// last non-empty stderr line (where ssh prints "Permission denied", "Could not
+/// resolve hostname", etc.), falling back to a generic note.
+fn failure_reason(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| format!("the SSH bootstrap failed: {l}"))
+        .unwrap_or_else(|| {
+            "the SSH bootstrap failed (ssh produced no output — check your SSH access to the host)"
+                .to_string()
+        })
 }
 
 /// The `ssh` program, overridable via `$NOISSH_SSH` (tests / custom transports).
@@ -146,8 +165,14 @@ fn is_default_server_cmd(remote_server_cmd: &[String]) -> bool {
 }
 
 /// Run one bootstrap attempt against `remote_server_cmd`.
+///
+/// `udp_host` is the host the Noise/UDP session should be addressed to — it may
+/// differ from `host_of(target)` when the target is an ssh_config alias whose
+/// real address is in `HostName`. `ssh` itself still receives the original
+/// `target`, so it applies the user's `~/.ssh/config` (ProxyJump, Port, …).
 fn attempt(
     target: &str,
+    udp_host: &str,
     remote_server_cmd: &[String],
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
@@ -179,11 +204,12 @@ fn attempt(
     // server-controlled banner from injecting a forged connect line earlier in
     // the stream.
     if let Some((port, server_pubkey)) = stdout.lines().rev().find_map(parse_connect_line) {
-        let host = host_of(target);
-        let server_addr = (host, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or(RuntimeError::SshBootstrap)?;
+        let host = udp_host;
+        let server_addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+            RuntimeError::BadAddress(format!(
+                "connected over SSH but could not resolve {host}:{port} for the UDP session"
+            ))
+        })?;
         // The server prints its version just before the connect line; absent on
         // pre-v0.4.11 servers, in which case we simply can't offer an upgrade.
         let server_version = stdout.lines().rev().find_map(parse_version_line);
@@ -196,7 +222,7 @@ fn attempt(
     if looks_like_missing_command(&output) {
         Ok(Attempt::NotFound)
     } else {
-        Ok(Attempt::Failed)
+        Ok(Attempt::Failed(failure_reason(&output)))
     }
 }
 
@@ -239,7 +265,9 @@ fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), Runtime
     if status.success() {
         Ok(())
     } else {
-        Err(RuntimeError::SshBootstrap)
+        Err(RuntimeError::SshFailed(
+            "failed to install noisshd on the remote (see the installer output above)".to_string(),
+        ))
     }
 }
 
@@ -259,6 +287,7 @@ fn installed_noisshd_cmd() -> Vec<String> {
 /// server command is the default), install it over SSH and retry once.
 pub fn bootstrap(
     target: &str,
+    udp_host: &str,
     remote_server_cmd: &[String],
     client_pubkey: &[u8],
     extra_ssh_args: &[String],
@@ -268,6 +297,7 @@ pub fn bootstrap(
     let offer = auto_install && is_default_server_cmd(remote_server_cmd);
     match attempt(
         target,
+        udp_host,
         remote_server_cmd,
         client_pubkey,
         extra_ssh_args,
@@ -279,6 +309,7 @@ pub fn bootstrap(
             // the non-interactive PATH — try that before re-downloading.
             if let Attempt::Connected(b) = attempt(
                 target,
+                udp_host,
                 &installed_noisshd_cmd(),
                 client_pubkey,
                 extra_ssh_args,
@@ -293,6 +324,7 @@ pub fn bootstrap(
             install_remote(target, extra_ssh_args)?;
             match attempt(
                 target,
+                udp_host,
                 &installed_noisshd_cmd(),
                 client_pubkey,
                 extra_ssh_args,
@@ -303,10 +335,21 @@ pub fn bootstrap(
                     eprintln!("noissh: noisshd installed; connecting…");
                     Ok(b)
                 }
-                _ => Err(RuntimeError::SshBootstrap),
+                Attempt::Failed(reason) => Err(RuntimeError::SshFailed(reason)),
+                Attempt::NotFound => Err(RuntimeError::SshFailed(
+                    "installed noisshd but it still could not be launched on the remote"
+                        .to_string(),
+                )),
             }
         }
-        _ => Err(RuntimeError::SshBootstrap),
+        Attempt::Failed(reason) => Err(RuntimeError::SshFailed(reason)),
+        // `noisshd` is missing but we were told not to install it (or a custom
+        // --server-cmd was given, so we won't auto-install over it).
+        Attempt::NotFound => Err(RuntimeError::SshFailed(format!(
+            "noisshd was not found on {}. Install it there, or omit --no-install / --server-cmd to \
+             let noissh install it over SSH.",
+            host_of(target)
+        ))),
     }
 }
 
@@ -365,6 +408,56 @@ fn prompt_yes_no(question: &str) -> bool {
         return false;
     }
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
+/// Install the client's public key into the remote `authorized_keys` over SSH,
+/// like `ssh-copy-id`. Creates `~/.config/noissh` (`0700`) and
+/// `authorized_keys` (`0600`) if needed and appends the key only if it isn't
+/// already present (idempotent). `pubkey_line` is the full `noissh-x25519
+/// <base64>` text; it contains only key-type and base64 characters, so
+/// single-quoting it in the remote command keeps it inert.
+///
+/// Returns `Ok(())` on success (whether newly added or already present). Errors
+/// if the SSH invocation itself fails (auth denied, host unreachable, …).
+pub fn copy_id(
+    target: &str,
+    pubkey_line: &str,
+    extra_ssh_args: &[String],
+) -> Result<(), RuntimeError> {
+    // Defence in depth: the key line is only `noissh-x25519 <base64>`, but reject
+    // anything with a single quote or control character so it can never break out
+    // of the single-quoted remote string.
+    if pubkey_line.contains('\'') || pubkey_line.chars().any(|c| c.is_control()) {
+        return Err(RuntimeError::SshFailed(
+            "refusing to copy a key line containing quotes or control characters".to_string(),
+        ));
+    }
+    // `dir=${XDG_CONFIG_HOME:-$HOME/.config}/noissh` mirrors the client/server
+    // config_dir() logic so the key lands where noisshd actually reads it. Use
+    // grep -qxF for an exact, fixed-string, whole-line match to avoid duplicates.
+    let remote = format!(
+        "set -e; dir=\"${{XDG_CONFIG_HOME:-$HOME/.config}}/noissh\"; \
+         mkdir -p \"$dir\"; chmod 700 \"$dir\" 2>/dev/null || true; \
+         ak=\"$dir/authorized_keys\"; touch \"$ak\"; chmod 600 \"$ak\" 2>/dev/null || true; \
+         if grep -qxF '{pubkey_line}' \"$ak\"; then echo 'noissh: key already authorized'; \
+         else echo '{pubkey_line}' >> \"$ak\"; echo 'noissh: key added'; fi"
+    );
+    let mut cmd = Command::new(ssh_prog());
+    cmd.args(extra_ssh_args);
+    cmd.arg("--"); // terminate ssh option parsing (target may start with `-`)
+    cmd.arg(target);
+    cmd.arg(remote);
+    let output = cmd.output()?;
+    if output.status.success() {
+        // Surface the remote's "key added" / "already authorized" line.
+        let msg = String::from_utf8_lossy(&output.stdout);
+        for line in msg.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            eprintln!("{line}");
+        }
+        Ok(())
+    } else {
+        Err(RuntimeError::SshFailed(failure_reason(&output)))
+    }
 }
 
 /// Detach from the controlling SSH session so the server survives `ssh`

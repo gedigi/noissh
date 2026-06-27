@@ -78,7 +78,13 @@ impl ClientCore {
             server_addr,
             rows,
             cols,
-            term: "xterm-256color".to_string(),
+            // Advertise the user's actual terminal type so the remote shell and
+            // programs render correctly (colours, key sequences), falling back to
+            // a safe modern default when $TERM is unset.
+            term: std::env::var("TERM")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "xterm-256color".to_string()),
             established: false,
             server_static: None,
             exited: None,
@@ -826,6 +832,15 @@ impl Client {
         };
         let mut sent_fin = false;
 
+        // Progress reporting (TTY-only; quiet in scripts/pipelines). On upload we
+        // know the total from the request; on download the size is unknown, so we
+        // report the running count.
+        let (label, total) = match req {
+            proto::XferRequest::Put { size, .. } => (format!("↑ {local}"), Some(*size)),
+            proto::XferRequest::Get { path } => (format!("↓ {path}"), None),
+        };
+        let mut progress = crate::xfer::Progress::new(label, total);
+
         let keepalive = Duration::from_secs(3);
         let mut next_keepalive = Instant::now() + keepalive;
 
@@ -865,13 +880,16 @@ impl Client {
                         self.core.stream_close(id);
                         sent_fin = true;
                     } else {
+                        let n = chunk.len() as u64;
                         self.core.stream_write(id, &chunk);
+                        progress.add(n);
                     }
                 }
                 // Done once the server acknowledges by closing its half back.
                 if sent_fin && self.core.stream_recv_finished(id) {
                     self.flush()?;
                     self.say_bye();
+                    progress.finish();
                     return Ok(());
                 }
             }
@@ -883,12 +901,14 @@ impl Client {
                     if d.is_empty() {
                         break;
                     }
+                    progress.add(d.len() as u64);
                     snk.write(&d)?;
                 }
                 if self.core.stream_recv_finished(id) {
                     self.core.stream_close(id);
                     self.flush()?;
                     self.say_bye();
+                    progress.finish();
                     // Atomically move the completed download into place. (On an
                     // error return below, the sink is dropped and the temp file
                     // is discarded — the destination is never clobbered.)

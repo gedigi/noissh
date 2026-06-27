@@ -22,7 +22,11 @@ use noissh::{RuntimeError, ssh};
 fn main() {
     if let Err(e) = run() {
         eprintln!("noisshd: {e}");
-        exit(1);
+        // Usage errors get the conventional exit status 2; everything else 1.
+        exit(match e {
+            RuntimeError::Usage(_) => 2,
+            _ => 1,
+        });
     }
 }
 
@@ -34,6 +38,7 @@ struct Args {
     authorized_keys: Option<String>,
     authorize: Option<String>,
     command: Option<Vec<String>>,
+    user: Option<String>,
     verbose: bool,
 }
 
@@ -56,6 +61,9 @@ Options:
   --key PATH            server keypair path (standalone)
   --authorized-keys P   authorized client keys path (standalone)
   --authorize B64       one-shot: the single client public key to trust
+  --user NAME           drop sessions to this user (standalone; requires root).
+                        File transfer, agent forwarding, and exec are refused in
+                        this mode — prefer the SSH bootstrap for multi-user.
   --command CMD ...     run CMD instead of a login shell (rest of argv)
   -v, --verbose         log session lifecycle events
   -h, --help            print this help and exit
@@ -75,6 +83,7 @@ fn parse_args() -> Args {
         authorized_keys: None,
         authorize: None,
         command: None,
+        user: None,
         verbose: false,
     };
     let mut it = std::env::args().skip(1);
@@ -95,6 +104,7 @@ fn parse_args() -> Args {
             "--key" => a.key = it.next(),
             "--authorized-keys" => a.authorized_keys = it.next(),
             "--authorize" => a.authorize = it.next(),
+            "--user" => a.user = it.next(),
             "--command" => {
                 // Remaining args form the command to run instead of a shell.
                 a.command = Some(it.by_ref().collect());
@@ -128,16 +138,22 @@ fn run_standalone(args: Args) -> Result<(), RuntimeError> {
     let keypair = load_or_generate_keypair(&key_path)?;
     let authorized = load_authorized_keys(&ak_path)?;
 
-    let listen: SocketAddr = args
-        .listen
-        .as_deref()
-        .unwrap_or("0.0.0.0:51820")
-        .parse()
-        .map_err(|_| RuntimeError::BadKeyFile)?;
+    let listen_str = args.listen.as_deref().unwrap_or("0.0.0.0:51820");
+    let listen: SocketAddr = listen_str.parse().map_err(|_| {
+        RuntimeError::BadAddress(format!(
+            "invalid --listen address {listen_str:?} (expected ADDR:PORT, e.g. 0.0.0.0:51820)"
+        ))
+    })?;
 
     let mut core = ServerCore::local(keypair.clone(), authorized);
     if let Some(cmd) = args.command {
         core = core.with_command(cmd);
+    }
+    if args.user.is_some() {
+        // Drop sessions to this user (requires running as root). File transfer,
+        // agent forwarding, and remote-command exec are refused in this mode (see
+        // ServerCore::privsep_active) since the driver itself does not drop.
+        core = core.with_user(args.user);
     }
     let mut server = Server::bind(listen, core)?;
     eprintln!(
@@ -178,20 +194,26 @@ fn serve_verbose(server: &mut Server) {
 fn run_one_shot(args: Args) -> Result<(), RuntimeError> {
     // Ephemeral key; trust only the client key passed over the SSH channel.
     let keypair = noise_core::generate_keypair()?;
-    let authorize_b64 = args.authorize.clone().ok_or(RuntimeError::SshBootstrap)?;
+    let authorize_b64 = args.authorize.clone().ok_or_else(|| {
+        RuntimeError::Usage(
+            "--one-shot requires --authorize <base64-public-key> (it is normally launched by the \
+             noissh client's SSH bootstrap, not by hand)"
+                .to_string(),
+        )
+    })?;
     // Validate the client key up front (fail fast on a bad value).
     PublicKey::from_bytes(
-        &STANDARD
-            .decode(&authorize_b64)
-            .map_err(|_| RuntimeError::BadKeyFile)?,
+        &STANDARD.decode(&authorize_b64).map_err(|_| {
+            RuntimeError::Usage("--authorize value is not valid base64".to_string())
+        })?,
     )?;
 
-    let bind: SocketAddr = args
-        .bind
-        .as_deref()
-        .unwrap_or("0.0.0.0:0")
-        .parse()
-        .map_err(|_| RuntimeError::BadKeyFile)?;
+    let bind_str = args.bind.as_deref().unwrap_or("0.0.0.0:0");
+    let bind: SocketAddr = bind_str.parse().map_err(|_| {
+        RuntimeError::BadAddress(format!(
+            "invalid --bind address {bind_str:?} (expected ADDR:PORT)"
+        ))
+    })?;
 
     // Build a fresh core (Server::bind consumes it, so we need one per attempt).
     let make_core = || -> Result<ServerCore, RuntimeError> {
