@@ -4,9 +4,10 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0]
 
-A feature/UX pass closing the biggest gaps against everyday `ssh`/Mosh use.
+A combined UX-audit pass and feature pass closing the biggest gaps against
+everyday `ssh`/Mosh use.
 
 ### Added
 
@@ -38,19 +39,11 @@ A feature/UX pass closing the biggest gaps against everyday `ssh`/Mosh use.
 - **File-transfer progress.** `--put`/`--get` now show a live progress line
   (percentage and sizes on upload; running byte count on download). It is
   TTY-only, so scripts and pipelines stay clean.
-
-### Known limitations
-
-- **Scrollback.** Like Mosh, noissh paints a live picture of the remote screen,
-  so your terminal's native scrollback does not capture content that scrolls off
-  the top. Run `tmux` or `screen` on the server for scrollback (and an even
-  stronger detach story). See the User Guide.
-- **Windows client.** The client is Unix-only (it needs a PTY and POSIX terminal
-  handling). Windows support is tracked as future work; see the User Guide.
-
-## [0.4.14]
-
-A user-experience pass driven by a full UX audit (static review + live testing).
+- **`-h`/`--help` works everywhere** and now notes that options precede the host.
+- **`noisshd --user NAME`** drops sessions to a target user (the privilege-drop
+  mode the docs described but the daemon didn't expose).
+- **An optional `config` file** (`~/.config/noissh/config`) sets the default
+  `port` for direct connections; `noissh-keygen` gained `-V`/`--version`.
 
 ### Fixed
 
@@ -88,13 +81,14 @@ A user-experience pass driven by a full UX audit (static review + live testing).
   on first run prints its location and public key (so you can authorize it), and
   pinning a server's key on first direct connection is announced.
 
-### Added
+### Known limitations
 
-- **`-h`/`--help` works everywhere** and now notes that options precede the host.
-- **`noisshd --user NAME`** drops sessions to a target user (the privilege-drop
-  mode the docs described but the daemon didn't expose).
-- **An optional `config` file** (`~/.config/noissh/config`) sets the default
-  `port` for direct connections; `noissh-keygen` gained `-V`/`--version`.
+- **Scrollback.** Like Mosh, noissh paints a live picture of the remote screen,
+  so your terminal's native scrollback does not capture content that scrolls off
+  the top. Run `tmux` or `screen` on the server for scrollback (and an even
+  stronger detach story). See the User Guide.
+- **Windows client.** The client is Unix-only (it needs a PTY and POSIX terminal
+  handling). Windows support is tracked as future work; see the User Guide.
 
 ## [0.4.13]
 
