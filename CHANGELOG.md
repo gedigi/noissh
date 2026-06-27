@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1]
+
+### Added
+
+- **Debian/Ubuntu `.deb` packages.** Each release now publishes a `.deb` for
+  `amd64` and `arm64` (alongside the tarballs), with a SHA-256 checksum and a
+  Sigstore build-provenance attestation. Install with
+  `sudo dpkg -i noissh-<target>.deb` (or `sudo apt install ./noissh-<target>.deb`);
+  it installs `noissh`, `noisshd`, `noissh-keygen`, and their man pages.
+
 ## [0.5.0]
 
 A combined UX-audit pass and feature pass closing the biggest gaps against

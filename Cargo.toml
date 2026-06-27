@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "MIT"
 authors = ["Gerardo <gedigi@live.com>"]
@@ -37,8 +37,35 @@ proto = { path = "crates/proto" }
 
 [package]
 name = "noissh"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
+license.workspace = true
+authors.workspace = true
+description = "A resilient remote shell over the Noise Protocol — survives roaming, NAT, and suspend/resume."
+repository = "https://github.com/gedigi/noissh"
+homepage = "https://github.com/gedigi/noissh"
+
+# Debian/Ubuntu package metadata (used by `cargo deb` in the release workflow).
+[package.metadata.deb]
+maintainer = "Gerardo <gedigi@live.com>"
+section = "net"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+noissh is a resilient remote shell built on the Noise Protocol Framework. \
+Sessions survive packet loss, IP changes, NAT rebinding, and suspend/resume, \
+with local echo prediction for an instant feel. It also provides local/remote/ \
+dynamic port forwarding, file transfer, and SSH agent forwarding over the same \
+authenticated, encrypted session."""
+assets = [
+    ["target/release/noissh", "usr/bin/", "755"],
+    ["target/release/noisshd", "usr/bin/", "755"],
+    ["target/release/noissh-keygen", "usr/bin/", "755"],
+    ["docs/man/noissh.1", "usr/share/man/man1/", "644"],
+    ["docs/man/noisshd.1", "usr/share/man/man1/", "644"],
+    ["docs/man/noissh-keygen.1", "usr/share/man/man1/", "644"],
+    ["README.md", "usr/share/doc/noissh/README.md", "644"],
+]
 
 [workspace.lints.clippy]
 all = "warn"

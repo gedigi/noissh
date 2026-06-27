@@ -65,6 +65,14 @@ curl -fsSL https://raw.githubusercontent.com/gedigi/noissh/main/install.sh | sh
 Prebuilt binaries are on the [releases page](https://github.com/gedigi/noissh/releases/latest).
 The installer verifies each download's SHA-256 checksum before installing.
 
+**Debian/Ubuntu (`.deb`):** each release also ships `amd64`/`arm64` packages:
+
+```sh
+sudo apt install ./noissh-x86_64-unknown-linux-gnu.deb   # or the aarch64 package
+```
+
+This installs `noissh`, `noisshd`, `noissh-keygen`, and their man pages.
+
 ### Verifying a download
 
 Every release archive ships a `.sha256` checksum and a Sigstore **build

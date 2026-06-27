@@ -65,10 +65,27 @@ jobs:
             shasum -a 256 "noissh-${{ matrix.target }}.tar.gz" > "noissh-${{ matrix.target }}.tar.gz.sha256"
           fi
 
+      - name: Build .deb package (Linux)
+        if: contains(matrix.target, 'linux')
+        run: |
+          cargo install cargo-deb --version "^2" --locked
+          # --no-build reuses the binaries built above; --no-strip avoids needing
+          # a cross strip tool for the aarch64 target. cargo-deb rewrites the
+          # target/release/ asset paths to target/<target>/release/ for --target.
+          cargo deb --no-build --no-strip --target "${{ matrix.target }}" \
+            --output "noissh-${{ matrix.target }}.deb"
+          sha256sum "noissh-${{ matrix.target }}.deb" > "noissh-${{ matrix.target }}.deb.sha256"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: noissh-${{ matrix.target }}.tar.gz
+
+      - name: Attest .deb provenance (Linux)
+        if: contains(matrix.target, 'linux')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: noissh-${{ matrix.target }}.deb
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -76,3 +93,11 @@ jobs:
           files: |
             noissh-${{ matrix.target }}.tar.gz
             noissh-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload .deb to release (Linux)
+        if: contains(matrix.target, 'linux')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            noissh-${{ matrix.target }}.deb
+            noissh-${{ matrix.target }}.deb.sha256
