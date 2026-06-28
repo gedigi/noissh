@@ -81,13 +81,16 @@ fn e2e_server_announces_version_in_session() {
     )
     .unwrap();
 
-    let got = client.wait_for_server_version(Duration::from_secs(3));
-    // The test binary and the server share the workspace version.
-    assert_eq!(got.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    // The version rides in the handshake (m2 payload), so it is known the instant
+    // the connection is established — no pumping/waiting needed.
     assert_eq!(
         client.core().server_version(),
-        Some(env!("CARGO_PKG_VERSION"))
+        Some(env!("CARGO_PKG_VERSION")),
+        "version should be available immediately from the handshake"
     );
+    // And wait_for_server_version returns it instantly (the loop never iterates).
+    let got = client.wait_for_server_version(Duration::from_secs(3));
+    assert_eq!(got.as_deref(), Some(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]

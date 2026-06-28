@@ -55,7 +55,7 @@ mod tests {
         authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "laptop");
 
         let (mut client, p1) = Handshaker::client(&client_kp.private, sid).unwrap();
-        let mut server = Handshaker::server(&server_kp.private, sid).unwrap();
+        let mut server = Handshaker::server(&server_kp.private, sid, b"test").unwrap();
 
         let p2 = server.read(body(&p1)).unwrap().reply.unwrap();
         let p3 = client.read(body(&p2)).unwrap().reply.unwrap();
@@ -91,7 +91,7 @@ mod tests {
         let authorized = AuthorizedKeys::new();
 
         let (mut client, p1) = Handshaker::client(&client_kp.private, sid).unwrap();
-        let mut server = Handshaker::server(&server_kp.private, sid).unwrap();
+        let mut server = Handshaker::server(&server_kp.private, sid, b"test").unwrap();
         let p2 = server.read(body(&p1)).unwrap().reply.unwrap();
         let p3 = client.read(body(&p2)).unwrap().reply.unwrap();
         server.read(body(&p3)).unwrap();

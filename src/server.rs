@@ -200,7 +200,17 @@ impl ServerCore {
                 if self.pending.len() >= MAX_PENDING_HANDSHAKES {
                     return Ok(Vec::new());
                 }
-                (Handshaker::server(&self.keypair.private, sid)?, false)
+                // Carry our version in the handshake so a direct client learns
+                // it immediately (the in-session ControlMsg::ServerVersion below
+                // remains as a fallback for pre-handshake-signalling clients).
+                (
+                    Handshaker::server(
+                        &self.keypair.private,
+                        sid,
+                        env!("CARGO_PKG_VERSION").as_bytes(),
+                    )?,
+                    false,
+                )
             }
         };
         // A failed read must NOT consume EXISTING pending state: the session id

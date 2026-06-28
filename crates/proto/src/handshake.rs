@@ -27,6 +27,13 @@ pub struct Handshaker {
     hs: Option<Handshake>,
     session_id: SessionId,
     finished: bool,
+    /// Payload to embed in the next handshake message we write. The server uses
+    /// this to carry its version in `m2` (`e, ee, s, es`), so the client learns
+    /// it the instant the handshake completes — no extra round trip.
+    send_payload: Vec<u8>,
+    /// The last non-empty payload received from the peer (for the client, the
+    /// server's `m2` payload, i.e. its version).
+    peer_payload: Option<Vec<u8>>,
 }
 
 /// Result of feeding a handshake message.
@@ -56,18 +63,28 @@ impl Handshaker {
                 hs: Some(hs),
                 session_id,
                 finished: false,
+                send_payload: Vec::new(),
+                peer_payload: None,
             },
             pkt,
         ))
     }
 
-    /// Begin as the server, awaiting the client's first message.
-    pub fn server(local_private: &[u8], session_id: SessionId) -> Result<Self, HandshakeError> {
+    /// Begin as the server, awaiting the client's first message. `send_payload`
+    /// is carried (encrypted) in the server's `m2` reply — used for the server's
+    /// version, so a direct client learns it without a separate round trip.
+    pub fn server(
+        local_private: &[u8],
+        session_id: SessionId,
+        send_payload: &[u8],
+    ) -> Result<Self, HandshakeError> {
         let hs = Handshake::new(Role::Responder, local_private)?;
         Ok(Handshaker {
             hs: Some(hs),
             session_id,
             finished: false,
+            send_payload: send_payload.to_vec(),
+            peer_payload: None,
         })
     }
 
@@ -82,18 +99,32 @@ impl Handshaker {
     /// Feed an incoming handshake message body (the part after the packet
     /// header). Returns any reply packet to send and whether we are done.
     pub fn read(&mut self, body: &[u8]) -> Result<HsOutcome, HandshakeError> {
-        let hs = self.hs.as_mut().ok_or(HandshakeError::AlreadyFinished)?;
-        hs.read_message(body)?;
-        if hs.is_finished() {
-            // Responder completes upon reading the final message.
-            self.finished = true;
-            return Ok(HsOutcome {
-                reply: None,
-                finished: true,
-            });
+        let payload = {
+            let hs = self.hs.as_mut().ok_or(HandshakeError::AlreadyFinished)?;
+            hs.read_message(body)?
+        };
+        // Keep the peer's payload (for the client, the server's m2 version).
+        // Ignore an all-zero payload: that is the client's m1 anti-amplification
+        // padding (see `client`), not meaningful data.
+        if payload.iter().any(|&b| b != 0) {
+            self.peer_payload = Some(payload);
         }
-        // Otherwise we owe the peer the next message.
-        let out = hs.write_message(&[])?;
+        {
+            let hs = self.hs.as_ref().ok_or(HandshakeError::AlreadyFinished)?;
+            if hs.is_finished() {
+                // Responder completes upon reading the final message.
+                self.finished = true;
+                return Ok(HsOutcome {
+                    reply: None,
+                    finished: true,
+                });
+            }
+        }
+        // We owe the peer the next message, carrying our payload. Drain it so it
+        // is embedded exactly once, never re-sent on any later message.
+        let send = std::mem::take(&mut self.send_payload);
+        let hs = self.hs.as_mut().ok_or(HandshakeError::AlreadyFinished)?;
+        let out = hs.write_message(&send)?;
         self.finished = hs.is_finished();
         let pkt = build_handshake_packet(&self.session_id, &out);
         Ok(HsOutcome {
@@ -105,6 +136,15 @@ impl Handshaker {
     /// The peer's authenticated static public key (once available).
     pub fn remote_static(&self) -> Option<Vec<u8>> {
         self.hs.as_ref().and_then(|h| h.remote_static())
+    }
+
+    /// The last meaningful handshake payload the peer sent. In practice only the
+    /// client uses this — to read the server's version from `m2` once the
+    /// handshake completes. (The client's own `m1` payload is all-zero
+    /// anti-amplification padding and is deliberately not recorded, so a
+    /// server-side `Handshaker` returns `None` here.)
+    pub fn peer_payload(&self) -> Option<&[u8]> {
+        self.peer_payload.as_deref()
     }
 
     /// Consume into a live transport session anchored at `peer_addr`. Errors if
@@ -139,9 +179,9 @@ mod tests {
         let sid = random_session_id();
 
         let (mut client, p1) = Handshaker::client(&ck.private, sid).unwrap();
-        let mut server = Handshaker::server(&sk.private, sid).unwrap();
+        let mut server = Handshaker::server(&sk.private, sid, b"0.5.3").unwrap();
 
-        // server reads msg1 -> replies msg2
+        // server reads msg1 -> replies msg2 (carrying the server's version)
         let r1 = server.read(&body(&p1)).unwrap();
         assert!(!r1.finished);
         let p2 = r1.reply.unwrap();
@@ -150,6 +190,9 @@ mod tests {
         let r2 = client.read(&body(&p2)).unwrap();
         assert!(r2.finished);
         let p3 = r2.reply.unwrap();
+
+        // The client learned the server's version from the m2 payload.
+        assert_eq!(client.peer_payload(), Some(&b"0.5.3"[..]));
 
         // server reads msg3 -> finished
         let r3 = server.read(&body(&p3)).unwrap();

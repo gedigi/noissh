@@ -57,6 +57,14 @@ authenticated static public key. The server then checks the client key against
 `authorized_keys` **before** creating a session; the client checks the server key
 against `known_hosts` (TOFU).
 
+**Version signalling.** Message 2 carries the server's version string as its
+(encrypted) Noise payload, so the client knows it the instant the handshake
+completes — no extra round trip. This lets a direct connection notice an outdated
+standing daemon and offer to upgrade it. The payload is confidential and bound to
+the server's static key (same trust as the session). Servers/clients that predate
+this still interoperate: the server also sends the version as a post-handshake
+`ServerVersion` control message (§6), which older clients use as a fallback.
+
 Session-id reuse: the server keys in-progress handshakes and established sessions
 by session id, independent of source address.
 
@@ -166,9 +174,10 @@ color: [0]                | [1][index u8] | [2][r u8][g u8][b u8]
 0x08 ServerVersion : version string                     (server→client)
 ```
 
-`ServerVersion` is sent once just after the session is established, so a direct
-connection can notice an outdated standing daemon and offer to upgrade it (the
-same check the SSH bootstrap makes from the connect line).
+`ServerVersion` is a fallback for the handshake-payload version signalling (§3):
+a v0.5.3+ client learns the version directly from message 2, but the server still
+sends this control message once after the session is established so a pre-v0.5.3
+client can also notice an outdated daemon.
 `OpenShell`'s `agent` byte requests SSH agent forwarding (`-A`). Strings are
 `varint length` + UTF-8 bytes. (Tags `0x04`/`0x05` are reserved — they were a
 never-wired second-factor prompt/response, since removed.)

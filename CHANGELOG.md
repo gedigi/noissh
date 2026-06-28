@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3]
+
+### Changed
+
+- **The server's version now rides in the Noise handshake** (the encrypted `m2`
+  payload) instead of only a post-handshake message, so a direct connection knows
+  it the instant the handshake completes — no extra round trip and no wait. The
+  direct-upgrade prompt added in 0.5.2 therefore appears immediately. The
+  post-handshake `ServerVersion` control message is kept as a fallback so a
+  v0.5.3 client still learns the version from a v0.5.2 daemon, and a v0.5.2 client
+  still learns it from a v0.5.3 daemon — no flag day.
+
 ## [0.5.2]
 
 ### Added

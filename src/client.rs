@@ -52,6 +52,18 @@ pub struct ClientCore {
     server_version: Option<String>,
 }
 
+/// Validate a server-supplied version string before storing it — it is later
+/// shown in the upgrade prompt, so require a short, version-ish token (leading
+/// digit, version characters only) to keep a hostile server from injecting
+/// control sequences. Mirrors the SSH-bootstrap version check.
+fn sane_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 32
+        && v.as_bytes()[0].is_ascii_digit()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
 /// Bound on OpenShell retransmissions, so a shell that produces no screen output
 /// does not cause the request to be resent for the whole session.
 const OPEN_SHELL_MAX_TICKS: u32 = 300;
@@ -209,6 +221,17 @@ impl ClientCore {
                 Tofu::Match => {}
             }
             self.server_static = Some(server_static);
+            // Learn the server's version from the handshake payload (v0.5.3+),
+            // so it's known the instant we connect — no extra round trip. A
+            // pre-v0.5.3 server sends nothing here and falls back to the
+            // in-session ControlMsg::ServerVersion handled in recv_and_handle.
+            if self.server_version.is_none()
+                && let Some(p) = self.hs.as_ref().and_then(|h| h.peer_payload())
+                && let Ok(v) = std::str::from_utf8(p)
+                && sane_version(v)
+            {
+                self.server_version = Some(v.to_string());
+            }
             let hs = self.hs.take().unwrap();
             self.session = Some(hs.into_session(Some(self.server_addr))?);
             self.established = true;
@@ -243,7 +266,14 @@ impl ClientCore {
                 Frame::Ack { seq } => self.shell.on_input_ack(seq),
                 Frame::Control { data } => match ControlMsg::decode(&data) {
                     Ok(ControlMsg::Exit { status }) => self.exited = Some(status),
-                    Ok(ControlMsg::ServerVersion(v)) => self.server_version = Some(v),
+                    // Fallback for a pre-handshake-signalling server: only honour
+                    // it if we didn't already learn the (static-key-bound) version
+                    // from the handshake, and apply the same validation.
+                    Ok(ControlMsg::ServerVersion(v))
+                        if self.server_version.is_none() && sane_version(&v) =>
+                    {
+                        self.server_version = Some(v)
+                    }
                     _ => {}
                 },
                 f @ (Frame::StreamOpen { .. }
