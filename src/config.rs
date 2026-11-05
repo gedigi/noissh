@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use auth::{AuthorizedKeys, KnownHosts};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use noise_core::{Keypair, generate_keypair};
+use noise_core::{Keypair, generate_keypair, public_from_private};
 
 use crate::RuntimeError;
 
@@ -21,8 +21,27 @@ pub fn config_dir() -> PathBuf {
     Path::new(&home).join(".config").join("noissh")
 }
 
+/// The public-key file that accompanies the private key file `path`:
+/// `<path>.pub` (e.g. `id` → `id.pub`), as with ssh.
+pub fn public_key_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".pub");
+    PathBuf::from(p)
+}
+
 /// Load a static keypair from `path`, or generate and persist one on first use.
-/// File format: two lines, `private <base64>` and `public <base64>`.
+///
+/// As with ssh, a key lives in two files:
+/// - `path` holds only the private key, as `private <base64>`, mode `0600`;
+/// - `path.pub` holds the public key as an authorized_keys line,
+///   `noissh-x25519 <base64> user@host`, so it can be appended to a server's
+///   `authorized_keys` as is.
+///
+/// The public key is derived from the private one, so `path.pub` is a copy for
+/// people and tools to read: it is written whenever it is missing and never
+/// consulted when loading. A key file from noissh 0.6.0 or earlier, which holds both
+/// halves (`private` and `public` lines), still loads, and is rewritten to hold
+/// only the private key (with its `.pub` written alongside).
 pub fn load_or_generate_keypair(path: &Path) -> Result<Keypair, RuntimeError> {
     if path.exists() {
         // Tighten an over-permissive key file before reading it (defends against
@@ -30,7 +49,7 @@ pub fn load_or_generate_keypair(path: &Path) -> Result<Keypair, RuntimeError> {
         tighten_if_loose(path);
         let contents = fs::read_to_string(path)?;
         let mut private = None;
-        let mut public = None;
+        let mut legacy_public = None;
         for line in contents.lines() {
             let mut it = line.split_whitespace();
             match (it.next(), it.next()) {
@@ -38,28 +57,115 @@ pub fn load_or_generate_keypair(path: &Path) -> Result<Keypair, RuntimeError> {
                     private = Some(STANDARD.decode(b64).map_err(|_| RuntimeError::BadKeyFile)?)
                 }
                 (Some("public"), Some(b64)) => {
-                    public = Some(STANDARD.decode(b64).map_err(|_| RuntimeError::BadKeyFile)?)
+                    legacy_public =
+                        Some(STANDARD.decode(b64).map_err(|_| RuntimeError::BadKeyFile)?)
                 }
                 _ => {}
             }
         }
-        match (private, public) {
-            (Some(private), Some(public)) => Ok(Keypair { private, public }),
-            _ => Err(RuntimeError::BadKeyFile),
+        let private = private.ok_or(RuntimeError::BadKeyFile)?;
+        let public = public_from_private(&private).ok_or(RuntimeError::BadKeyFile)?;
+        // A legacy file's stored public half must be the one its private half
+        // derives; anything else means the file is corrupt.
+        if legacy_public.as_ref().is_some_and(|p| *p != public) {
+            return Err(RuntimeError::BadKeyFile);
         }
+        let kp = Keypair { private, public };
+        if legacy_public.is_some() {
+            // Migrate to the private-only format. Best-effort: the key works
+            // either way, so a read-only directory must not stop a connection.
+            if let Err(e) = rewrite_private(path, private_key_text(&kp).as_bytes()) {
+                eprintln!(
+                    "noissh: could not split the public key out of {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        ensure_public_key_file(path, &kp);
+        Ok(kp)
     } else {
         let kp = generate_keypair()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let body = format!(
-            "private {}\npublic {}\n",
-            STANDARD.encode(&kp.private),
-            STANDARD.encode(&kp.public)
-        );
-        write_private(path, body.as_bytes())?;
+        write_private(path, private_key_text(&kp).as_bytes())?;
+        ensure_public_key_file(path, &kp);
         Ok(kp)
     }
+}
+
+/// The private key file's contents.
+fn private_key_text(kp: &Keypair) -> String {
+    format!("private {}\n", STANDARD.encode(&kp.private))
+}
+
+/// The comment ssh puts on a public key: `user@host`.
+fn key_comment() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    let host = nix::unistd::gethostname()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_default();
+    match (user.is_empty(), host.is_empty()) {
+        (false, false) => format!("{user}@{host}"),
+        (false, true) => user,
+        (true, false) => host,
+        (true, true) => String::new(),
+    }
+}
+
+/// Write `path.pub` for `kp` if it is missing; warn if one exists but holds a
+/// different key (it is left alone: it may be the user's own file). Never
+/// fails: the public key file is informational.
+fn ensure_public_key_file(path: &Path, kp: &Keypair) {
+    let Ok(public) = auth::PublicKey::from_bytes(&kp.public) else {
+        return;
+    };
+    let pub_path = public_key_path(path);
+    match fs::read_to_string(&pub_path) {
+        Ok(existing) => {
+            let matches = existing
+                .lines()
+                .any(|l| auth::PublicKey::from_text(l).is_ok_and(|k| k == public));
+            if !matches {
+                eprintln!(
+                    "noissh: {} does not hold the public key of {}; the private key is \
+                     used. Delete it to have it rewritten.",
+                    pub_path.display(),
+                    path.display()
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let comment = key_comment();
+            let line = if comment.is_empty() {
+                format!("{}\n", public.to_text())
+            } else {
+                format!("{} {comment}\n", public.to_text())
+            };
+            if let Err(e) = fs::write(&pub_path, line) {
+                eprintln!("noissh: could not write {}: {e}", pub_path.display());
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// Atomically replace the private file `path`: write a `0600` sibling temp
+/// file, fsync it, then rename it into place, so the key is never lost or
+/// momentarily world-readable.
+fn rewrite_private(path: &Path, body: &[u8]) -> Result<(), RuntimeError> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let _ = fs::remove_file(&tmp);
+    let result = write_private(&tmp, body).and_then(|()| Ok(fs::rename(&tmp, path)?));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Write a private file, creating it with `0600` atomically so the secret is
@@ -205,6 +311,129 @@ mod tests {
         let k2 = load_or_generate_keypair(&path).unwrap();
         assert_eq!(k1.private, k2.private);
         assert_eq!(k1.public, k2.public);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn key_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("noissh-key-test-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn pub_line_key(path: &Path) -> auth::PublicKey {
+        let text = fs::read_to_string(public_key_path(path)).unwrap();
+        auth::PublicKey::from_text(text.trim()).unwrap()
+    }
+
+    #[test]
+    fn new_key_is_split_into_private_and_public_files() {
+        let dir = key_dir("split");
+        let path = dir.join("id");
+        let kp = load_or_generate_keypair(&path).unwrap();
+
+        // `id`: the private key only, owner-only.
+        let private_text = fs::read_to_string(&path).unwrap();
+        assert!(private_text.starts_with("private "), "{private_text}");
+        assert!(!private_text.contains("public"), "{private_text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // `id.pub`: an authorized_keys line for the same key.
+        assert_eq!(dir.join("id.pub"), public_key_path(&path));
+        let pubkey = pub_line_key(&path);
+        assert_eq!(pubkey, auth::PublicKey::from_bytes(&kp.public).unwrap());
+
+        // Reloading yields the same identity (public derived from private).
+        let again = load_or_generate_keypair(&path).unwrap();
+        assert_eq!(again.private, kp.private);
+        assert_eq!(again.public, kp.public);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_combined_key_file_is_migrated() {
+        let dir = key_dir("legacy");
+        let path = dir.join("id");
+        let kp = generate_keypair().unwrap();
+        fs::write(
+            &path,
+            format!(
+                "private {}\npublic {}\n",
+                STANDARD.encode(&kp.private),
+                STANDARD.encode(&kp.public)
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_or_generate_keypair(&path).unwrap();
+        assert_eq!(loaded.private, kp.private);
+        assert_eq!(loaded.public, kp.public);
+        let private_text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            private_text,
+            format!("private {}\n", STANDARD.encode(&kp.private))
+        );
+        assert_eq!(
+            pub_line_key(&path),
+            auth::PublicKey::from_bytes(&kp.public).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "migrated key must stay owner-only");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_file_with_mismatched_public_half_is_rejected() {
+        let dir = key_dir("mismatch");
+        let path = dir.join("id");
+        let a = generate_keypair().unwrap();
+        let b = generate_keypair().unwrap();
+        let body = format!(
+            "private {}\npublic {}\n",
+            STANDARD.encode(&a.private),
+            STANDARD.encode(&b.public)
+        );
+        fs::write(&path, &body).unwrap();
+        assert!(matches!(
+            load_or_generate_keypair(&path),
+            Err(RuntimeError::BadKeyFile)
+        ));
+        // A corrupt file is left exactly as it was.
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_public_file_is_recreated_and_a_foreign_one_left_alone() {
+        let dir = key_dir("pubfile");
+        let path = dir.join("noisshd_key");
+        let kp = load_or_generate_keypair(&path).unwrap();
+        let pub_path = public_key_path(&path);
+
+        fs::remove_file(&pub_path).unwrap();
+        load_or_generate_keypair(&path).unwrap();
+        assert_eq!(
+            pub_line_key(&path),
+            auth::PublicKey::from_bytes(&kp.public).unwrap()
+        );
+
+        // Someone else's key in the .pub file is not overwritten; the private
+        // key still decides the identity.
+        let other = auth::PublicKey::from_bytes(&generate_keypair().unwrap().public).unwrap();
+        fs::write(&pub_path, format!("{}\n", other.to_text())).unwrap();
+        let loaded = load_or_generate_keypair(&path).unwrap();
+        assert_eq!(loaded.public, kp.public);
+        assert_eq!(pub_line_key(&path), other);
         let _ = fs::remove_dir_all(&dir);
     }
 

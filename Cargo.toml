@@ -20,8 +20,11 @@ authors = ["Gerardo <gedigi@live.com>"]
 [workspace.dependencies]
 # Lean dependency surface: only the features actually used are enabled.
 snow = "0.10" # default-resolver provides ChaChaPoly + BLAKE2s + 25519 (pure Rust)
+# Already in the tree via snow; used directly only to derive a public key from
+# its private key (so the private key file need not also store the public key).
+curve25519-dalek = { version = "4.1", default-features = false }
 vte = { version = "0.15", default-features = false } # core Parser/Perform only (no `ansi` layer)
-nix = { version = "0.31", default-features = false, features = ["term", "fs", "user", "poll"] }
+nix = { version = "0.31", default-features = false, features = ["term", "fs", "user", "poll", "hostname"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 getrandom = "0.4"
 thiserror = "2"

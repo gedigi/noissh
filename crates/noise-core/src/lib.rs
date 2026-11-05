@@ -48,6 +48,17 @@ pub fn generate_keypair() -> Result<Keypair, NoiseError> {
     })
 }
 
+/// Derive the X25519 public key for `private` (a 32-byte static private key, as
+/// produced by [`generate_keypair`]). Lets a key file store only the secret.
+pub fn public_from_private(private: &[u8]) -> Option<Vec<u8>> {
+    let bytes: [u8; KEY_LEN] = private.try_into().ok()?;
+    Some(
+        curve25519_dalek::MontgomeryPoint::mul_base_clamped(bytes)
+            .to_bytes()
+            .to_vec(),
+    )
+}
+
 /// Which side of the handshake we are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -168,6 +179,17 @@ pub fn handshake_in_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_key_derives_from_private_key() {
+        // The derivation must agree with snow's own key generation, or a key
+        // file holding only the private half would load a different identity.
+        for _ in 0..16 {
+            let kp = generate_keypair().unwrap();
+            assert_eq!(public_from_private(&kp.private).unwrap(), kp.public);
+        }
+        assert!(public_from_private(&[0u8; 31]).is_none());
+    }
 
     #[test]
     fn keypair_is_32_bytes() {

@@ -207,7 +207,7 @@ noissh-x25519 <base64-public-key>  optional-comment
 ```
 
 The client prints its own key on first run (it is stored in
-`~/.config/noissh/id`).
+`~/.config/noissh/id.pub`).
 
 ### One-shot (used by SSH bootstrap)
 
@@ -240,14 +240,27 @@ Homebrew/deb packaging placeholders.
 
 ## Keys & trust
 
-- **Your identity (client):** `~/.config/noissh/id` — a static X25519 keypair,
-  generated on first run, stored `0600`.
-- **Server identity:** `~/.config/noissh/noisshd_key` on the server.
+- **Your identity (client):** a static X25519 keypair, generated on first run.
+  As with ssh it is split in two: `~/.config/noissh/id` holds the private key
+  (`0600`) and `~/.config/noissh/id.pub` the public key, as an
+  `authorized_keys` line (`noissh-x25519 <base64> user@host`).
+- **Server identity:** `~/.config/noissh/noisshd_key` (and `noisshd_key.pub`)
+  on the server.
 - **Server trust (client side):** `~/.config/noissh/known_hosts`, TOFU-pinned.
 - **Client authorization (server side):** `~user/.config/noissh/authorized_keys`.
 
 This mirrors SSH's `known_hosts` / `authorized_keys` model, but with Noise static
 keys.
+
+The public key is derived from the private key, so a missing `.pub` file is
+simply written again. A key file from noissh 0.6.0 or earlier, which held both
+halves in `id`, keeps working: the first run of a newer version rewrites `id` to
+hold only the private key and writes `id.pub` next to it. Copy
+`id.pub` into a server's `authorized_keys` to authorize it:
+
+```sh
+cat ~/.config/noissh/id.pub     # noissh-x25519 <base64> you@laptop
+```
 
 ### Authorizing your key with `--copy-id`
 
@@ -285,8 +298,8 @@ noissh-keygen
 # -> noissh-x25519 <base64-public-key>
 ```
 
-On first run it creates the keypair (default `~/.config/noissh/id`, stored
-`0600`); on later runs it just prints the existing public key without
+On first run it creates the keypair (private key in `~/.config/noissh/id`,
+stored `0600`, and public key in `id.pub`); on later runs it just prints the existing public key without
 regenerating. Use `--key PATH` for a non-default location, or `--help` for usage:
 
 ```sh
@@ -302,9 +315,11 @@ Files live under `$XDG_CONFIG_HOME/noissh` (or `~/.config/noissh`):
 
 | File | Side | Purpose |
 |---|---|---|
-| `id` | client | your static keypair |
+| `id` | client | your private key (`0600`) |
+| `id.pub` | client | your public key (an `authorized_keys` line) |
 | `known_hosts` | client | pinned server public keys |
-| `noisshd_key` | server | server static keypair |
+| `noisshd_key` | server | server private key (`0600`) |
+| `noisshd_key.pub` | server | server public key |
 | `authorized_keys` | server | allowed client public keys |
 | `config` | both | optional settings file (see below) |
 
@@ -584,7 +599,8 @@ noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
 
 ```
 noissh-keygen [--key PATH]
-  --key PATH      keypair file to ensure/print (default <config>/id)
+  --key PATH      private key file to ensure/print (default <config>/id);
+                  the public key goes in PATH.pub
   -h, --help      print usage
   -V, --version   print the version
 ```

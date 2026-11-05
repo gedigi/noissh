@@ -459,8 +459,9 @@ fn run() -> Result<(), RuntimeError> {
     let keypair = load_or_generate_keypair(&id_path)?;
     if first_run {
         eprintln!(
-            "noissh: generated a new identity key at {}",
-            id_path.display()
+            "noissh: generated a new identity key at {} (public key in {})",
+            id_path.display(),
+            noissh::config::public_key_path(&id_path).display()
         );
         eprintln!(
             "        your public key (add to a server's authorized_keys for direct connections):"

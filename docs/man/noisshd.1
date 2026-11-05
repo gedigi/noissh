@@ -51,7 +51,9 @@ session.
 Bind address for standalone mode (default 0.0.0.0:51820).
 .TP
 .BI \-\-key " PATH"
-Static key file (default <config>/noisshd_key); generated on first use.
+Static private key file (default <config>/noisshd_key); generated on first use,
+with the public key written to the same path plus
+.IR .pub .
 .TP
 .BI \-\-authorized\-keys " PATH"
 Authorized client keys (default <config>/authorized_keys).
@@ -92,7 +94,10 @@ current user and needs no root.
 .SH FILES
 .TP
 .I <config>/noisshd_key
-Server static keypair.
+Server static private key (mode 0600).
+.TP
+.I <config>/noisshd_key.pub
+Server public key.
 .TP
 .I <config>/authorized_keys
 Allowed client public keys, one
