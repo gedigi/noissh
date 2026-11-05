@@ -40,6 +40,10 @@ laptop going to sleep.
 - **It runs commands.** Run a single remote command non-interactively, ssh-style
   (`noissh user@server <cmd>`), streaming its output and exiting with its status
   — handy for scripts.
+- **It works where `ssh` does.** noissh accepts ssh's flags, so tools that run
+  `ssh` can run it instead — point VS Code's `remote.SSH.path` at noissh and your
+  remote editor session survives network changes and sleep too
+  ([how](docs/USER_GUIDE.md#using-noissh-as-ssh-vs-code-remote-ssh-and-other-tools)).
 - **It moves files.** Copy files to and from the server (`--put`/`--get`) over
   the same authenticated channel — no second tool, no extra login.
 - **It forwards your keys.** **Agent forwarding** (`-A`) lets commands on the

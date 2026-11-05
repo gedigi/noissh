@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **noissh can stand in for `ssh` in tools that run it**, such as VS Code
+  Remote-SSH (`"remote.SSH.path": "/path/to/noissh"`). See "Using noissh as
+  `ssh`" in the user guide.
+  - **Port forwards now run alongside a remote command.** `noissh -D 1080 host
+    cmd` runs `cmd` and serves the SOCKS proxy on the same session until `cmd`
+    exits, as ssh does (previously the forwards were silently ignored when a
+    command was given). VS Code relies on this to reach its server.
+  - **ssh's command-line flags are accepted.** `-N` and `-n` behave as in ssh;
+    `-b -B -c -E -F -i -J -l -m -o -p` are passed to `ssh` for the bootstrap
+    (`-F` also resolves host aliases, and `-o` options that shape the session
+    itself are dropped); `-4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y` and
+    `-e CHAR` are accepted as no-ops. Flags can be clustered (`-NT`) or take
+    attached values (`-p2222`, `-oBatchMode=yes`).
+
 ## [0.5.3]
 
 ### Changed

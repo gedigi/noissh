@@ -96,6 +96,13 @@ struct Args {
     /// `--copy-id`: install our public key into the remote authorized_keys over
     /// SSH, then exit.
     copy_id: bool,
+    /// `-N`: run no remote command (forwards only), like `ssh -N`.
+    no_command: bool,
+    /// `-n`: give a remote command an empty stdin, like `ssh -n`.
+    null_stdin: bool,
+    /// `-F FILE`: the ssh config file to resolve host aliases from (also passed
+    /// to `ssh` for the bootstrap).
+    ssh_config: Option<String>,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -140,9 +147,13 @@ Options:
   --server-port N       pin the bootstrapped server's UDP port (firewall-friendly)
   --server-cmd CMD      remote server command for --ssh (default \"noisshd\")
   --no-install          do not auto-install noisshd on the remote if missing
-  -L LPORT:HOST:PORT    local port forward (repeatable); implies no shell
-  -R RPORT:HOST:PORT    remote port forward (repeatable); implies no shell
-  -D [BIND:]PORT        dynamic SOCKS forward (repeatable); implies no shell
+  -L LPORT:HOST:PORT    local port forward (repeatable)
+  -R RPORT:HOST:PORT    remote port forward (repeatable)
+  -D [BIND:]PORT        dynamic SOCKS forward (repeatable)
+                        forwards run alongside a command if one is given;
+                        otherwise the session is forward-only (no shell)
+  -N                    no remote command or shell (forwards only), like ssh -N
+  -n                    give the remote command an empty stdin, like ssh -n
   --put LOCAL:REMOTE    upload LOCAL to REMOTE, then exit
   --get REMOTE:LOCAL    download REMOTE to LOCAL, then exit
   -A, --forward-agent   forward your local SSH agent to the shell session
@@ -155,11 +166,17 @@ Options:
   -h, --help            print this help and exit
   -V, --version         print the version and exit
 
+ssh compatibility (so noissh can stand in for ssh, e.g. VS Code remote.SSH.path):
+  -b -B -c -E -F -i -J -l -m -o -p   passed to ssh for the bootstrap (-F is also
+                        used to resolve host aliases)
+  -4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y, -e CHAR   accepted, no effect
+
 Examples:
   noissh user@host                 # interactive shell
   noissh user@host uname -a        # run one command, then exit
   noissh --ssh user@host           # force the SSH bootstrap
   noissh -L 8080:localhost:80 user@host   # options go before the host
+  noissh -T -D 1080 user@host bash # a command with a SOCKS forward alongside
 
 Note: options must come before the host; anything after the host is the remote
 command.
@@ -213,6 +230,9 @@ fn parse_args() -> Args {
         verbose: false,
         forget_host: None,
         copy_id: false,
+        no_command: false,
+        null_stdin: false,
+        ssh_config: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -225,36 +245,24 @@ fn parse_args() -> Args {
             break;
         }
         match arg.as_str() {
-            "-h" | "--help" => {
+            "--help" => {
                 print_help();
                 exit(0);
             }
-            "-V" | "--version" => {
+            "--version" => {
                 println!("noissh {}", env!("CARGO_PKG_VERSION"));
                 exit(0);
             }
             "--ssh" => a.ssh = true,
             "--direct" => a.direct = true,
-            "-v" | "--verbose" => a.verbose = true,
+            "--verbose" => a.verbose = true,
             "--copy-id" => a.copy_id = true,
             "--forget-host" => a.forget_host = Some(string_value(it.next(), "--forget-host")),
             "--no-install" => a.no_install = true,
-            "-A" | "--forward-agent" => a.forward_agent = true,
+            "--forward-agent" => a.forward_agent = true,
             "--port" => a.port = port_value(it.next(), "--port"),
             "--server-cmd" => a.server_cmd = string_value(it.next(), "--server-cmd"),
             "--server-port" => a.server_port = Some(port_value(it.next(), "--server-port")),
-            "-L" => match it.next().as_deref().and_then(parse_forward) {
-                Some(spec) => a.local_forwards.push(spec),
-                None => usage_exit("-L wants LPORT:HOST:PORT (e.g. -L 8080:localhost:80)"),
-            },
-            "-R" => match it.next().as_deref().and_then(parse_forward) {
-                Some(spec) => a.remote_forwards.push(spec),
-                None => usage_exit("-R wants RPORT:HOST:PORT (e.g. -R 9000:localhost:22)"),
-            },
-            "-D" => match it.next().as_deref().and_then(parse_dynamic) {
-                Some(spec) => a.dynamic_forwards.push(spec),
-                None => usage_exit("-D wants [BIND:]PORT (e.g. -D 1080)"),
-            },
             "--put" => match it.next().as_deref().and_then(|s| s.split_once(':')) {
                 Some((local, remote)) if !local.is_empty() && !remote.is_empty() => {
                     let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
@@ -279,7 +287,10 @@ fn parse_args() -> Args {
                 }
                 _ => usage_exit("--get wants REMOTE:LOCAL (e.g. --get /var/log/app.log:./app.log)"),
             },
-            "--" => a.ssh_args = it.by_ref().collect(),
+            "--" => a.ssh_args.extend(it.by_ref()),
+            other if other.len() > 1 && other.starts_with('-') && !other.starts_with("--") => {
+                parse_short_options(other, &mut it, &mut a);
+            }
             other => {
                 if a.target.is_none() && !other.starts_with('-') {
                     a.target = Some(other.to_string());
@@ -290,6 +301,120 @@ fn parse_args() -> Args {
         }
     }
     a
+}
+
+/// ssh session options that noissh itself provides (or that would conflict with
+/// the bootstrap's own `ssh` invocation), so a `-o` setting them is dropped
+/// rather than handed to the bootstrap `ssh`. Compared case-insensitively.
+const SSH_OPTIONS_NOT_PASSED: &[&str] = &[
+    "remotecommand",
+    "requesttty",
+    "sessiontype",
+    "localforward",
+    "remoteforward",
+    "dynamicforward",
+    "forwardagent",
+    "stdinnull",
+    "forkafterauthentication",
+    "controlmaster",
+    "controlpath",
+    "controlpersist",
+];
+
+/// The option name of an `ssh -o` argument (`Key=Value` or `Key Value`).
+fn ssh_option_name(opt: &str) -> String {
+    opt.split(|c: char| c == '=' || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Parse a cluster of single-letter options (`-v`, `-NT`, `-D1080`,
+/// `-p 2222`, ...), accepting ssh's own flags so noissh can stand in for `ssh`
+/// in tools that invoke it (e.g. VS Code's `remote.SSH.path`).
+///
+/// - noissh's flags: `-A -h -V -v -L -R -D`
+/// - ssh flags with a noissh meaning: `-N` (no command), `-n` (null stdin)
+/// - ssh flags that only matter to the SSH bootstrap, passed through to `ssh`:
+///   `-b -B -c -E -F -i -J -l -m -o -p`
+/// - ssh flags that are meaningless here and accepted as no-ops:
+///   `-4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y` and `-e CHAR`
+fn parse_short_options(arg: &str, it: &mut impl Iterator<Item = String>, a: &mut Args) {
+    let flags = &arg[1..];
+    for (i, c) in flags.char_indices() {
+        let takes_value = matches!(
+            c,
+            'L' | 'R' | 'D' | 'b' | 'B' | 'c' | 'E' | 'F' | 'i' | 'J' | 'l' | 'm' | 'o' | 'p' | 'e'
+        );
+        if takes_value {
+            // ssh-style: the value is either the rest of this argument
+            // (`-D1080`) or the next argument (`-D 1080`).
+            let rest = &flags[i + c.len_utf8()..];
+            let value = if rest.is_empty() {
+                match it.next() {
+                    Some(v) => v,
+                    None => usage_exit(&format!("-{c} requires a value")),
+                }
+            } else {
+                rest.to_string()
+            };
+            apply_valued_option(c, value, a);
+            return;
+        }
+        match c {
+            'h' => {
+                print_help();
+                exit(0);
+            }
+            'V' => {
+                println!("noissh {}", env!("CARGO_PKG_VERSION"));
+                exit(0);
+            }
+            'v' => a.verbose = true,
+            'A' => a.forward_agent = true,
+            'N' => a.no_command = true,
+            'n' => a.null_stdin = true,
+            // Accepted for ssh compatibility; nothing to do for noissh (no TTY
+            // is requested for a command, X11/compression/IP-family/GSSAPI are
+            // not applicable).
+            '4' | '6' | 'a' | 'C' | 'g' | 'k' | 'K' | 'q' | 's' | 'T' | 't' | 'x' | 'X' | 'Y'
+            | 'y' => {}
+            _ => usage_exit(&format!("unknown option \"-{c}\"")),
+        }
+    }
+}
+
+/// Apply a single-letter option that takes a value (see [`parse_short_options`]).
+fn apply_valued_option(c: char, value: String, a: &mut Args) {
+    match c {
+        'L' => match parse_forward(&value) {
+            Some(spec) => a.local_forwards.push(spec),
+            None => usage_exit("-L wants LPORT:HOST:PORT (e.g. -L 8080:localhost:80)"),
+        },
+        'R' => match parse_forward(&value) {
+            Some(spec) => a.remote_forwards.push(spec),
+            None => usage_exit("-R wants RPORT:HOST:PORT (e.g. -R 9000:localhost:22)"),
+        },
+        'D' => match parse_dynamic(&value) {
+            Some(spec) => a.dynamic_forwards.push(spec),
+            None => usage_exit("-D wants [BIND:]PORT (e.g. -D 1080)"),
+        },
+        // The escape character: noissh has its own detach key, so ignore it.
+        'e' => {}
+        'o' => {
+            if !SSH_OPTIONS_NOT_PASSED.contains(&ssh_option_name(&value).as_str()) {
+                a.ssh_args.push("-o".to_string());
+                a.ssh_args.push(value);
+            }
+        }
+        _ => {
+            if c == 'F' {
+                a.ssh_config = Some(value.clone());
+            }
+            a.ssh_args.push(format!("-{c}"));
+            a.ssh_args.push(value);
+        }
+    }
 }
 
 fn run() -> Result<(), RuntimeError> {
@@ -364,10 +489,20 @@ fn run() -> Result<(), RuntimeError> {
 
     // No interactive shell for a one-shot transfer or when `-L`/`-R`/`-D` is
     // given (the latter behaves like `ssh -N`).
-    let forward_only = !args.local_forwards.is_empty()
+    let has_forwards = !args.local_forwards.is_empty()
         || !args.remote_forwards.is_empty()
         || !args.dynamic_forwards.is_empty();
-    let want_shell = !forward_only && args.transfer.is_none() && args.command.is_empty();
+    // `-N` means no remote command at all, even if one was given (as with ssh).
+    let command = if args.no_command {
+        Vec::new()
+    } else {
+        args.command.clone()
+    };
+    // Forwards without a command run forward-only (`ssh -N`); forwards with a
+    // command run alongside it (`ssh -D 1080 host cmd`).
+    let forward_only = args.no_command || (has_forwards && command.is_empty());
+    let want_shell =
+        !forward_only && !has_forwards && args.transfer.is_none() && command.is_empty();
     // Agent forwarding only applies to an interactive shell; it needs a local
     // agent ($SSH_AUTH_SOCK) to bridge to.
     let agent_sock = if args.forward_agent && want_shell {
@@ -392,7 +527,17 @@ fn run() -> Result<(), RuntimeError> {
     // address is in `HostName` would never connect over UDP. The original target
     // is still handed to `ssh` (which applies ProxyJump/Port/User from the config).
     let alias = ssh::host_of(&target).to_string();
-    let host_cfg = noissh::sshconfig::resolve_default(&alias);
+    let host_cfg = match &args.ssh_config {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => noissh::sshconfig::resolve(&text, &alias),
+            Err(e) => {
+                return Err(RuntimeError::Usage(format!(
+                    "can't read the ssh config file {path:?} given with -F: {e}"
+                )));
+            }
+        },
+        None => noissh::sshconfig::resolve_default(&alias),
+    };
     let host = host_cfg.hostname.clone().unwrap_or_else(|| alias.clone());
     if args.verbose && host != alias {
         eprintln!("noissh: ~/.ssh/config: {alias} → HostName {host}");
@@ -579,10 +724,17 @@ fn run() -> Result<(), RuntimeError> {
         ssh::maybe_offer_direct_upgrade(&target, &args.ssh_args, &remote_v);
     }
 
-    if !args.command.is_empty() {
+    if !command.is_empty() {
         // ssh-style: run the trailing command and exit with its status. The args
         // are joined and run via the remote shell (so quoting/redirs behave).
-        let code = client.run_exec(&args.command.join(" "))?;
+        // Any forwards run alongside it for as long as it runs.
+        let opts = noissh::client::ExecOptions {
+            local: args.local_forwards.clone(),
+            remote: args.remote_forwards.clone(),
+            dynamic: args.dynamic_forwards.clone(),
+            null_stdin: args.null_stdin,
+        };
+        let code = client.run_exec_with(&command.join(" "), &opts)?;
         exit(code);
     } else if let Some((req, local)) = args.transfer {
         client.run_transfer(&req, &local)?;

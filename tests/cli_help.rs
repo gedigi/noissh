@@ -64,7 +64,10 @@ fn noissh_invalid_args_fail_loudly() {
         &["--port", "abc", "host"][..],
         &["--put", "missing-colon", "host"][..],
         &["-L", "8080", "host"][..],
-        &["-x", "host"][..],
+        &["-Z", "host"][..],
+        &["-W", "localhost:22", "host"][..],
+        &["-D", "notaport", "host"][..],
+        &["-o"][..],
     ] {
         let (code, out) = run(bin, args);
         assert_eq!(code, 2, "{args:?} should exit 2, got {code}: {out}");
@@ -73,6 +76,49 @@ fn noissh_invalid_args_fail_loudly() {
             "{args:?} should print a noissh error: {out}"
         );
     }
+}
+
+#[test]
+fn noissh_accepts_ssh_flags() {
+    // Tools that invoke `ssh` (e.g. VS Code's `remote.SSH.path`) pass ssh's own
+    // flags. They must parse — clustered, attached, or separate — rather than
+    // fail as unknown options. `--forget-host` exits right after parsing, so
+    // this checks the parser without connecting anywhere.
+    let bin = env!("CARGO_BIN_EXE_noissh");
+    let dir = std::env::temp_dir().join(format!("noissh-sshflags-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(bin)
+        .args([
+            "-T",
+            "-NqC",
+            "-o",
+            "ConnectTimeout=15",
+            "-oBatchMode=yes",
+            "-p2222",
+            "-l",
+            "me",
+            "-F",
+            "/dev/null",
+            "-i",
+            "/dev/null",
+            "-D1080",
+            "-e",
+            "none",
+            "-46",
+            "--forget-host",
+            "nope.example",
+        ])
+        .env("XDG_CONFIG_HOME", &dir)
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ssh flags should parse: {stderr}"
+    );
+    assert!(stderr.contains("no pinned host key"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
