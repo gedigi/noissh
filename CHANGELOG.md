@@ -4,7 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0-rc.1]
+
+### Fixed
+
+- **Auto-installing `noisshd` now installs the release matching your client.**
+  The installer script was pinned to the client's tag, but it then downloaded
+  the *latest* release's binaries, so a client newer than the latest release (a
+  prerelease, or a stale "latest") installed a mismatched server.
+- Release tags with a suffix (`v0.6.0-rc.1`) are now published as GitHub
+  prereleases, so they don't become the version `install.sh` installs by default.
 
 ### Added
 

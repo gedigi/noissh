@@ -90,6 +90,9 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          # A tag with a suffix (v0.6.0-rc.1) is a prerelease: published for
+          # testing, but not marked "latest", so install.sh keeps the stable one.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             noissh-${{ matrix.target }}.tar.gz
             noissh-${{ matrix.target }}.tar.gz.sha256
@@ -98,6 +101,9 @@ jobs:
         if: contains(matrix.target, 'linux')
         uses: softprops/action-gh-release@v2
         with:
+          # A tag with a suffix (v0.6.0-rc.1) is a prerelease: published for
+          # testing, but not marked "latest", so install.sh keeps the stable one.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             noissh-${{ matrix.target }}.deb
             noissh-${{ matrix.target }}.deb.sha256
