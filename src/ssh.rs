@@ -232,9 +232,11 @@ fn attempt(
 /// it by an absolute path regardless of the non-interactive `PATH`. Installer
 /// output streams to the user's terminal.
 fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), RuntimeError> {
-    // Pin the installer to THIS client's released tag rather than a moving
-    // branch, so an auto-install runs a versioned, reproducible script (the
-    // installer itself then verifies the release binary's SHA-256 checksum).
+    // Pin the installer, and the release it downloads (NOISSH_VERSION), to THIS
+    // client's tag rather than a moving branch or "latest", so an auto-install
+    // runs a versioned, reproducible script and installs the matching server
+    // (the installer itself then verifies the release binary's SHA-256
+    // checksum).
     let installer = format!(
         "https://raw.githubusercontent.com/gedigi/noissh/v{}/install.sh",
         env!("CARGO_PKG_VERSION")
@@ -253,7 +255,8 @@ fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), Runtime
          if command -v curl >/dev/null 2>&1; then curl -fsSL '{installer}' -o \"$tmp\"; \
          elif command -v wget >/dev/null 2>&1; then wget -qO \"$tmp\" '{installer}'; \
          else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi; \
-         NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh \"$tmp\" --yes"
+         NOISSH_VERSION='v{ver}' NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh \"$tmp\" --yes",
+        ver = env!("CARGO_PKG_VERSION")
     );
     let mut cmd = Command::new(ssh_prog());
     cmd.args(extra_ssh_args);
