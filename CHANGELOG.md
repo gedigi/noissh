@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Keys are stored in two files, like ssh.** The private key stays in `id`
+  (`noisshd_key` on a server), mode `0600`, and the public key now has its own
+  `id.pub` (`noisshd_key.pub`) in `authorized_keys` format
+  (`noissh-x25519 <base64> user@host`), ready to copy to a server. The public
+  key is derived from the private key, so a missing `.pub` is rewritten. An
+  existing combined key file keeps working and is split automatically on first
+  use; the identity does not change. noissh 0.6.0 and earlier can't read the
+  split file: to go back to one, append the `.pub` key as a `public <base64>`
+  line to the private key file.
+
 ## [0.6.0]
 
 ### Fixed

@@ -3,8 +3,9 @@
 //!
 //! Usage:
 //!   noissh-keygen [--key PATH]
-//!       Ensure a static keypair exists at PATH (default <config>/id),
-//!       creating it if missing, and print the public key line
+//!       Ensure a static keypair exists at PATH (default <config>/id, with
+//!       the public key in PATH.pub), creating it if missing, and print the
+//!       public key line
 //!       `noissh-x25519 <base64>` to stdout. Paste that line into a server's
 //!       authorized_keys to authorize this identity. If the file already
 //!       exists, its public key is printed without regenerating.
@@ -25,6 +26,8 @@ Usage:
   noissh-keygen [--key PATH]   ensure a keypair at PATH (default <config>/id),
                                creating it if missing, then print the public
                                key line `noissh-x25519 <base64>`
+
+The private key is stored in PATH (mode 0600) and the public key in PATH.pub.
   noissh-keygen --help         print this help
   noissh-keygen --version      print the version
 

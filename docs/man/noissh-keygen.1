@@ -14,7 +14,8 @@ noissh\-keygen \- ensure a noissh static keypair exists and print its public key
 ensures a long\-term static keypair exists for noissh and prints its public key
 line. If the key file is missing it is created (with
 .B 0600
-permissions); if it already exists, its public key is printed without
+permissions), with the public key written alongside it to the same path plus
+.IR .pub ; if it already exists, its public key is printed without
 regenerating, so the command is safe to run repeatedly.
 .PP
 The printed line has the form
@@ -51,8 +52,13 @@ Print the version and exit.
 .SH FILES
 .TP
 .I ~/.config/noissh/id
-Default static keypair (private key; created
+Default private key (created
 .BR 0600 ).
+.TP
+.I ~/.config/noissh/id.pub
+Its public key, as an
+.I authorized_keys
+line.
 .SH EXIT STATUS
 .TP
 .B 0

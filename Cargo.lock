@@ -331,6 +331,7 @@ name = "noise-core"
 version = "0.6.0"
 dependencies = [
  "base64",
+ "curve25519-dalek",
  "snow",
  "thiserror",
 ]
