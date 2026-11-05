@@ -25,6 +25,7 @@ This guide covers installing, connecting, configuring, and troubleshooting.
 - [Remote command execution](#remote-command-execution)
 - [File transfer](#file-transfer)
 - [Agent forwarding](#agent-forwarding)
+- [Using noissh as `ssh` (VS Code Remote-SSH and other tools)](#using-noissh-as-ssh-vs-code-remote-ssh-and-other-tools)
 - [Scrollback and long output](#scrollback-and-long-output)
 - [Windows](#windows)
 - [Command reference](#command-reference)
@@ -332,8 +333,10 @@ does not need a config entry.
 ## Port forwarding
 
 Local (`-L`) and remote (`-R`) port forwarding ride the same resilient session
-and work like SSH's equivalents. Adding any forward makes the session
-forward-only (no shell), like a `-N`-style session.
+and work like SSH's equivalents. Forwards given without a remote command make
+the session forward-only (no shell), like `ssh -N`; given with a command, they
+run alongside it for as long as it runs (see
+[Remote command execution](#remote-command-execution)).
 
 ```sh
 # Local: localhost:8080 (your machine) -> 10.0.0.5:80 (reachable from the server)
@@ -361,8 +364,8 @@ noissh --ssh -D 127.0.0.1:1080 user@server
 
 Point a SOCKS-aware application at the proxy and its connections exit from the
 server. The proxy speaks SOCKS5 (no authentication) and SOCKS4/4a, CONNECT only.
-It binds loopback by default. Like `-L`/`-R`, `-D` makes the session
-forward-only (no shell), and all forwards may be combined.
+It binds loopback by default. Like `-L`/`-R`, `-D` without a command makes the
+session forward-only (no shell), and all forwards may be combined.
 
 ## Remote command execution
 
@@ -389,6 +392,17 @@ your local shell when needed:
 ```sh
 noissh --ssh user@server 'echo $HOME && uname -a'
 ```
+
+Port forwards (`-L`/`-R`/`-D`) given with a command run alongside it on the same
+session, and noissh exits when the command does — as with
+`ssh -D 1080 user@server cmd`:
+
+```sh
+noissh -D 1080 user@server 'sleep 600'   # a SOCKS proxy for ten minutes
+```
+
+`-n` gives the command an empty stdin instead of forwarding yours (like
+`ssh -n`), and `-N` runs no command at all.
 
 Like file transfer and agent forwarding, a remote command is refused by a standalone
 daemon configured with a `--user` privilege drop (see
@@ -455,6 +469,51 @@ The server-side agent socket lives in a per-user directory created `0700`
 (noissh refuses a pre-existing path not owned by you) and the socket file itself
 is `0600`, so other local users on the server cannot reach your forwarded agent.
 
+## Using noissh as `ssh` (VS Code Remote-SSH and other tools)
+
+noissh accepts `ssh`'s command-line flags, so tools that run `ssh` can run
+noissh instead and get a connection that survives network changes and sleep.
+For **VS Code Remote-SSH**, point `remote.SSH.path` at noissh in your
+`settings.json`:
+
+```json
+"remote.SSH.path": "/home/you/.local/bin/noissh"
+```
+
+Connect to hosts as usual (aliases come from `~/.ssh/config`, or from the file in
+`remote.SSH.configFile`, which VS Code passes with `-F`). VS Code runs something
+like `noissh -T -D 53412 -o ConnectTimeout=15 myhost bash`: noissh runs the
+remote shell, feeds it VS Code's setup script over stdin, and serves the `-D`
+SOCKS proxy that VS Code uses to reach its server, all on one resilient session.
+
+How ssh's flags are treated:
+
+| Flags | Effect |
+|---|---|
+| `-L` `-R` `-D` `-A` `-v` | noissh's own forwarding, agent forwarding and verbose output |
+| `-N` / `-n` | no remote command / empty stdin for the command, as in ssh |
+| `-b -B -c -E -F -i -J -l -m -o -p` | passed to `ssh` for the [SSH bootstrap](#ssh-bootstrap-the-automatic-fallback); `-F` is also used to resolve host aliases |
+| `-4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y`, `-e CHAR` | accepted and ignored |
+
+Flags can be clustered or have their value attached (`-NT`, `-p2222`,
+`-oBatchMode=yes`), as with ssh. `-o` settings that shape the session itself
+(`RemoteCommand`, `RequestTTY`, `SessionType`, the `*Forward` options,
+`ForwardAgent`, `StdinNull`, `ForkAfterAuthentication` and the `Control*`
+multiplexing options) are not passed to the bootstrap `ssh`, because noissh
+provides the session; everything else (`ConnectTimeout`, `BatchMode`, ...) is.
+Flags noissh doesn't support (for example `-W`, `-f` or `-G`) are rejected with an
+error rather than ignored.
+
+Tips:
+
+- **Connect directly when you can.** With a standing `noisshd` and your key
+  authorized (`--copy-id`), connections skip the SSH bootstrap.
+- **`-V` prints noissh's version**, not OpenSSH's. Tools that parse
+  `ssh -V` output to detect OpenSSH features may need that check disabled.
+- If a tool connects but then hangs, the usual cause is blocked UDP; see
+  [Troubleshooting](#troubleshooting). `-v` (which VS Code passes) narrates the
+  connection sequence into the tool's log.
+
 ## Command reference
 
 ### `noissh`
@@ -467,9 +526,12 @@ noissh [OPTIONS] [user@]host [command ...] [-- <ssh args>]
   --server-port N pin the bootstrapped server's UDP port (firewall-friendly)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   --no-install    do not auto-install noisshd on the remote if it is missing
-  -L LPORT:HOST:PORT   local forward (repeatable); implies forward-only
-  -R RPORT:HOST:PORT   remote forward (repeatable); implies forward-only
-  -D [BIND:]PORT       dynamic SOCKS forward (repeatable); implies forward-only
+  -L LPORT:HOST:PORT   local forward (repeatable)
+  -R RPORT:HOST:PORT   remote forward (repeatable)
+  -D [BIND:]PORT       dynamic SOCKS forward (repeatable); forwards run
+                       alongside a command, or forward-only without one
+  -N              no remote command or shell (forwards only), like ssh -N
+  -n              give the remote command an empty stdin, like ssh -n
   --put LOCAL:REMOTE   upload LOCAL to REMOTE, then exit (no shell)
   --get REMOTE:LOCAL   download REMOTE to LOCAL, then exit (no shell)
   -A, --forward-agent  forward your local auth agent to the shell session
@@ -482,6 +544,9 @@ noissh [OPTIONS] [user@]host [command ...] [-- <ssh args>]
   command ...     run this command on the server non-interactively (ssh-style),
                   then exit with its status; omit it for an interactive shell
   -- <args>       pass remaining args to ssh (only with --ssh)
+ssh-compatible flags (see "Using noissh as ssh"):
+  -b -B -c -E -F -i -J -l -m -o -p   passed to ssh for the bootstrap
+  -4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y, -e CHAR   ignored
 ```
 
 All options must come before the host.

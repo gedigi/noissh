@@ -628,55 +628,20 @@ impl Client {
         remote: &[(u16, String)],
         dynamic: &[(String, u16)],
     ) -> Result<(), RuntimeError> {
-        use crate::forward::ForwardConn;
-        use crate::socks::{Progress, SocksConn};
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-        use std::collections::HashMap;
-        use std::net::TcpListener;
         use std::os::fd::AsFd;
         use std::time::Instant;
 
         // The loop waits via poll(); the UDP socket must be non-blocking so
         // recv drains to WouldBlock instead of blocking on each retransmit.
         self.socket.set_nonblocking(true)?;
+        let mut fwd = Forwarder::bind(&mut self.core, self.server_addr, local, remote, dynamic)?;
 
-        let mut listeners = Vec::new();
-        for (port, target) in local {
-            let l = TcpListener::bind(("127.0.0.1", *port))?;
-            l.set_nonblocking(true)?;
-            eprintln!("-L 127.0.0.1:{port} -> {target} (via {})", self.server_addr);
-            listeners.push((l, target.clone()));
-        }
-        for (port, target) in remote {
-            self.core.request_remote_forward(*port, target);
-            eprintln!("-R {}:{port} -> {target}", self.server_addr.ip());
-        }
-        // SOCKS (`-D`) listeners: each accepts SOCKS clients and tunnels their
-        // CONNECT targets dynamically.
-        let mut socks_listeners = Vec::new();
-        for (bind, port) in dynamic {
-            let l = TcpListener::bind((bind.as_str(), *port))?;
-            l.set_nonblocking(true)?;
-            eprintln!("-D {bind}:{port} (SOCKS) -> via {}", self.server_addr);
-            socks_listeners.push(l);
-        }
-        // SOCKS connections still negotiating (no forward stream opened yet).
-        let mut pending_socks: Vec<SocksConn> = Vec::new();
-
-        let mut conns: HashMap<u64, ForwardConn> = HashMap::new();
         let keepalive = Duration::from_secs(3);
         let mut next_keepalive = Instant::now() + keepalive;
 
-        // Cap unacked per-stream bytes so a fast TCP producer can't grow the
-        // mux send buffer without bound (the mux has receive-side flow control;
-        // this is the matching send-side check).
-        const SEND_CAP: u64 = 512 * 1024;
-
         loop {
-            let timeout = if self.core.has_outgoing()
-                || conns.values().any(|c| c.wants_write())
-                || !pending_socks.is_empty()
-            {
+            let timeout = if self.core.has_outgoing() || fwd.is_busy() {
                 Duration::from_millis(20)
             } else {
                 next_keepalive
@@ -686,150 +651,24 @@ impl Client {
             {
                 let sock = self.socket.as_fd();
                 let mut fds = vec![PollFd::new(sock, PollFlags::POLLIN)];
-                for (l, _) in &listeners {
-                    fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
-                }
-                for l in &socks_listeners {
-                    fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
-                }
-                // Wait on each forwarded socket too (no busy-spin while connected).
-                let conn_fds: Vec<_> = conns.values().map(|c| c.as_fd()).collect();
-                for fd in &conn_fds {
-                    fds.push(PollFd::new(*fd, PollFlags::POLLIN));
-                }
-                let socks_fds: Vec<_> = pending_socks.iter().map(|c| c.as_fd()).collect();
-                for fd in &socks_fds {
-                    fds.push(PollFd::new(*fd, PollFlags::POLLIN));
+                for fd in fwd.poll_fds() {
+                    fds.push(PollFd::new(fd, PollFlags::POLLIN));
                 }
                 let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
                 let _ = poll(&mut fds, PollTimeout::from(ms));
             }
 
-            // Accept new local (`-L`) connections and open a forward stream each.
-            for (l, target) in &listeners {
-                loop {
-                    match l.accept() {
-                        Ok((s, _)) => {
-                            if let Ok(conn) = ForwardConn::new(s) {
-                                let id = self.core.open_forward(target);
-                                conns.insert(id, conn);
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
-            }
-
-            // Accept new SOCKS (`-D`) connections; negotiation happens below.
-            for l in &socks_listeners {
-                loop {
-                    match l.accept() {
-                        Ok((s, _)) => {
-                            if let Ok(sc) = SocksConn::new(s) {
-                                pending_socks.push(sc);
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
-            }
-
-            // Drive SOCKS negotiations; on CONNECT, open a forward and bridge.
-            let mut still_pending = Vec::new();
-            for sc in pending_socks.drain(..) {
-                match sc.negotiate() {
-                    (
-                        Progress::Connected {
-                            target,
-                            socket,
-                            leftover,
-                        },
-                        _,
-                    ) => {
-                        if let Ok(conn) = ForwardConn::new(socket) {
-                            let id = self.core.open_forward(&target);
-                            if !leftover.is_empty() {
-                                self.core.stream_write(id, &leftover);
-                            }
-                            conns.insert(id, conn);
-                        }
-                    }
-                    (Progress::Pending, Some(sc)) => still_pending.push(sc),
-                    // Failed, or pending-without-handback: drop the connection.
-                    _ => {}
-                }
-            }
-            pending_socks = still_pending;
+            fwd.accept(&mut self.core);
 
             // Inbound session packets.
             while self.recv_and_handle()? {}
 
             // React to stream events (incl. inbound `-R` opens → dial out).
             for ev in self.core.take_stream_events() {
-                match ev {
-                    StreamEvent::Opened {
-                        id,
-                        kind: StreamKind::Forward,
-                        meta,
-                    } => {
-                        match std::str::from_utf8(&meta)
-                            .ok()
-                            .and_then(|t| ForwardConn::connect(t).ok())
-                        {
-                            Some(conn) => {
-                                conns.insert(id, conn);
-                            }
-                            None => self.core.stream_close(id),
-                        }
-                    }
-                    // Session→TCP draining happens in the pump loop below, bounded
-                    // by the out buffer; Readable just signals data is available.
-                    StreamEvent::Readable { .. } => {}
-                    // Peer closed its send half: keep flushing what we have, but
-                    // stop expecting more session data. Reset aborts immediately.
-                    StreamEvent::Closed { id, .. } => {
-                        if let Some(c) = conns.get_mut(&id) {
-                            c.mark_peer_closed();
-                        }
-                    }
-                    StreamEvent::Reset { id } => {
-                        conns.remove(&id);
-                    }
-                    _ => {}
-                }
+                let _ = fwd.handle_event(&mut self.core, ev);
             }
 
-            // Pump both directions, with caps, propagate half-close, reap.
-            let ids: Vec<u64> = conns.keys().copied().collect();
-            for id in ids {
-                if let Some(c) = conns.get_mut(&id) {
-                    // session → TCP, bounded so a stuck local peer backpressures
-                    // the session (its mux recv window closes as we stop reading).
-                    c.flush();
-                    while c.out_len() < SEND_CAP as usize {
-                        let d = self.core.stream_read(id);
-                        if d.is_empty() {
-                            break;
-                        }
-                        c.queue_to_tcp(&d);
-                    }
-                    // TCP → session, bounded by unacked in-flight bytes.
-                    if self.core.stream_in_flight(id) < SEND_CAP {
-                        let data = c.read_tcp();
-                        if !data.is_empty() {
-                            self.core.stream_write(id, &data);
-                        }
-                    }
-                    if c.needs_fin() {
-                        self.core.stream_close(id);
-                    }
-                    if c.is_finished() {
-                        conns.remove(&id);
-                    }
-                }
-            }
+            fwd.pump(&mut self.core);
 
             self.flush()?;
             if Instant::now() >= next_keepalive {
@@ -968,26 +807,48 @@ impl Client {
     /// and stderr to ours and returning its exit code. stdin is forwarded from
     /// our stdin until EOF.
     pub fn run_exec(&mut self, cmd: &str) -> Result<i32, RuntimeError> {
+        self.run_exec_with(cmd, &ExecOptions::default())
+    }
+
+    /// Like [`Client::run_exec`], but with port forwards (`-L`/`-R`/`-D`)
+    /// serviced alongside the command for its whole lifetime, as `ssh -D 1080
+    /// host cmd` does. Editors such as VS Code Remote-SSH rely on this: they
+    /// feed a bootstrap script to the remote shell over stdin, then reach the
+    /// server it starts through a forward on the same connection.
+    pub fn run_exec_with(&mut self, cmd: &str, opts: &ExecOptions) -> Result<i32, RuntimeError> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
         use std::io::Read;
         use std::os::fd::AsFd;
         use std::time::Instant;
 
         self.socket.set_nonblocking(true)?;
+        let mut fwd = Forwarder::bind(
+            &mut self.core,
+            self.server_addr,
+            &opts.local,
+            &opts.remote,
+            &opts.dynamic,
+        )?;
         let stdin = std::io::stdin();
-        set_fd_nonblocking(stdin.as_fd());
+        if !opts.null_stdin {
+            set_fd_nonblocking(stdin.as_fd());
+        }
 
         let e = self.core.open_exec(cmd);
         let mut err_id: Option<u64> = None;
         let mut exit_code: Option<i32> = None;
-        let mut stdin_eof = false;
+        // `-n`: the command sees an immediate EOF on stdin.
+        let mut stdin_eof = opts.null_stdin;
+        if stdin_eof {
+            self.core.stream_close(e);
+        }
 
         let keepalive = Duration::from_secs(3);
         let mut next_keepalive = Instant::now() + keepalive;
         let mut inbuf = [0u8; 16384];
 
         loop {
-            let timeout = if self.core.has_outgoing() {
+            let timeout = if self.core.has_outgoing() || fwd.is_busy() {
                 Duration::from_millis(20)
             } else {
                 next_keepalive
@@ -1001,13 +862,23 @@ impl Client {
                 if !stdin_eof {
                     fds.push(PollFd::new(inp, PollFlags::POLLIN));
                 }
+                for fd in fwd.poll_fds() {
+                    fds.push(PollFd::new(fd, PollFlags::POLLIN));
+                }
                 let ms = timeout.as_millis().min(u16::MAX as u128) as u16;
                 let _ = poll(&mut fds, PollTimeout::from(ms));
             }
 
+            fwd.accept(&mut self.core);
+
             while self.recv_and_handle()? {}
 
             for ev in self.core.take_stream_events() {
+                // Forward-stream events (incl. inbound `-R` opens) go to the
+                // forwarder; whatever it doesn't own concerns the command.
+                let Some(ev) = fwd.handle_event(&mut self.core, ev) else {
+                    continue;
+                };
                 match ev {
                     // The server opens one Exec stream back to us: it's stderr.
                     StreamEvent::Opened {
@@ -1055,6 +926,8 @@ impl Client {
                     }
                 }
             }
+
+            fwd.pump(&mut self.core);
 
             self.flush()?;
             if Instant::now() >= next_keepalive {
@@ -1176,5 +1049,220 @@ fn set_fd_nonblocking<Fd: std::os::fd::AsFd>(fd: Fd) {
         let mut flags = OFlag::from_bits_truncate(cur);
         flags.insert(OFlag::O_NONBLOCK);
         let _ = fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags));
+    }
+}
+
+/// Options for [`Client::run_exec_with`].
+#[derive(Debug, Clone, Default)]
+pub struct ExecOptions {
+    /// `-L` forwards `(local_port, "host:port")`.
+    pub local: Vec<(u16, String)>,
+    /// `-R` forwards `(remote_port, "host:port")`.
+    pub remote: Vec<(u16, String)>,
+    /// `-D` SOCKS forwards `(bind_addr, port)`.
+    pub dynamic: Vec<(String, u16)>,
+    /// `-n`: give the command an empty stdin instead of forwarding ours.
+    pub null_stdin: bool,
+}
+
+/// Unacked per-stream byte cap, so a fast TCP producer can't grow the mux send
+/// buffer without bound (the mux has receive-side flow control; this is the
+/// matching send-side check).
+const FORWARD_SEND_CAP: u64 = 512 * 1024;
+
+/// Client-side port-forwarding state (`-L`/`-R`/`-D`), independent of the
+/// session loop driving it, so forwards can run on their own (`ssh -N` style)
+/// or alongside a remote command.
+pub struct Forwarder {
+    /// `-L` listeners and their fixed targets.
+    listeners: Vec<(std::net::TcpListener, String)>,
+    /// `-D` SOCKS listeners.
+    socks_listeners: Vec<std::net::TcpListener>,
+    /// SOCKS connections still negotiating (no forward stream opened yet).
+    pending_socks: Vec<crate::socks::SocksConn>,
+    /// Live forwarded connections, keyed by stream id.
+    conns: std::collections::HashMap<u64, crate::forward::ForwardConn>,
+}
+
+impl Forwarder {
+    /// Bind the local listeners and request the remote forwards.
+    pub fn bind(
+        core: &mut ClientCore,
+        server_addr: SocketAddr,
+        local: &[(u16, String)],
+        remote: &[(u16, String)],
+        dynamic: &[(String, u16)],
+    ) -> Result<Self, RuntimeError> {
+        use std::net::TcpListener;
+        let mut listeners = Vec::new();
+        for (port, target) in local {
+            let l = TcpListener::bind(("127.0.0.1", *port))?;
+            l.set_nonblocking(true)?;
+            eprintln!("-L 127.0.0.1:{port} -> {target} (via {server_addr})");
+            listeners.push((l, target.clone()));
+        }
+        for (port, target) in remote {
+            core.request_remote_forward(*port, target);
+            eprintln!("-R {}:{port} -> {target}", server_addr.ip());
+        }
+        let mut socks_listeners = Vec::new();
+        for (bind, port) in dynamic {
+            let l = TcpListener::bind((bind.as_str(), *port))?;
+            l.set_nonblocking(true)?;
+            eprintln!("-D {bind}:{port} (SOCKS) -> via {server_addr}");
+            socks_listeners.push(l);
+        }
+        Ok(Forwarder {
+            listeners,
+            socks_listeners,
+            pending_socks: Vec::new(),
+            conns: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Whether there is local work in progress that warrants a short poll
+    /// timeout (buffered output to flush, SOCKS handshakes to drive).
+    pub fn is_busy(&self) -> bool {
+        self.conns.values().any(|c| c.wants_write()) || !self.pending_socks.is_empty()
+    }
+
+    /// Every descriptor the session loop should wait on for readability.
+    pub fn poll_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        let mut fds = Vec::new();
+        fds.extend(self.listeners.iter().map(|(l, _)| l.as_fd()));
+        fds.extend(self.socks_listeners.iter().map(|l| l.as_fd()));
+        fds.extend(self.conns.values().map(|c| c.as_fd()));
+        fds.extend(self.pending_socks.iter().map(|c| c.as_fd()));
+        fds
+    }
+
+    /// Accept new local connections and advance SOCKS negotiations, opening a
+    /// forward stream for each connection that is ready.
+    pub fn accept(&mut self, core: &mut ClientCore) {
+        use crate::forward::ForwardConn;
+        use crate::socks::{Progress, SocksConn};
+
+        // New `-L` connections: open a forward stream each.
+        for (l, target) in &self.listeners {
+            while let Ok((s, _)) = l.accept() {
+                if let Ok(conn) = ForwardConn::new(s) {
+                    let id = core.open_forward(target);
+                    self.conns.insert(id, conn);
+                }
+            }
+        }
+
+        // New SOCKS (`-D`) connections; negotiation happens below.
+        for l in &self.socks_listeners {
+            while let Ok((s, _)) = l.accept() {
+                if let Ok(sc) = SocksConn::new(s) {
+                    self.pending_socks.push(sc);
+                }
+            }
+        }
+
+        // Drive SOCKS negotiations; on CONNECT, open a forward and bridge.
+        let mut still_pending = Vec::new();
+        for sc in self.pending_socks.drain(..) {
+            match sc.negotiate() {
+                (
+                    Progress::Connected {
+                        target,
+                        socket,
+                        leftover,
+                    },
+                    _,
+                ) => {
+                    if let Ok(conn) = ForwardConn::new(socket) {
+                        let id = core.open_forward(&target);
+                        if !leftover.is_empty() {
+                            core.stream_write(id, &leftover);
+                        }
+                        self.conns.insert(id, conn);
+                    }
+                }
+                (Progress::Pending, Some(sc)) => still_pending.push(sc),
+                // Failed, or pending-without-handback: drop the connection.
+                _ => {}
+            }
+        }
+        self.pending_socks = still_pending;
+    }
+
+    /// Handle a stream event if it concerns a forward; otherwise hand it back
+    /// for the caller to process.
+    pub fn handle_event(&mut self, core: &mut ClientCore, ev: StreamEvent) -> Option<StreamEvent> {
+        use crate::forward::ForwardConn;
+        match ev {
+            // Inbound `-R` connection: dial the local target.
+            StreamEvent::Opened {
+                id,
+                kind: StreamKind::Forward,
+                meta,
+            } => {
+                match std::str::from_utf8(&meta)
+                    .ok()
+                    .and_then(|t| ForwardConn::connect(t).ok())
+                {
+                    Some(conn) => {
+                        self.conns.insert(id, conn);
+                    }
+                    None => core.stream_close(id),
+                }
+                None
+            }
+            // Session→TCP draining happens in `pump`, bounded by the out
+            // buffer; Readable just signals data is available.
+            StreamEvent::Readable { id } if self.conns.contains_key(&id) => None,
+            // Peer closed its send half: keep flushing what we have, but stop
+            // expecting more session data.
+            StreamEvent::Closed { id, .. } if self.conns.contains_key(&id) => {
+                if let Some(c) = self.conns.get_mut(&id) {
+                    c.mark_peer_closed();
+                }
+                None
+            }
+            // Reset aborts immediately.
+            StreamEvent::Reset { id } if self.conns.contains_key(&id) => {
+                self.conns.remove(&id);
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    /// Pump both directions of every forwarded connection (with backpressure
+    /// caps), propagate half-close, and reap finished connections.
+    pub fn pump(&mut self, core: &mut ClientCore) {
+        let ids: Vec<u64> = self.conns.keys().copied().collect();
+        for id in ids {
+            let Some(c) = self.conns.get_mut(&id) else {
+                continue;
+            };
+            // session → TCP, bounded so a stuck local peer backpressures the
+            // session (its mux recv window closes as we stop reading).
+            c.flush();
+            while c.out_len() < FORWARD_SEND_CAP as usize {
+                let d = core.stream_read(id);
+                if d.is_empty() {
+                    break;
+                }
+                c.queue_to_tcp(&d);
+            }
+            // TCP → session, bounded by unacked in-flight bytes.
+            if core.stream_in_flight(id) < FORWARD_SEND_CAP {
+                let data = c.read_tcp();
+                if !data.is_empty() {
+                    core.stream_write(id, &data);
+                }
+            }
+            if c.needs_fin() {
+                core.stream_close(id);
+            }
+            if c.is_finished() {
+                self.conns.remove(&id);
+            }
+        }
     }
 }

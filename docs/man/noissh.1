@@ -137,14 +137,16 @@ Local port forward: connections to
 .IR 127.0.0.1:LPORT
 on this machine are tunnelled, over the resilient session, to
 .IR HOST:PORT
-reachable from the server. May be repeated. Implies forward\-only (no shell).
+reachable from the server. May be repeated. Without a remote command the
+session is forward\-only (no shell); with one, the forward runs alongside it.
 .TP
 .BI \-R " RPORT:HOST:PORT"
 Remote port forward: the server listens on
 .IR 127.0.0.1:RPORT
 and tunnels accepted connections back to this client for delivery to
 .IR HOST:PORT .
-May be repeated. Implies forward\-only (no shell).
+May be repeated. Without a remote command the session is forward\-only (no
+shell); with one, the forward runs alongside it.
 .TP
 .BI \-D " [BIND:]PORT"
 Dynamic port forward: run a local SOCKS proxy on
@@ -153,8 +155,18 @@ Dynamic port forward: run a local SOCKS proxy on
 .I BIND
 is given) whose connections are tunnelled, over the resilient session, to the
 host and port each client requests, resolved via the server. The proxy speaks
-SOCKS5 (no authentication) and SOCKS4/4a, CONNECT only. May be repeated. Implies
-forward\-only (no shell).
+SOCKS5 (no authentication) and SOCKS4/4a, CONNECT only. May be repeated. Without
+a remote command the session is forward\-only (no shell); with one, the forward
+runs alongside it.
+.TP
+.B \-N
+Run no remote command or shell (forwards only), like
+.BR "ssh \-N" .
+.TP
+.B \-n
+Give the remote command an empty standard input instead of forwarding yours,
+like
+.BR "ssh \-n" .
 .TP
 .I command ...
 Any words after
@@ -165,7 +177,9 @@ shell, so quoting, globs, pipes, and redirections take effect there. The
 command's standard output and standard error are streamed separately to yours,
 your standard input is forwarded until EOF, and noissh exits with the command's
 exit status. Output is byte\-for\-byte (no PTY/terminal processing), so it is safe
-to redirect or pipe. The remote command's own flags are not parsed by
+to redirect or pipe. Any
+.BR \-L / \-R / \-D
+forwards run alongside the command, and noissh exits when it does. The remote command's own flags are not parsed by
 .BR noissh .
 Mutually exclusive with an interactive shell. Refused by a
 standalone daemon configured with a
@@ -233,6 +247,27 @@ With
 .BR \-\-ssh ,
 pass all remaining arguments verbatim to
 .BR ssh (1).
+.TP
+.B "\-b \-B \-c \-E \-F \-i \-J \-l \-m \-o \-p"
+.BR ssh (1)
+options, accepted so noissh can stand in for
+.B ssh
+in tools that run it (for example VS Code Remote\-SSH's
+.IR remote.SSH.path ).
+They are passed to
+.B ssh
+for the SSH bootstrap;
+.B \-F
+is also used to resolve host aliases. Values may be attached
+.RB ( \-p2222 ).
+.B \-o
+settings that shape the session itself (RemoteCommand, RequestTTY, SessionType,
+the *Forward options, ForwardAgent, StdinNull, ForkAfterAuthentication, and the
+Control* options) are not passed on.
+.TP
+.B "\-4 \-6 \-a \-C \-g \-k \-K \-q \-s \-T \-t \-x \-X \-Y \-y \-e" " CHAR"
+.BR ssh (1)
+options accepted for compatibility; they have no effect.
 .TP
 .BR \-h ", " \-\-help
 Print a usage summary and exit.
