@@ -5,7 +5,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual runs name the tag to release; it is created at the commit being
+  # built if it doesn't exist yet.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.6.0)"
+        required: true
 
 permissions:
   contents: write
@@ -92,7 +98,9 @@ jobs:
         with:
           # A tag with a suffix (v0.6.0-rc.1) is a prerelease: published for
           # testing, but not marked "latest", so install.sh keeps the stable one.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           files: |
             noissh-${{ matrix.target }}.tar.gz
             noissh-${{ matrix.target }}.tar.gz.sha256
@@ -103,7 +111,9 @@ jobs:
         with:
           # A tag with a suffix (v0.6.0-rc.1) is a prerelease: published for
           # testing, but not marked "latest", so install.sh keeps the stable one.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           files: |
             noissh-${{ matrix.target }}.deb
             noissh-${{ matrix.target }}.deb.sha256
