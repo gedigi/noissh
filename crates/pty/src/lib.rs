@@ -240,18 +240,60 @@ mod tests {
         out
     }
 
+    /// Run `script` under `/bin/sh -c` in a PTY and return what it prints, up to
+    /// and including `want`.
+    ///
+    /// The script must end by reading a line (`read _`), which this sends only
+    /// once `want` has been read. That keeps the child, and so the PTY's slave
+    /// side, alive until its output is collected: when the last slave
+    /// descriptor closes, macOS may discard output the master has not read yet
+    /// (Linux keeps it readable), so reading after a short-lived child exits
+    /// races its exit there.
+    fn capture_until(req: SpawnRequest, script: &str, want: &str) -> (String, i32) {
+        let req = SpawnRequest {
+            command: Some(vec!["/bin/sh".into(), "-c".into(), script.into()]),
+            ..req
+        };
+        let mut h = LocalLogin.spawn(&req).unwrap();
+        let out = drain_until(&mut h, want);
+        // Release the script's final `read`, then reap it.
+        h.write(b"\n").unwrap();
+        (out, h.wait().unwrap())
+    }
+
+    /// Read `h` until its output contains `want` (or EOF, or a 10 s timeout).
+    fn drain_until(h: &mut PtyHandle, want: &str) -> String {
+        h.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !String::from_utf8_lossy(&out).contains(want) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {want:?}; got: {:?}",
+                String::from_utf8_lossy(&out)
+            );
+            match h.read(&mut buf) {
+                Ok(0) => break, // EOF: the assertion in the caller reports it
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(PtyError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                Err(e) => panic!("pty read failed: {e}"),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     #[test]
     fn spawn_command_captures_output() {
-        let login = LocalLogin;
-        let req = SpawnRequest {
-            command: Some(vec!["/bin/echo".into(), "hello-pty".into()]),
-            ..Default::default()
-        };
-        let mut h = login.spawn(&req).unwrap();
-        let out = read_to_end(&mut h);
-        let s = String::from_utf8_lossy(&out);
+        let (s, code) = capture_until(
+            SpawnRequest::default(),
+            "/bin/echo hello-pty; read _",
+            "hello-pty",
+        );
         assert!(s.contains("hello-pty"), "got: {s:?}");
-        assert_eq!(h.wait().unwrap(), 0);
+        assert_eq!(code, 0);
     }
 
     #[test]
@@ -261,14 +303,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .dir;
-        let login = LocalLogin;
-        let req = SpawnRequest {
-            command: Some(vec!["/bin/sh".into(), "-c".into(), "pwd".into()]),
-            ..Default::default()
-        };
-        let mut h = login.spawn(&req).unwrap();
-        let out = read_to_end(&mut h);
-        let s = String::from_utf8_lossy(&out);
+        let (s, _) = capture_until(
+            SpawnRequest::default(),
+            "pwd; read _",
+            &home.to_string_lossy(),
+        );
         assert!(
             s.contains(&*home.to_string_lossy()),
             "expected cwd {home:?} in output, got: {s:?}"
@@ -289,16 +328,12 @@ mod tests {
 
     #[test]
     fn winsize_is_applied_to_pty() {
-        let login = LocalLogin;
         let req = SpawnRequest {
-            command: Some(vec!["/bin/sh".into(), "-c".into(), "stty size".into()]),
             rows: 30,
             cols: 100,
             ..Default::default()
         };
-        let mut h = login.spawn(&req).unwrap();
-        let out = read_to_end(&mut h);
-        let s = String::from_utf8_lossy(&out);
+        let (s, _) = capture_until(req, "stty size; read _", "30 100");
         assert!(s.contains("30 100"), "stty size returned: {s:?}");
     }
 
@@ -309,7 +344,9 @@ mod tests {
             command: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "sleep 0.3; stty size".into(),
+                // `read _` keeps the child alive until its output is read
+                // (see `capture_until`).
+                "sleep 0.3; stty size; read _".into(),
             ]),
             rows: 24,
             cols: 80,
@@ -317,8 +354,9 @@ mod tests {
         };
         let mut h = login.spawn(&req).unwrap();
         h.set_winsize(40, 120).unwrap();
-        let out = read_to_end(&mut h);
-        let s = String::from_utf8_lossy(&out);
+        let s = drain_until(&mut h, "40 120");
+        h.write(b"\n").unwrap();
+        assert_eq!(h.wait().unwrap(), 0);
         assert!(s.contains("40 120"), "after resize stty size: {s:?}");
     }
 
