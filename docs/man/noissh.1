@@ -283,7 +283,12 @@ options accepted for compatibility; they have no effect.
 Print a usage summary and exit.
 .TP
 .BR \-V ", " \-\-version
-Print the version and exit.
+Print the version and exit, as
+.IR "noissh <version> (OpenSSH\-compatible command line)" .
+Tools that check
+.B "ssh \-V"
+before using a binary in its place (VS Code Remote\-SSH requires the output to
+mention OpenSSH) accept it.
 .SH STATUS AND DETACHING
 While an interactive session's link is healthy you see a normal shell. If it
 goes quiet (roaming, a network change, or a dead spot), a status banner appears

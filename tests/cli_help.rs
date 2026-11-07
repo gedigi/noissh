@@ -29,6 +29,12 @@ fn noissh_help_and_version() {
             out.contains(env!("CARGO_PKG_VERSION")),
             "{flag} should print the version: {out}"
         );
+        // VS Code Remote-SSH runs `<remote.SSH.path> -V` and silently falls
+        // back to the system ssh unless the output matches /OpenSSH/.
+        assert!(
+            out.contains("OpenSSH"),
+            "{flag} must pass Remote-SSH's /OpenSSH/ check: {out}"
+        );
     }
 }
 

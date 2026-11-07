@@ -532,8 +532,12 @@ Tips:
 
 - **Connect directly when you can.** With a standing `noisshd` and your key
   authorized (`--copy-id`), connections skip the SSH bootstrap.
-- **`-V` prints noissh's version**, not OpenSSH's. Tools that parse
-  `ssh -V` output to detect OpenSSH features may need that check disabled.
+- **`-V` prints `noissh <version> (OpenSSH-compatible command line)`.** VS Code
+  Remote-SSH runs `<remote.SSH.path> -V` first and silently falls back to the
+  system `ssh` unless the output mentions OpenSSH; its log then says
+  `ssh output did not match /OpenSSH/`. noissh 0.6.2 and earlier fail that
+  check, so use 0.6.3 or later. A tool that parses an OpenSSH version number
+  out of `-V` gets none.
 - If a tool connects but then hangs, the usual cause is blocked UDP; see
   [Troubleshooting](#troubleshooting). `-v` (which VS Code passes) narrates the
   connection sequence into the tool's log.
