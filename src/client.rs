@@ -533,7 +533,10 @@ impl Client {
         let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(20)))?;
         self.socket = socket;
-        Ok(())
+        // Announce the new address at once: the server follows a client to
+        // whatever address its latest authenticated packet came from, and an
+        // idle client would otherwise stay silent until its next keepalive.
+        self.send_keepalive()
     }
 
     /// Borrow the UDP socket (e.g. to register it with a poller).

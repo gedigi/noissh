@@ -45,7 +45,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "auth"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64",
  "thiserror",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "noise-core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64",
  "curve25519-dalek",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "noissh"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "auth",
  "base64",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "predict"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "term",
 ]
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "auth",
  "noise-core",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "pty"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "nix",
  "pty-process",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "term"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "thiserror",
  "unicode-width",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "getrandom 0.4.3",
  "noise-core",
@@ -771,7 +771,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wire"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "thiserror",
 ]

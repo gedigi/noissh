@@ -135,6 +135,11 @@ impl ServerShell {
 pub struct ClientShell {
     grid: Grid,
     current_seq: u64,
+    /// A state diff arrived since our last ack (applied or not), so the server
+    /// needs to hear where we are. Acks are sent only then, not on every poll:
+    /// an unconditional ack per poll sent a datagram every client tick even on
+    /// an idle connection (and in exec/forward-only sessions with no shell).
+    ack_due: bool,
     input_tx: InputSender,
     predictor: Predictor,
 }
@@ -145,6 +150,7 @@ impl ClientShell {
         ClientShell {
             grid: grid.clone(),
             current_seq: 0,
+            ack_due: false,
             input_tx: InputSender::new(),
             predictor: Predictor::new(grid),
         }
@@ -167,20 +173,27 @@ impl ClientShell {
     }
 
     /// Frames to send now: pending input (if any) plus the screen-state ack.
-    pub fn poll_frames(&self) -> Vec<Frame> {
+    pub fn poll_frames(&mut self) -> Vec<Frame> {
         let mut frames = Vec::new();
         if let Some(input) = self.input_tx.pending() {
             frames.push(input);
         }
-        frames.push(Frame::Ack {
-            seq: self.current_seq,
-        });
+        // Ack after every received diff, applied or not: a resent diff means
+        // our previous ack was lost (or the server is ahead of our base), and
+        // the ack tells it which state to diff from.
+        if self.ack_due {
+            frames.push(Frame::Ack {
+                seq: self.current_seq,
+            });
+            self.ack_due = false;
+        }
         frames
     }
 
     /// Apply a server state-diff. Full snapshots apply unconditionally; deltas
     /// apply only when their base matches our current state and they are newer.
     pub fn apply_state_diff(&mut self, seq: u64, base: u64, data: &[u8]) -> bool {
+        self.ack_due = true;
         // Full snapshots apply unconditionally; deltas only when their base
         // matches our current state and they are strictly newer.
         let applicable = is_full(data) || (base == self.current_seq && seq > self.current_seq);

@@ -34,13 +34,50 @@ const INIT_CWND: u32 = 10 * MSS;
 /// Congestion-window ceiling — no point exceeding the receiver's window.
 const MAX_CWND: u32 = DEFAULT_WINDOW;
 
-/// Retransmit timeout bounds, expressed in `poll_transmit` rounds (the core has
-/// no wall clock; a round is the drivers' active cadence, ~tens of ms). `INIT`
-/// applies until the first RTT sample; the live RTO is then derived from the
-/// smoothed RTT (Jacobson/Karels) and clamped to `[MIN, MAX]`.
-const INIT_RTO: u32 = 8;
-const MIN_RTO: u32 = 2;
-const MAX_RTO: u32 = 240;
+/// Retransmit timeout bounds, in milliseconds. `INIT` applies until the first
+/// RTT sample; the live RTO is then derived from the smoothed RTT
+/// (Jacobson/Karels) and clamped to `[MIN, MAX]`.
+///
+/// These used to be counted in `poll_transmit` rounds. But the drivers poll on
+/// every received datagram as well as on a timer, so under load rounds come
+/// much faster than under idle: a timeout of a few rounds then fired long
+/// before an ack could arrive over a real link (40 ms RTT), causing spurious
+/// retransmits and collapsing the congestion window. Throughput over such a
+/// link was ~140 KB/s with a 256 KiB window. Time-based timers don't depend on
+/// how often the drivers poll.
+const INIT_RTO: u32 = 300;
+const MIN_RTO: u32 = 60;
+const MAX_RTO: u32 = 3_000;
+
+/// The mux's clock, in milliseconds. Real time in use; in unit tests a
+/// simulated clock that advances a fixed step per `poll_transmit`, so tests stay
+/// deterministic and express timeouts in polls.
+#[derive(Debug, Clone, Copy)]
+enum Clock {
+    Real(std::time::Instant),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Simulated(u64),
+}
+
+/// Simulated milliseconds per `poll_transmit` (unit tests only).
+#[cfg(test)]
+const SIM_STEP_MS: u64 = 10;
+
+impl Clock {
+    fn tick(&mut self) -> u64 {
+        match self {
+            // +1 so the first reading is never 0 (0 is "never" in some fields).
+            Clock::Real(start) => start.elapsed().as_millis() as u64 + 1,
+            Clock::Simulated(now) => {
+                #[cfg(test)]
+                {
+                    *now += SIM_STEP_MS;
+                }
+                *now
+            }
+        }
+    }
+}
 
 /// Events surfaced to the application as frames are processed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,11 +197,11 @@ struct StreamState {
     fin_acked: bool,
     close_status: Option<i32>,
 
-    // --- retransmit timer + RTT estimation (ticks = poll_transmit rounds) ---
+    // --- retransmit timer + RTT estimation (milliseconds, see `Clock`) ---
     /// Tick the RTO countdown started from (oldest unacked data), or None when
     /// nothing is outstanding.
     rto_start: Option<u64>,
-    /// Current retransmit timeout in ticks.
+    /// Current retransmit timeout in milliseconds.
     rto: u32,
     /// Smoothed RTT and its variation (0 = no sample yet).
     srtt: u32,
@@ -200,11 +237,10 @@ struct StreamState {
 }
 
 /// An idle stream re-advertises its (unchanged) ack and window this often, in
-/// `poll_transmit` rounds, as a safety net against a lost ack; otherwise acks
-/// are sent only when something changed or data arrived. Sending one every
-/// round made an idle connection (and a vanished client) receive a datagram
-/// every tick.
-const ACK_REFRESH_TICKS: u64 = 100;
+/// milliseconds, as a safety net against a lost ack; otherwise acks are sent
+/// only when something changed or data arrived. Sending one every round made an
+/// idle connection (and a vanished client) receive a datagram every tick.
+const ACK_REFRESH_MS: u64 = 1_000;
 
 /// After a graceful close, how many `poll_transmit` rounds to wait for the
 /// FIN-bearing `StreamData` before force-reclaiming the stream. This only
@@ -449,7 +485,7 @@ impl StreamState {
         let current = (self.recv.ack_point(), self.recv_window);
         if self.ack_pending
             || self.last_ack != Some(current)
-            || now.saturating_sub(self.last_ack_at) >= ACK_REFRESH_TICKS
+            || now.saturating_sub(self.last_ack_at) >= ACK_REFRESH_MS
         {
             out.push(Frame::StreamAck {
                 id: self.id,
@@ -495,9 +531,10 @@ pub struct StreamMux {
     local_parity: u64,
     streams: BTreeMap<u64, StreamState>,
     events: Vec<StreamEvent>,
-    /// Monotonic tick counter (incremented per `poll_transmit`); the clock for
-    /// RTT estimation and the retransmit timer.
+    /// The current time in milliseconds (read once per `poll_transmit`); the
+    /// clock for RTT estimation, the retransmit timer and ack refresh.
     now: u64,
+    clock: Clock,
 }
 
 /// A read handle returned to callers (just the id; data via `StreamMux::read`).
@@ -513,6 +550,11 @@ impl StreamMux {
             streams: BTreeMap::new(),
             events: Vec::new(),
             now: 0,
+            clock: if cfg!(test) {
+                Clock::Simulated(0)
+            } else {
+                Clock::Real(std::time::Instant::now())
+            },
         }
     }
 
@@ -646,7 +688,7 @@ impl StreamMux {
 
     /// Collect all frames that should be sent now.
     pub fn poll_transmit(&mut self) -> Vec<Frame> {
-        self.now += 1; // advance the RTT/RTO clock one tick per poll
+        self.now = self.clock.tick();
         let now = self.now;
         let mut out = Vec::new();
         let mut retire_ids = Vec::new();
@@ -877,7 +919,7 @@ mod tests {
         // An open but idle stream (e.g. a quiet forwarded connection) must not
         // emit a frame every poll: that sent a datagram per tick on an idle
         // session, and kept flooding a client that had vanished. It acks when
-        // something changes, then only refreshes every ACK_REFRESH_TICKS.
+        // something changes, then only refreshes every ACK_REFRESH_MS.
         let mut client = StreamMux::new(true);
         let mut server = StreamMux::new(false);
         let id = client.open(StreamKind::Forward, b"127.0.0.1:1".to_vec());
@@ -887,7 +929,7 @@ mod tests {
         pump(&mut client, &mut server, 6, |_| false);
 
         // Now idle: count frames over two refresh periods.
-        let rounds = 2 * ACK_REFRESH_TICKS as usize;
+        let rounds = (2 * ACK_REFRESH_MS / SIM_STEP_MS) as usize;
         let mut client_frames = 0;
         let mut server_frames = 0;
         for _ in 0..rounds {
@@ -926,7 +968,7 @@ mod tests {
         }
         // The retransmitted data must elicit an ack from the server.
         let mut acked = false;
-        for _ in 0..(INIT_RTO as usize * 4) {
+        for _ in 0..(INIT_RTO as usize * 4 / SIM_STEP_MS as usize) {
             let frames = client.poll_transmit();
             let carried_data = frames.iter().any(|f| matches!(f, Frame::StreamData { .. }));
             for f in frames {
@@ -988,9 +1030,10 @@ mod tests {
 
         // First poll sends the data.
         assert_eq!(count_data(&a.poll_transmit()), 1);
-        // The next INIT_RTO-1 polls send NO data (no spurious retransmits).
+        // The polls before INIT_RTO elapses send NO data (no spurious
+        // retransmits).
         let mut retx = 0;
-        for _ in 0..(INIT_RTO - 1) {
+        for _ in 0..(INIT_RTO as u64 / SIM_STEP_MS - 1) {
             retx += count_data(&a.poll_transmit());
         }
         assert_eq!(retx, 0, "data was retransmitted before the RTO elapsed");

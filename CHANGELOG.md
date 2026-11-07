@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5]
+
+### Fixed
+
+- **Much faster port forwarding over real links (VS Code Remote-SSH).** The
+  stream retransmit timer and RTT estimate were counted in loop iterations,
+  not time. Drivers iterate on every received packet as well as on a timer, so
+  under load the timer fired long before an ack could arrive over a real link:
+  spurious retransmits and a collapsed congestion window. Over a simulated
+  40 ms RTT link a 2 MB transfer took 14 s (140 KB/s); it now takes 2.3 s
+  (~880 KB/s). Timers now use real time (milliseconds).
+- **An idle client no longer sends ~50 packets a second.** The client
+  acknowledged the screen state on every loop iteration, even with no shell
+  (exec and forwarding sessions such as VS Code's). It now acks only after
+  receiving a screen update. A client that roams to a new socket announces its
+  new address immediately instead of waiting for the next keepalive.
+
 ## [0.6.4]
 
 ### Fixed
