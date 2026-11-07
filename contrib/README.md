@@ -52,7 +52,7 @@ A formula is not published yet. Planned outline:
 ```ruby
 # Formula/noissh.rb (TODO)
 class Noissh < Formula
-  desc "Resilient Noise/UDP remote shell"
+  desc "Resilient remote shell over QUIC and Noise"
   homepage "https://github.com/gedigi/noissh"
   # url "https://github.com/gedigi/noissh/archive/refs/tags/vX.Y.Z.tar.gz"
   # sha256 "..."

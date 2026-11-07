@@ -23,11 +23,13 @@ noisshd \- resilient remote shell over the Noise Protocol Framework (server)
 .IR "CMD ..." ]
 .SH DESCRIPTION
 .B noisshd
-is the noissh server daemon. It accepts Noise\-encrypted UDP sessions, demultiplexes
-them by a cryptographic session id (independent of source IP, which is what
-enables roaming), authenticates the client's static key against
+is the noissh server daemon. It accepts QUIC connections over UDP secured by the
+Noise XX handshake, authenticates the client's static key against
 .IR authorized_keys ,
-allocates a PTY, and runs the user's login shell.
+allocates a PTY, and runs the user's login shell. Connections follow a client
+that changes address (QUIC connection migration); a shell whose connection is
+lost keeps running, detached, for 15 minutes, and the client's next connection
+takes it over.
 .SH MODES
 .SS Standalone
 A persistent daemon using a persistent static key and
@@ -43,10 +45,10 @@ binds the UDP port given with
 .B \-\-bind
 (or an ephemeral one if that port is taken), prints a line of the form
 .RS
-.B NOISSH CONNECT <port> <base64 server pubkey>
+.B NOISSH CONNECT <port> <base64 server pubkey> quic
 .RE
-on standard output, detaches from the controlling terminal, and serves one
-session. It exits if no client connects within 60 seconds.
+on standard output, detaches from the controlling terminal, and serves until
+its session has ended. It exits if no client connects within 60 seconds.
 .SH OPTIONS
 .TP
 .BI \-\-listen " ADDR"
@@ -90,13 +92,23 @@ server falls back to an ephemeral port and reports it in the connect line.
 Log session lifecycle (each session established and ended, with the current
 active session count) and fatal socket errors.
 .SH SECURITY
-An unauthorized client key is rejected at handshake completion, before any
-session or PTY/login work occurs. On Linux, when built with the
-.B pam
-feature and run as root, the privilege\-separated backend performs
-.BR setgid / initgroups / setuid
-and PAM account/session setup. The portable backend runs the shell as the
-current user and needs no root.
+Client and server authenticate each other inside the handshake: an
+unauthorized client key fails the handshake, before any session, stream or
+PTY exists. Shells run as the user
+.B noisshd
+runs as (no root needed). With
+.B \-\-user
+(as root), each shell drops to that user's uid and gid before exec, without
+supplementary groups; file transfer, agent forwarding and remote commands are
+then refused, since the daemon itself keeps its privileges. For multi\-user
+hosts prefer the SSH bootstrap, or run one daemon per user.
+.SH ENVIRONMENT
+.TP
+.B NOISSH_CC
+Congestion control for the data this side sends: BBR by default (keeps
+throughput up on lossy Wi\-Fi and mobile paths);
+.B cubic
+selects Cubic.
 .SH FILES
 .TP
 .I <config>/noisshd_key

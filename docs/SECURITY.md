@@ -1,17 +1,34 @@
 # noissh Security Model
 
-> **Status:** noissh is new software (v0.4.x). The protocol and code have **not**
-> been independently audited. Do not rely on it for high-stakes use yet. Reports
+> **Status:** noissh is new software (0.x). The protocol and code have **not**
+> been independently audited; in particular the binding of Noise into QUIC
+> (`noise-quic`, new in 0.7) awaits review. Do not rely on it for high-stakes use yet. Reports
 > of security issues are welcome — see [Reporting](#reporting).
 
 ## Cryptographic foundation
 
-All session cryptography is the Noise Protocol Framework, pattern
+Authentication and key agreement use the Noise Protocol Framework, pattern
 `Noise_XX_25519_ChaChaPoly_BLAKE2s`, via the [`snow`](https://crates.io/crates/snow)
 library. The `XX` pattern provides mutual authentication and identity hiding:
 neither party reveals its static key to an unauthenticated peer until the
-handshake commits. Transport data uses ChaCha20-Poly1305 AEAD with an explicit
-per-datagram nonce.
+handshake commits.
+
+The session runs over QUIC ([`quinn-proto`](https://crates.io/crates/quinn-proto),
+built without TLS), with the Noise handshake as QUIC's crypto layer (crate
+`noise-quic`, see [PROTOCOL.md](PROTOCOL.md) section 2):
+
+- The handshake messages travel in QUIC CRYPTO frames under Initial and
+  Handshake packet keys that are derived from public values (as QUIC's Initial
+  keys are): they only obfuscate. Confidentiality and integrity of the
+  handshake come from Noise itself: static keys and the server's transport
+  parameters are encrypted in Noise messages 2 and 3, and the client's
+  parameters (message 1) are bound into the transcript.
+- Application data is protected with 1-RTT keys from Noise's split, mixed with
+  the final handshake hash: ChaCha20-Poly1305 per packet (nonce from the packet
+  number), ChaCha20 header protection, keyed BLAKE2s for key derivation, and
+  periodic key updates (RFC 9001 §6).
+- A private QUIC version number keeps standard QUIC/TLS peers out, and the
+  Noise prologue binds the transcript to it.
 
 ## Trust model
 
@@ -23,43 +40,45 @@ noissh mirrors SSH's trust model with Noise static keys:
   certificate authority; trust is first-use or out-of-band.
 - **Client authorization (authorized_keys).** The server holds the set of allowed
   client static public keys per user. The `XX` handshake proves the client holds
-  the matching private key. **An unauthorized client key is rejected at handshake
-  completion, before any session is created or any PTY/login work happens.**
+  the matching private key. **An unauthorized client key fails the handshake,
+  before any 1-RTT key, session, stream or PTY exists.** The client likewise
+  checks the server key before sending its own identity (message 3).
 - **Key-based authentication.** The Noise static key *is* the cryptographic
   authentication, analogous to SSH public-key auth. There is no password stack to
-  brute-force. (An optional second factor over the control channel is defined in
-  the protocol but not enabled by default.)
+  brute-force.
+- **Reattach.** A detached shell is handed only to a connection authenticated
+  with the same client key.
 
 ## What noissh protects against
 
 - **Passive eavesdropping.** All session content is encrypted and authenticated.
-- **Active tampering / injection.** Every datagram is AEAD-authenticated; forged
-  or modified datagrams are dropped.
-- **Replay.** A per-direction 64-packet sliding-window filter drops replayed or
-  too-old datagrams (on top of Noise's strictly increasing nonces).
-- **Session hijacking via spoofed source address.** Roaming updates the peer
-  address **only after** a datagram authenticates, so an attacker who spoofs a
-  source address but cannot produce a valid AEAD tag cannot steal or redirect a
-  session.
+- **Active tampering / injection.** Every packet is AEAD-authenticated; forged
+  or modified packets are dropped, and corrupting a handshake packet only costs
+  a retransmission.
+- **Replay.** QUIC packet numbers: a packet number is accepted once.
+- **Session hijacking via spoofed source address.** A connection moves to a new
+  address **only after** a packet from it authenticates, and the server then
+  validates the new path; an attacker who spoofs a source address but cannot
+  produce a valid AEAD tag cannot steal or redirect a session.
 - **Server impersonation.** Pinned known_hosts keys mean a substituted server key
   aborts the connection.
 
 ## What noissh does *not* protect against (current limitations)
 
 - **Denial of service.** An attacker who can flood the UDP port can degrade
-  service. There is no proof-of-work or cookie exchange before the handshake;
-  each unknown session-id handshake allocates a small amount of state. This is a
-  known area for hardening. (noissh *is* hardened against being used as a
-  reflection/amplification vector: the client pads its initial handshake packet
-  and the server refuses an undersized new-session init, so a spoofed-source
-  request can never elicit a response larger than what was sent.)
+  service. Each new handshake allocates a small amount of state (up to 512
+  connections at a time); QUIC's Retry address validation is not enabled. This
+  is a known area for hardening. (noissh *is* hardened against being used as a
+  reflection/amplification vector: the client pads its first packet to 1200
+  bytes, smaller ones get no answer, and until the client's address is
+  validated the server sends at most three times what it received.)
 - **Traffic analysis.** Packet sizes and timing are not padded; an observer can
   infer activity (typing, screen updates).
 - **Compromised endpoints.** noissh secures the link, not the machines. A
   compromised client or server is out of scope.
-- **0-RTT / forward-secrecy edge cases for resumption.** v1 always performs a
-  full `XX` handshake; resumption tickets / `IK` (a future optimization) are not
-  implemented, so there is no 0-RTT attack surface yet.
+- **0-RTT / forward-secrecy edge cases for resumption.** Every connection
+  performs a full `XX` handshake; resumption / `IK` with 0-RTT data (a possible
+  future optimization) is not implemented, so there is no 0-RTT attack surface.
 
 ## Memory safety
 
@@ -76,7 +95,8 @@ it minimal:
 
 - All parsing, crypto, and protocol handling run in **unprivileged**, safe code
   and are fuzzed (the frame parser and packet handler never panic on arbitrary
-  input — see the `security` and `wire` tests).
+  input — see the `security` and `wire` tests). QUIC packet processing is
+  `quinn-proto`'s, a widely used implementation.
 - The portable login backend allocates a real PTY and runs the shell as the
   **current user** with **no root** required.
 - **Multi-user deployments use the SSH-bootstrap model:** the SSH bootstrap
@@ -104,15 +124,16 @@ is a standalone daemon started as **root with a `--user` privilege drop**: there
 the shell drops to the target user at exec, but the daemon process itself stays
 root and cannot confine file/agent I/O to that user without in-process `setuid`
 (deliberately avoided; see above). To prevent the daemon from acting with root
-privileges on a client's behalf, **file transfer and agent forwarding are
-refused whenever a `--user` drop is configured.** Use the SSH-bootstrap model or
+privileges on a client's behalf, **file transfer, agent forwarding and remote
+commands are refused whenever a `--user` drop is configured.** Use the SSH-bootstrap model or
 run the daemon as the target user to use these features.
 
 ## Cryptographic key storage
 
 - Private keys are stored in the config directory with `0600` permissions.
 - Keys are generated with the system CSPRNG (`getrandom`) via `snow`.
-- Session ids are random 64-bit values; they are demux labels, not secrets.
+- QUIC connection ids are random; they are routing labels, not secrets.
+  Stateless-reset and address-validation token keys are random per process.
 
 ## Release integrity (supply chain)
 

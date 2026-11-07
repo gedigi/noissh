@@ -1,160 +1,156 @@
 # noissh Protocol
 
-This document specifies the noissh wire protocol as implemented: packet framing,
-the handshake, the frame format, the interactive data plane, and the reliable
-stream layer. It is descriptive of the current implementation, not a frozen
-standard — the protocol is pre-1.0 and may change.
+This document specifies the noissh wire protocol as implemented (0.7): QUIC
+secured by a Noise handshake, the streams and datagrams noissh carries over it,
+the session-layer frames, and the SSH bootstrap. It describes the current
+implementation, not a frozen standard: the protocol is pre-1.0 and may change.
+0.7 is not compatible with 0.6 peers.
 
-All multi-byte integers in headers are **big-endian**; all variable-length
-integers inside frame payloads are **LEB128 unsigned varints**.
+Session-layer integers are **LEB128 unsigned varints** unless stated otherwise;
+fixed-width integers are **big-endian**.
 
-## 1. Cryptography
+## 1. Transport: QUIC
 
-- Noise pattern: `Noise_XX_25519_ChaChaPoly_BLAKE2s`.
-- Static keys are X25519 (32 bytes). Text form: `noissh-x25519 <base64(pubkey)>`.
-- After the handshake, each side holds a `StatelessTransportState` providing AEAD
-  with an explicit per-message 64-bit nonce, so reordered/lost datagrams are fine.
+Each session is one QUIC connection (RFC 9000 semantics, implemented by
+`quinn-proto`) over UDP, from the client to the server's port (51820 by
+default). QUIC provides what noissh needs from a transport:
 
-## 2. Packet framing (outer)
+- **Reliable, ordered streams** with per-stream and connection flow control,
+  loss recovery and congestion control (BBR by default; `NOISSH_CC=cubic`
+  selects Cubic).
+- **Unreliable datagrams** (RFC 9221) for latest-wins data.
+- **Connection migration**: a client that changes address (Wi-Fi ↔ cellular,
+  NAT rebinding) keeps its connection; the server validates the new path and
+  follows it. Packets are authenticated before they can move the connection.
+- **Replay protection** through packet numbers, and **amplification limits**
+  before the client's address is validated: the client's first datagram is
+  padded to at least 1200 bytes, and the server sends at most three times what
+  it received until then.
 
-Every UDP datagram begins with a one-byte type and an 8-byte session id:
+Version and parameters:
 
-```
-byte 0      : packet type (0 = handshake, 1 = transport)
-bytes 1..9  : session id (8 bytes, chosen by the client, constant per session)
-```
+| | |
+|---|---|
+| QUIC version | `0x6e6f6973` ("nois"), private: a noissh endpoint never talks to a standard QUIC/TLS one |
+| Idle timeout | 60 s |
+| Client keep-alive | every 3 s of silence (a PING) |
+| Stream receive window | 8 MiB per stream, 32 MiB per connection |
+| Concurrent streams | 1024 bidirectional per side; no unidirectional streams |
+| ACK frequency | the peer is asked to acknowledge every 8th packet (out-of-order arrival is acknowledged at once) |
 
-### Handshake packet (type 0)
+## 2. Handshake: Noise XX inside QUIC
 
-```
-[0x00][session-id(8)][noise handshake message ...]
-```
-
-### Transport packet (type 1)
-
-```
-[0x01][session-id(8)][nonce(8, BE)][AEAD ciphertext ...]
-```
-
-The ciphertext decrypts (under the session's transport keys and the given nonce)
-to a **frame payload**: a concatenation of frames (section 4). The session id is
-plaintext (needed for demux) but unauthenticated; tampering with it simply routes
-to a different/absent session and decryption fails.
-
-## 3. Handshake (XX)
-
-Three messages, carried in handshake packets that all share the client-chosen
-session id:
+QUIC delegates its handshake to a crypto layer, usually TLS 1.3; noissh uses
+`Noise_XX_25519_ChaChaPoly_BLAKE2s` (crate `noise-quic`). The Noise messages
+travel in QUIC CRYPTO frames, each prefixed with its length (u16, big endian):
 
 ```
-client → server :  e
-server → client :  e, ee, s, es
-client → server :  s, se
+client                                         server
+  Initial:   msg1 → e            [payload: client transport parameters]
+  Handshake: msg2 ← e, ee, s, es [payload: server transport parameters]
+  Handshake: msg3 → s, se        [payload: empty]
+  1-RTT keys from Noise Split()
 ```
 
-After message 3 both parties are in transport mode and each has the other's
-authenticated static public key. The server then checks the client key against
-`authorized_keys` **before** creating a session; the client checks the server key
-against `known_hosts` (TOFU).
+- **Prologue**: `"noissh-quic"` followed by the QUIC version (u32), so a
+  transcript from another context can't be replayed here.
+- **Authentication**: the client checks the server's static key (`s` in msg2)
+  against its known hosts (TOFU) or the key pinned by the SSH bootstrap,
+  before sending msg3. The server checks the client's static key (msg3) against
+  `authorized_keys`. A rejected key fails the handshake with crypto error 0x2a
+  and the reason `server key not trusted` / `client key not authorized`,
+  before any application key exists.
+- **Packet protection keys**: Initial keys are derived from the client's
+  destination connection id and Handshake keys from the Noise handshake hash
+  after msg1; both are public values (obfuscation only, as QUIC's Initial
+  keys are). Everything the handshake must protect is protected by Noise itself:
+  the static keys and the server's parameters are encrypted in msg2/msg3, and
+  the client's parameters (msg1) are bound to the transcript, so altering them
+  makes msg2 fail to decrypt. 1-RTT keys come from Noise's split, each mixed
+  with the final handshake hash.
+- **Packet protection**: ChaCha20-Poly1305 (nonce: IV XOR packet number, the
+  header as associated data); header protection with ChaCha20 (RFC 9001
+  §5.4.4); key derivation with keyed BLAKE2s-256. Key updates follow RFC 9001
+  §6.
+- **Retry** integrity tags use ChaCha20-Poly1305 with a fixed noissh key;
+  stateless-reset and address-validation tokens are keyed from random
+  per-process secrets.
 
-**Version signalling.** Message 2 carries the server's version string as its
-(encrypted) Noise payload, so the client knows it the instant the handshake
-completes — no extra round trip. This lets a direct connection notice an outdated
-standing daemon and offer to upgrade it. The payload is confidential and bound to
-the server's static key (same trust as the session). Servers/clients that predate
-this still interoperate: the server also sends the version as a post-handshake
-`ServerVersion` control message (§6), which older clients use as a fallback.
+Details and the reasoning behind each choice are in
+[design/quic-transport.md](design/quic-transport.md), section 4.
 
-Session-id reuse: the server keys in-progress handshakes and established sessions
-by session id, independent of source address.
+## 3. Streams
 
-**Anti-amplification.** The client pads its initial handshake datagram (message 1)
-to a fixed floor (the padding rides as the first Noise message's ignored
-payload), and the server refuses to reply to — or create state for — a new-session
-init smaller than that floor. The handshake reply can therefore never be larger
-than what was received, so a spoofed-source init cannot be used to reflect
-amplified traffic. A read failure for an *already-pending* session id does not
-discard its state (the id is plaintext, so otherwise an injected packet could
-abort an in-flight handshake).
+Every stream is bidirectional and starts with a header in its opener's
+direction:
 
-```mermaid
-sequenceDiagram
-    participant C as noissh (client)
-    participant S as noisshd (server)
-    Note over C,S: every packet carries the client-chosen session-id
-    C->>S: handshake msg 1 (e)
-    S->>C: handshake msg 2 (e, ee, s, es)
-    C->>S: handshake msg 3 (s, se)
-    Note over S: check client static key vs authorized_keys<br/>BEFORE creating a session
-    Note over C: check server static key vs known_hosts (TOFU)
-    C->>S: Control{OpenShell} (retransmitted until screen state flows)
-    Note over S: allocate PTY, exec login shell
-    loop interactive session (latest-wins + reliable input)
-        S->>C: StateDiff{seq, base, screen delta}
-        C->>S: Ack{seq}  (screen ack)
-        C->>S: Input{offset, keystrokes}
-        S->>C: Ack{bytes}  (input ack)
-    end
-    Note over C,S: any authenticated datagram from a new address<br/>updates the server's peer address (roaming)
-    S->>C: Control{Exit{status}} on shell exit
+```
+[kind u8][meta length u16][meta bytes]
 ```
 
-## 4. Frame format (inner, after decryption)
+| kind | stream | opened by | meta |
+|---|---|---|---|
+| 0 | control | client, first, once per connection | (none) |
+| 1 | forward (`-L`, `-D`, `-R`) | client (`-L`/`-D`), server (`-R`) | target `host:port` |
+| 2 | file transfer | client | `PUT <size> <path>` or `GET <path>` |
+| 3 | agent | server | (none) |
+| 4 | exec | client (stdin/stdout), server (the same command's stderr) | the command (client); none (server) |
 
-Each frame is `[type byte][fields...]`. Frames are packed back-to-back to fill a
-datagram payload. Length-prefixed byte fields use a varint length followed by the
-bytes. Signed integers use zig-zag varint encoding.
+After the header, a stream is a plain byte pipe in each direction. A FIN is a
+clean end of that direction; a reset (RESET_STREAM + STOP_SENDING, error code
+1) aborts both. Unknown kinds and a second control stream are reset.
 
-| Type | Name | Fields |
-|---|---|---|
-| `0x01` | `Ack` | `seq: varint` |
-| `0x02` | `Input` | `offset: varint`, `data: bytes` |
-| `0x03` | `StateDiff` | `seq: varint`, `base: varint`, `data: bytes` |
-| `0x04` | `Resize` | `cols: varint`, `rows: varint` |
-| `0x05` | `Ping` | `stamp: varint` |
-| `0x06` | `Pong` | `stamp: varint` |
-| `0x10` | `StreamOpen` | `id: varint`, `kind: u8`, `meta: bytes` |
-| `0x11` | `StreamData` | `id: varint`, `offset: varint`, `fin: u8`, `data: bytes` |
-| `0x12` | `StreamAck` | `id: varint`, `ack: varint`, `window: varint` |
-| `0x13` | `StreamClose` | `id: varint`, `status: zigzag varint` |
-| `0x14` | `StreamReset` | `id: varint` |
-| `0x20` | `Control` | `data: bytes` (a control message, section 6) |
+- **Forward**: the side that accepts the stream connects to the target and
+  pipes bytes both ways; it resets the stream if the target is unreachable.
+  For `-R`, the client first sends `RemoteForward` (section 5) and the server
+  opens one stream per accepted connection.
+- **File transfer**: `PUT`: the client sends the file and finishes its half;
+  the server writes it to a temporary file, moves it into place, then finishes
+  its half (success) or resets the stream (failure). `GET`: the server sends
+  the file and finishes (or resets if it can't be read).
+- **Exec**: the client's stream carries the command's stdin (client → server)
+  and stdout (server → client); the server opens a second exec stream for
+  stderr. Before finishing stdout, the server sends `ExecExit{id, status}` on
+  the control stream, with `id` the client's stream id. The server resets the
+  stream if the command can't be started.
+- **Agent**: each connection to the forwarded agent socket on the server opens
+  an agent stream, which the client pipes to its local `$SSH_AUTH_SOCK`.
 
-`StreamKind`: `0 = Session`, `1 = Forward` (`-L`/`-R`/`-D`), `2 = FileTransfer`
-(`--put`/`--get`), `3 = Agent` (`-A`), `4 = Exec` (trailing `noissh user@host <cmd>`).
+Priorities: the control stream first (keystrokes, acks, screen updates), file
+transfers last, everything else in between.
 
-Unknown frame types and truncated fields are hard decode errors (the whole
-datagram is dropped). The decoder is fuzzed and never panics on arbitrary input.
+## 4. Session-layer frames
 
-## 5. Interactive data plane (v1)
+The control stream carries a sequence of messages, each a u32 length followed
+by one encoded frame. QUIC datagrams carry one encoded frame each. A frame is a
+type byte and its fields:
 
-The interactive shell uses two reliable-ish overlays plus latest-wins state-sync.
-Note the **direction-specific meaning of `Ack`**:
+```
+0x01 Ack       : seq varint                           (client → server)
+0x02 Input     : data bytes                           (client → server)
+0x03 StateDiff : seq varint, base varint, data bytes  (server → client)
+0x20 Control   : data bytes  (a control message, section 5)
+```
 
-- client → server `Ack{seq}` acknowledges the highest applied screen-state seq.
-- server → client `Ack{seq}` acknowledges contiguous input bytes received.
+`bytes` is a varint length followed by the bytes.
 
-### Input (client → server)
+### Interactive shell
 
-Keystrokes are an append-only byte stream. The client sends `Input{offset, data}`
-for everything not yet acknowledged, retransmitting until the server's input ack
-advances. The server reconstructs the exact contiguous stream regardless of loss,
-reorder, or duplication, and replies with `Ack{bytes_received}`.
-
-### Screen state (server → client)
-
-The server keeps the authoritative terminal grid. It assigns each distinct screen
-a monotonically increasing `seq`, and emits `StateDiff{seq, base, data}` where
-`data` is a diff from the client's last **acknowledged** state (`base`). A diff is
-either a full snapshot (applicable regardless of base; e.g. after a resize) or a
-delta listing only changed cells. The client applies full snapshots
-unconditionally and deltas only when `base` matches its current state and `seq`
-is newer. After **every** received `StateDiff`, applied or not, it sends
-`Ack{seq}` with its current seq: a resent diff means the previous ack was lost
-or the server is diffing from a stale base, and the ack tells it where to diff
-from. It sends no screen ack otherwise, so an idle session stays quiet. This
-converges under arbitrary loss/reorder (latest-wins): only the newest screen
-matters.
+- **Input**: keystrokes go as `Input` on the control stream (reliable and
+  ordered); the server writes them to the shell's PTY. The client predicts
+  their echo locally (section 6 of the architecture document).
+- **Screen state**: the server keeps the authoritative terminal grid and gives
+  each distinct screen an increasing `seq`. It sends `StateDiff{seq, base,
+  data}`, a diff from the client's last **acknowledged** state `base`, as a
+  QUIC datagram, or on the control stream when it doesn't fit in one. A diff is
+  either a full snapshot (applicable regardless of base, e.g. after a resize or
+  a reattach) or a delta of changed cells. The client applies snapshots always
+  and deltas only when `base` matches its current state and `seq` is newer, and
+  after every received diff, applied or not, it sends `Ack{seq}` with its
+  current seq on the control stream. The server sends a new diff when the
+  screen changes (at most every 8 ms) and resends the unacknowledged state
+  after 1.5 × RTT + 10 ms (at least 30 ms). Lost or reordered diffs are thus
+  simply superseded: only the newest screen matters.
 
 ### Screen diff encoding
 
@@ -167,83 +163,62 @@ cell : [char as varint][fg color][bg color][flags u8]
 color: [0]                | [1][index u8] | [2][r u8][g u8][b u8]
 ```
 
-## 6. Control messages (inside `Control` frames)
+## 5. Control messages (inside `Control` frames)
 
 ```
-0x01 OpenShell     : cols varint, rows varint, term string, agent u8
-0x02 Resize        : cols varint, rows varint
-0x03 Exit          : status zigzag varint
-0x06 RemoteForward : bind_port varint, target string   (client→server, -R)
-0x07 Bye           : (no payload)                       (client→server)
-0x08 ServerVersion : version string                     (server→client)
+0x01 OpenShell     : cols varint, rows varint, term string, agent u8 (client → server)
+0x02 Resize        : cols varint, rows varint                        (client → server)
+0x03 Exit          : status zigzag varint                            (server → client)
+0x06 RemoteForward : bind_port varint, target string                 (client → server, -R)
+0x07 Bye           : (no payload)                                    (client → server)
+0x08 ServerVersion : version string                                  (server → client)
+0x09 ExecExit      : stream id varint, status zigzag varint          (server → client)
 ```
 
-`ServerVersion` is a fallback for the handshake-payload version signalling (§3):
-a v0.5.3+ client learns the version directly from message 2, but the server still
-sends this control message once after the session is established so a pre-v0.5.3
-client can also notice an outdated daemon.
-`OpenShell`'s `agent` byte requests SSH agent forwarding (`-A`). Strings are
-`varint length` + UTF-8 bytes. (Tags `0x04`/`0x05` are reserved — they were a
-never-wired second-factor prompt/response, since removed.)
+Strings are a varint length followed by UTF-8 bytes. Tags 0x04 and 0x05 are
+reserved (a never-wired second-factor prompt, since removed).
 
-## 7. Reliable streams (v2)
+- The client sends `OpenShell` (interactive sessions) and its `RemoteForward`
+  requests right after the handshake, and again on every reconnection.
+  `agent` asks the server for an agent socket (`-A`).
+- The server sends `ServerVersion` as its first message on every connection;
+  a direct client uses it to offer upgrading an outdated standing daemon.
+- When the shell exits, the server sends `Exit`; the client closes the
+  connection. The server closes it itself 2 s later if the client hasn't.
+- `Bye` ends the session like a close does; current clients close the
+  connection instead (section 6).
 
-`StreamMux` provides reliable, ordered, flow-controlled byte streams over the same
-session. Locally-initiated stream ids use parity to avoid collisions (client even,
-server odd); a peer-opened stream of the wrong parity is rejected, and the number
-of concurrent peer-opened streams is capped. Per stream:
+## 6. Session lifecycle
 
-- **Send:** buffered bytes from the acked offset, sent within the smaller of the
-  peer's advertised window and a **congestion window** (slow start / congestion
-  avoidance, collapsing to one segment on loss). Unacked data is retransmitted
-  after a **retransmit timeout derived from a smoothed RTT estimate**
-  (Jacobson/Karels, with Karn's algorithm and exponential backoff), not on every
-  poll. Timers run on wall-clock milliseconds (initial RTO 300 ms, clamped to
-  60 ms–3 s), independent of how often the driver polls. `fin` marks the last
-  byte.
-- **Acks:** `StreamAck{ack, window}` is sent when the ack point or window changed,
-  when data arrived since the last ack (the peer may be retransmitting because an
-  ack was lost), and otherwise at most once a second as a refresh. A graceful
-  `StreamClose` is sent once, then again on the retransmit timer until the peer
-  has acked all data.
-- **Receive:** out-of-order segments are reassembled into a contiguous stream; the
-  receiver advertises a window of `DEFAULT_WINDOW - unread` so an idle reader
-  applies backpressure (flow control). Frames that overflow or fall outside the
-  window are dropped, and a peer FIN offset is recorded only once.
-- **Lifecycle:** `StreamOpen` (with kind + metadata) announces a stream;
-  `StreamClose{status}` is a graceful close carrying an exit status (the exec
-  channel uses it to deliver the command's exit code); `StreamReset` is an abort.
+- **End**: the client ends a session by closing the connection with
+  application error code 0 (on exit, after a command or transfer, or on the
+  detach key). The server then stops the shell and retires the session.
+- **Lost connection**: if the connection times out (no packet for 60 s) or
+  is reset, the server keeps a running shell **detached** for 15 minutes. The
+  interactive client opens a new connection; when it sends `OpenShell`, the
+  server hands it the detached shell (same client key) and sends the screen as
+  a full snapshot. A command, transfer or forward-only session ends with its
+  connection.
+- **Reattach after a client restart**: a new connection's `OpenShell` also
+  takes over a running shell of the same client key whose own connection has
+  been silent for at least 8 s (its client is gone). A shell whose connection
+  is alive is never taken: a second window gets its own shell.
+- **Liveness**: the client sends a PING after 3 s of silence (QUIC
+  keep-alive), and every second while it has heard nothing for 4 s, so a
+  recovered network is noticed within about a second.
 
-The stream metadata identifies the endpoint per kind: `Forward` carries the
-target `host:port` (dial-out target for `-L`/`-D`, or the client-side delivery
-target announced via the `RemoteForward` control message for `-R`); `FileTransfer`
-carries a `PUT <size> <path>` / `GET <path>` request; `Exec` carries the command;
-`Agent` has none. Streams roam with the session exactly like the v1 datagram path.
-
-## 8. Anti-replay & roaming
-
-- Each direction has an independent nonce space; Noise guarantees strictly
-  increasing nonces.
-- The receiver keeps a 64-packet sliding-window filter and drops replayed or
-  too-old nonces.
-- A datagram is authenticated **before** it is allowed to update the peer address,
-  so a forged datagram from a new address cannot hijack a session.
-- The server follows the client to the source address of its latest
-  authenticated datagram. An idle client sends a keepalive every few seconds, and
-  a client that rebinds its socket sends one immediately, so the server learns a
-  new address within one keepalive interval at most.
-
-## 9. SSH bootstrap (optional)
+## 7. SSH bootstrap (optional)
 
 An SSH bootstrap: `ssh <host> noisshd --one-shot --authorize <client pub>`.
 The one-shot server binds the UDP port the client asks for with `--bind` (51820
 by default), or an ephemeral one if that port is taken, prints
 
 ```
-NOISSH CONNECT <port> <base64 server pubkey>
+NOISSH CONNECT <port> <base64 server pubkey> quic
 ```
 
-on stdout, then detaches (daemonizes) and serves one session, exiting if no
-client connects within 60 seconds. The client parses
-that line, pins the server key (delivered over the authenticated SSH channel), and
-connects over the normal Noise/UDP protocol above.
+on stdout (the final `quic` names the transport; a server before 0.7 omits it,
+and a 0.7 client refuses such a server with a message to upgrade it), then detaches (daemonizes) and serves until its session has ended,
+exiting if no client connects within 60 seconds. The client parses that line,
+pins the server key (delivered over the authenticated SSH channel), and
+connects over QUIC as above.

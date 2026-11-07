@@ -183,10 +183,12 @@ Full walkthrough, configuration, and troubleshooting:
 ## How it works (the short version)
 
 The server keeps the real terminal; your client shows a live picture of it and
-predicts your typing locally so it feels instant. Every packet is encrypted and
-tagged with a session id, so the server recognizes you no matter which network
-address you appear from — that's what lets the connection roam. Packet loss never
-stalls anything, because only the *latest* screen matters.
+predicts your typing locally so it feels instant. The connection is QUIC,
+secured by the Noise protocol instead of TLS: it follows you when your network
+address changes, and port forwards, file transfers and the shell each get their
+own stream, so a big transfer never delays your typing. Packet loss never
+stalls the screen, because only the *latest* screen matters; after a long
+outage the client reconnects and gets the same shell back.
 
 Want the details? See the **[Architecture](docs/ARCHITECTURE.md)** and
 **[Protocol](docs/PROTOCOL.md)** docs.
@@ -196,7 +198,7 @@ Want the details? See the **[Architecture](docs/ARCHITECTURE.md)** and
 Working and tested end-to-end: the resilient interactive shell, predictive
 typing, roaming, local/remote/dynamic port forwarding (`-L`/`-R`/`-D`), remote
 command execution (`noissh user@server <cmd>`), file transfer (`--put`/`--get`), and SSH agent
-forwarding (`-A`) — all over the same reliable-stream layer. This
+forwarding (`-A`) — each a QUIC stream of the same connection. This
 is young software and hasn't had an independent security audit yet — see the
 **[Security model](docs/SECURITY.md)** before relying on it for anything
 sensitive.
@@ -209,7 +211,7 @@ sensitive.
 | [Architecture](docs/ARCHITECTURE.md) | How the pieces fit together (with diagrams) |
 | [Protocol](docs/PROTOCOL.md) | The wire format and handshake, in detail |
 | [Security](docs/SECURITY.md) | Trust model and threat model |
-| [QUIC transport design](docs/design/quic-transport.md) | Proposal for the 0.7 transport (QUIC + Noise) |
+| [QUIC transport design](docs/design/quic-transport.md) | Design of the transport (QUIC + Noise), with benchmarks |
 | [Benchmark](bench/README.md) | `noissh-bench`: noissh vs OpenSSH over a simulated network path |
 | [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) | Hacking on noissh · history |
 

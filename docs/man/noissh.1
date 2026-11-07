@@ -45,7 +45,7 @@ predictive\-echo engine, giving an instant feel even on poor links.
 A bare
 .B noissh
 .I host
-first attempts a direct Noise/UDP session to a standing
+first attempts a direct QUIC session to a standing
 .BR noisshd (1)
 on the host (UDP port 51820 by default, or
 .BR \-\-port ),
@@ -78,7 +78,7 @@ Force the SSH bootstrap, skipping the direct probe. Run
 .B ssh
 .I host noisshd --one-shot
 to obtain the UDP port and the server's ephemeral public key, then connect over
-Noise/UDP. (Without this flag the bootstrap still runs automatically when the
+QUIC. (Without this flag the bootstrap still runs automatically when the
 direct attempt finds no daemon;
 .B \-\-ssh
 just skips the few\-second probe.) No pre\-shared
@@ -325,7 +325,7 @@ are applied to both the SSH bootstrap (by
 itself, so
 .BR ProxyJump ,
 .BR IdentityFile ,
-etc. also apply) and the resilient Noise/UDP session, for which noissh resolves
+etc. also apply) and the resilient QUIC session, for which noissh resolves
 the alias's
 .B HostName
 as the UDP destination.
@@ -338,6 +338,11 @@ Run
 or
 .BR screen (1)
 on the server for scrollback. The client is Unix\-only.
+.PP
+Since 0.7 the session runs over QUIC: a 0.7 client works only with
+.B noisshd
+0.7 or later (the SSH bootstrap offers to upgrade an older one), and a 0.6
+client can't connect to a 0.7 server.
 .SH AUTHENTICATION
 On first contact the server's static public key is pinned (trust on first use)
 in
@@ -349,6 +354,13 @@ with its public half in
 which must appear in the server's
 .I authorized_keys
 for direct connections.
+.SH ENVIRONMENT
+.TP
+.B NOISSH_CC
+Congestion control for the data this side sends: BBR by default (keeps
+throughput up on lossy Wi\-Fi and mobile paths);
+.B cubic
+selects Cubic.
 .SH FILES
 .TP
 .I ~/.config/noissh/id

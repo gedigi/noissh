@@ -6,16 +6,53 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **New transport: QUIC, secured by Noise (breaking: 0.7 and 0.6 don't
+  interoperate).** Each session is one QUIC connection (`quinn-proto`) whose
+  handshake is the same Noise XX exchange with the same keys, `known_hosts`
+  and `authorized_keys`. Port forwards, SOCKS connections, remote commands,
+  file transfers and agent connections are QUIC streams; keystrokes and
+  control messages share a high-priority control stream; screen updates are
+  QUIC datagrams. Congestion control is BBR. Upgrade client and server
+  together; see "Upgrading from 0.6 to 0.7" in the user guide. Measured
+  against 0.6 over a simulated 40 ms path (`noissh-bench`):
+  - bulk transfers 19× faster (1.67 → 31.8 MB/s; 43 MB/s on long transfers),
+    and 26.6 MB/s with 1 % packet loss (0.6: 0.13 MB/s);
+  - round-trip latency equals the path RTT (0.6 added ~15 ms), and a bulk
+    transfer no longer delays typing (echo p95 under load 47.5 ms; ssh 81.6);
+  - an idle session sends 0.4 packets/s each way (0.6: 3.4).
+- **Sessions survive long outages.** An address change is followed within the
+  connection (QUIC migration). If the connection times out (60 s without
+  contact, e.g. while the laptop sleeps), the client reconnects on its own and
+  the server hands it the running shell, which it keeps for 15 minutes after
+  losing its connection.
+- **A second window gets its own shell.** A new connection takes over a shell
+  of the same key only if that shell's connection is gone or silent for 8 s
+  (its client restarted); 0.6 handed it over even while the first window was
+  still connected.
+- **The SSH bootstrap checks the server's transport.** The one-shot server's
+  connect line now ends with `quic`; a 0.7 client that finds a pre-0.7
+  `noisshd` offers to upgrade it, or stops with instructions, instead of
+  timing out.
+
 ### Added
 
-- **Design proposal for the 0.7 transport** (`docs/design/quic-transport.md`):
-  QUIC via `quinn-proto` with the Noise handshake in place of TLS.
-- **`noise-quic` crate** (groundwork for 0.7, not used by the binaries yet):
-  the Noise XX handshake as the crypto layer of `quinn-proto` QUIC
-  connections, with tests.
+- **`NOISSH_CC=cubic`** selects Cubic congestion control instead of BBR.
 - **`noissh-bench`** (`bench/`): compares noissh with OpenSSH over a simulated
   network path (delay, jitter, UDP loss): bulk throughput, echo latency idle and
   under load, idle packets per second.
+- **Design document** for the transport (`docs/design/quic-transport.md`),
+  with the benchmark results; `PROTOCOL.md`, `ARCHITECTURE.md` and
+  `SECURITY.md` describe the QUIC transport.
+- **`noise-quic` crate**: the Noise XX handshake as the crypto layer of
+  `quinn-proto` QUIC connections.
+
+### Removed
+
+- The 0.6 transport: the `transport` crate (session ids, anti-replay, the
+  stream mux), the handshake driver in `proto`, the input retransmission
+  channel, and the stream and ping frames in `wire`.
 
 ### Fixed
 
@@ -24,18 +61,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (or `--server-port`) and falls back to an ephemeral port only if that is
   taken. The guide now also covers running several sessions at once, restarting
   the daemon after changing `authorized_keys`, and a systemd user service.
-- **Much faster port forwarding over real links (VS Code Remote-SSH).** The
-  stream retransmit timer and RTT estimate were counted in loop iterations,
-  not time. Drivers iterate on every received packet as well as on a timer, so
-  under load the timer fired long before an ack could arrive over a real link:
-  spurious retransmits and a collapsed congestion window. Over a simulated
-  40 ms RTT link a 2 MB transfer took 14 s (140 KB/s); it now takes 2.3 s
-  (~880 KB/s). Timers now use real time (milliseconds).
-- **An idle client no longer sends ~50 packets a second.** The client
-  acknowledged the screen state on every loop iteration, even with no shell
-  (exec and forwarding sessions such as VS Code's). It now acks only after
-  receiving a screen update. A client that roams to a new socket announces its
-  new address immediately instead of waiting for the next keepalive.
+- **Docs: `noisshd(1)` described PAM support** that doesn't exist; its SECURITY
+  section now describes the `--user` drop as implemented.
 
 ## [0.6.4]
 

@@ -7,7 +7,7 @@
 //!       nothing answers, automatically fall back to the SSH bootstrap below.
 //!   noissh --ssh [user@]host [--server-cmd noisshd] [-- <ssh args>...]
 //!       Force the SSH bootstrap: launch (and, if missing, install) noisshd over
-//!       SSH, then run the session over Noise/UDP.
+//!       SSH, then run the session over QUIC.
 //!   noissh --direct [--port N] [user@]host
 //!       Direct only — never fall back to SSH.
 
@@ -553,7 +553,7 @@ fn run() -> Result<(), RuntimeError> {
     // bootstrap automatically. `--ssh` forces bootstrap; `--direct` forbids it.
     //
     // Resolve the target's host through ~/.ssh/config so an alias works for the
-    // Noise/UDP leg too: `ssh` honours the user's config for the bootstrap, but
+    // QUIC leg too: `ssh` honours the user's config for the bootstrap, but
     // noissh resolves the UDP address itself, so without this an alias whose real
     // address is in `HostName` would never connect over UDP. The original target
     // is still handed to `ssh` (which applies ProxyJump/Port/User from the config).
@@ -692,7 +692,7 @@ fn run() -> Result<(), RuntimeError> {
         let udp_port = boot.server_addr.port();
         if args.verbose {
             eprintln!(
-                "noissh: SSH bootstrap done; server at {} — opening Noise/UDP session…",
+                "noissh: SSH bootstrap done; server at {} — opening the QUIC session…",
                 boot.server_addr
             );
         }

@@ -29,6 +29,7 @@ This guide covers installing, connecting, configuring, and troubleshooting.
 - [Scrollback and long output](#scrollback-and-long-output)
 - [Windows](#windows)
 - [Command reference](#command-reference)
+- [Upgrading from 0.6 to 0.7](#upgrading-from-06-to-07)
 - [Troubleshooting](#troubleshooting)
 
 ## Install
@@ -54,7 +55,7 @@ noissh user@server
 ```
 
 That's it. noissh first tries to reach a standing `noisshd` directly over
-Noise/UDP, and if nothing answers it automatically falls back to launching the
+QUIC (UDP), and if nothing answers it automatically falls back to launching the
 server over your existing SSH access — no extra server configuration required.
 (Make sure UDP is reachable; see [Troubleshooting](#troubleshooting).)
 
@@ -63,7 +64,7 @@ server over your existing SSH access — no extra server configuration required.
 The default — `noissh [user@]host` — does the right thing on its own. You do not
 choose a mode up front:
 
-1. **Direct first.** noissh tries a Noise/UDP session to a standing `noisshd` on
+1. **Direct first.** noissh tries a QUIC session to a standing `noisshd` on
    the host (UDP port 51820 by default, or `--port N`), pinning the server's key
    via TOFU in `known_hosts`.
 2. **SSH fallback.** If nothing answers within a few seconds (no daemon is
@@ -112,7 +113,7 @@ What happens:
    prints a connect line with the port it got, and detaches so it survives the
    SSH connection closing. If no client connects within 60 seconds it exits.
 3. noissh reads the port + the server's ephemeral public key (delivered over the
-   authenticated SSH channel), pins it, and connects over Noise/UDP.
+   authenticated SSH channel), pins it, and connects over QUIC.
 
 Each bootstrapped session gets its own `noisshd`, and only one of them can hold a
 given port. A second session started while the first is running (a second
@@ -155,7 +156,12 @@ open that UDP port in the firewall.
 
 A noissh session rides out network changes on its own — close the laptop, switch
 from Wi-Fi to cellular, walk through a dead spot — and resumes when connectivity
-returns, no reconnect needed.
+returns. An address change is followed within the same connection (QUIC
+connection migration). After a longer outage (the connection times out after
+60 seconds without contact, e.g. while the laptop sleeps), noissh opens a new
+connection by itself and the server hands it your running shell: shells whose
+connection is lost keep running on the server for 15 minutes. Remote commands,
+transfers and forward-only sessions end with their connection, as with ssh.
 
 While the link is healthy you see a normal shell. If it goes quiet (you've
 moved networks, or the path is down), a status banner appears on the top row so
@@ -184,7 +190,7 @@ without killing your terminal window.
 noissh honours your existing `~/.ssh/config`. A `Host` alias's `HostName`,
 `User`, and `Port` are applied to **both** legs of a connection — the SSH
 bootstrap (handled by `ssh` itself, so `ProxyJump`, `IdentityFile`, and the rest
-work too) and the resilient Noise/UDP session (noissh resolves the alias's
+work too) and the resilient QUIC session (noissh resolves the alias's
 `HostName` for the UDP address). So if this is in your `~/.ssh/config`:
 
 ```
@@ -380,6 +386,12 @@ The terminal type advertised to the remote shell is taken from your `$TERM`
 environment variable (falling back to `xterm-256color` if it is unset), so it
 does not need a config entry.
 
+**Congestion control.** noissh uses BBR, which keeps throughput up on paths
+with random packet loss (Wi-Fi, mobile) where loss-based algorithms slow to a
+crawl. Setting the environment variable `NOISSH_CC=cubic` (on the side that
+sends the bulk of the data: the server for downloads, the client for uploads)
+selects Cubic instead, for comparison or for a network where BBR misbehaves.
+
 ## Port forwarding
 
 Local (`-L`) and remote (`-R`) port forwarding ride the same resilient session
@@ -574,9 +586,11 @@ Tips:
   `noissh --copy-id host` (then restart the daemon), and connect once with
   `noissh --direct host true` to pin its key; VS Code's connections then go
   straight to it.
-- **Use noissh 0.6.4 or later on both ends.** Earlier versions sent a packet on
-  every internal tick while streams were open, which some home routers treat as
-  a flood and block for minutes.
+- **Use the same noissh version on both ends (0.7 or later).** 0.7 replaced the
+  transport with QUIC and doesn't interoperate with 0.6 (see
+  [Upgrading to 0.7](#upgrading-from-06-to-07)). Earlier versions also sent a
+  packet on every internal tick while streams were open, which some home
+  routers treat as a flood and block for minutes.
 - **`-V` prints `noissh <version> (OpenSSH-compatible command line)`.** VS Code
   Remote-SSH runs `<remote.SSH.path> -V` first and silently falls back to the
   system `ssh` unless the output mentions OpenSSH; its log then says
@@ -698,9 +712,26 @@ the meantime, the client runs well under **WSL**, and the **server** (`noisshd`)
 targets Unix hosts. If Windows support matters to you, please open or 👍 an
 issue so it can be prioritised.
 
+## Upgrading from 0.6 to 0.7
+
+noissh 0.7 replaced its transport with QUIC (secured by the same Noise
+handshake and keys), so a 0.7 client and a 0.6 server can't talk to each
+other, nor the reverse. Keys, `known_hosts`, `authorized_keys` and the config
+file are unchanged. Upgrade both ends:
+
+- **SSH bootstrap.** A 0.7 client that finds an older `noisshd` on the server
+  says so and offers to upgrade it (in a terminal; `--no-install` turns that
+  off). After the upgrade, run the command again. Without the upgrade it stops
+  with a message rather than timing out.
+- **Standing daemon.** Install the new `noisshd` on the server and restart the
+  daemon (for example `systemctl --user restart noisshd`). Until then a 0.7
+  client's direct attempt gets no answer and falls back to the SSH bootstrap.
+- **Old client, new server.** A 0.6 client can't connect to a 0.7 server: its
+  session times out. Upgrade the client.
+
 ## Troubleshooting
 
-- **It hangs at connect.** The Noise/UDP session needs the server's UDP port to
+- **It hangs at connect.** The QUIC session needs the server's UDP port to
   be reachable. Open the port in the firewall (UDP 51820 by default, for both a
   standalone daemon and the SSH bootstrap; or your `--listen` / `--server-port`
   port). TCP-only reachability (SSH works but noissh hangs) is the classic

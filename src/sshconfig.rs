@@ -2,7 +2,7 @@
 //! Minimal `~/.ssh/config` interop.
 //!
 //! noissh runs the SSH bootstrap through `ssh`, which already honours the user's
-//! `~/.ssh/config`. But the resilient session runs over Noise/UDP, and noissh
+//! `~/.ssh/config`. But the resilient session runs over QUIC (UDP), and noissh
 //! resolves *that* address itself from the target string — so a `Host` alias
 //! whose real address lives in `HostName` would never resolve for the UDP leg.
 //! This module reads the relevant keys (`HostName`, `User`, `Port`) for an alias

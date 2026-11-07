@@ -1,7 +1,8 @@
 # Design: noissh 0.7 transport on QUIC (quinn-proto) with Noise
 
-Status: **in progress** — milestones 1 (`noise-quic`) and 2 (benchmark harness,
-0.6 baseline in section 9) implemented; the rest is the plan.
+Status: **implemented** (milestones 1–5; the 0.6 transport is removed).
+Tuning (milestone 6) is in progress; measurements are in section 9. The
+protocol as built is specified in [PROTOCOL.md](../PROTOCOL.md).
 
 ## 1. Why
 
@@ -168,21 +169,22 @@ later incompatible change can use a new version and negotiate.
 | session id + roaming | QUIC connection ids + connection migration / NAT rebinding (built in) |
 | anti-replay window | QUIC packet numbers (built in) |
 | `StreamMux` streams (exec, forward, agent, xfer) | one bidirectional QUIC stream each; first bytes: kind + metadata header |
-| exec stderr (extra server-opened stream) | a second, server-opened unidirectional stream |
+| exec stderr (extra server-opened stream) | a second, server-opened bidirectional exec stream; the exit code in an `ExecExit` control message |
 | control messages (OpenShell, Resize, RemoteForward, Bye, …) | a bidirectional control stream opened first by the client |
-| shell input (reliable byte stream) | a QUIC stream, highest priority |
-| screen state (latest-wins diffs) | QUIC DATAGRAM frames (RFC 9221; unreliable, congestion-controlled), same SSP-style diff/ack logic as today, acks on the control stream |
-| keepalive | QUIC keep-alive (PING) every 15 s |
-| idle reap (~minutes) | QUIC idle timeout off/long + noissh's own detach/reattach timer |
+| shell input (reliable byte stream) | `Input` frames on the control stream (highest priority) |
+| screen state (latest-wins diffs) | QUIC DATAGRAM frames (RFC 9221; unreliable, congestion-controlled), on the control stream when a diff doesn't fit; same SSP-style diff/ack logic, acks on the control stream |
+| keepalive | QUIC keep-alive (PING) after 3 s of silence; every second while the link looks dead |
+| idle reap (~minutes) | QUIC idle timeout (60 s); a shell then stays detached for 15 minutes; the client reconnects on its own |
 
 **Prioritisation**: quinn-proto schedules streams by priority. Shell input,
 screen datagrams and the control stream get the highest priority; VS Code /
 forward streams the default; file transfers below. A bulk transfer can no
 longer delay keystrokes.
 
-**Reattach after client restart**: a new QUIC connection whose authenticated
-client key owns a detached shell takes it over (today's logic, keyed by client
-static key), then receives a full screen snapshot.
+**Reattach**: a new connection's `OpenShell` takes over a running shell of the
+same client key whose connection is gone, or silent for 8 s (its client
+restarted), then receives a full screen snapshot. Unlike 0.6, a shell whose
+connection is alive is never taken, so a second window gets its own shell.
 
 **Remote command / VS Code flow** (`noissh -T -D <port> host`): unchanged at
 the CLI; underneath, the login shell is an exec stream and each SOCKS
@@ -195,6 +197,10 @@ connection is a forward stream.
   fixed ticks, so nothing is sent unless the state machine asks for it.
 - Batch: drain all readable datagrams, then all `poll_transmit()` output, per
   wake-up.
+- Once established, a received datagram only feeds QUIC; events, stream data
+  and replies are processed once per batch.
+- Descriptors whose stream is backed up (or at EOF) aren't polled for input,
+  so a slow peer or a closed socket can't make the loop spin.
 - Later: GSO/GRO and `recvmmsg` through `quinn-udp` (safe API) for high
   throughput on Linux.
 
@@ -222,7 +228,14 @@ trips. Out of scope for 0.7.0; the version number leaves room for it.
 6. **Tuning** against the benchmark (congestion controller choice, priorities,
    GSO), then release 0.7.0.
 
-Each milestone keeps `cargo test`, clippy and fmt green and is a separate PR.
+Each milestone keeps `cargo test`, clippy and fmt green. Milestones 3–5 landed
+together: the cores kept their public interface, so replacing the transport
+under them in one step was simpler than running both side by side.
+
+Decisions taken while implementing: BBR instead of Cubic (Cubic reached
+0.43 MB/s at 1 % loss and 40 ms; BBR 19–27 MB/s); the ACK-frequency
+extension (acknowledge every 8th packet) to halve the receiver's per-packet
+work; screen diffs paced at most every 8 ms, resent after 1.5 × RTT + 10 ms.
 
 ## 9. Benchmark
 
@@ -244,9 +257,8 @@ Metrics, each compared against OpenSSH over the same impairment:
 Targets: throughput ≥ ssh on clean links and ≥ 2× ssh at 1 % loss; echo latency
 during bulk transfer within 1.5× of idle; idle ≤ 1 pkt/s each way.
 
-Implemented so far: bulk throughput and echo latency through `-L`, idle and
-under load, and idle packets/s. File transfer and recovery times are still to
-add.
+Implemented: bulk throughput and echo latency through `-L`, idle and under
+load, and idle packets/s. File transfer and recovery times are still to add.
 
 ### 0.6 baseline
 
@@ -265,15 +277,47 @@ link), 5 MB bulk, release builds of 0.6.4 and OpenSSH 9.6:
 adds ~15 ms of tick latency to every round trip; ssh's echo suffers under load
 (head-of-line blocking behind the bulk transfer in one TCP connection).
 
+### 0.7 (QUIC)
+
+Same machine and method, 50 MB bulk:
+
+| path | tool | bulk MB/s | echo p50/p95 ms | echo under load p50/p95 ms | idle pkts/s up/down |
+|---|---|---|---|---|---|
+| 1 ms | noissh 0.7 | 68.9 | 2.1 / 2.6 | 6.9 / 10.6 | 0.4 / 0.4 |
+| 1 ms | OpenSSH | 522.0 | 2.0 / 2.2 | 2.7 / 39.0 | — |
+| 40 ms | noissh 0.7 | 31.8 | 41.5 / 42.4 | 41.6 / 47.5 | 0.4 / 0.4 |
+| 40 ms | OpenSSH | 38.5 | 41.3 / 41.7 | 41.7 / 81.6 | — |
+| 150 ms | noissh 0.7 | 13.0 | 151.7 / 154.1 | 151.3 / 154.2 | 0.4 / 0.4 |
+| 150 ms | OpenSSH | 12.3 | 151.4 / 151.8 | 151.9 / 196.1 | — |
+| 40 ms, 1 % loss | noissh 0.7 | 26.6 | 41.4 / 42.1 | 41.4 / 47.5 | 0.4 / 0.4 |
+| 40 ms, 5 % loss | noissh 0.7 | 22.1 | 41.4 / 151.5 | 41.9 / 96.5 | 0.4 / 0.4 |
+
+Against the targets:
+
+- **Echo latency under bulk ≤ 1.5× idle: met** (p95 47.5 vs 42.4 ms at 40 ms;
+  ssh's p95 doubles under load).
+- **Idle ≤ 1 pkt/s: met** (0.4 each way; 0.6 sent 3.4).
+- **Throughput ≥ ssh: met at 150 ms, close at 40 ms, not on a 1 ms path.**
+  On a near-zero RTT the limit is CPU per packet (one `sendto`/`recvfrom` per
+  1200-byte datagram against ssh's 64 KB TCP writes); GSO/GRO is the next step.
+  Over 300 MB at 40 ms (steady state, past BBR's start-up) noissh reached
+  43 MB/s.
+- **2× ssh at 1 % loss: not measured yet**: TCP loss needs `netem` (CI). For
+  reference, the Mathis bound for a loss-based TCP at 1 % loss and 40 ms is
+  about 0.4 MB/s; noissh keeps 26.6 MB/s.
+
+Noisy shared machine: repeated runs vary by ±20 %.
+
 ## 10. Risks and open questions
 
 - **Q1 — handshake-level keys. Resolved** in milestone 1: public
   (obfuscation-only) Handshake keys from the handshake hash after msg1, with
   msg2 and msg3 at the Handshake level; see section 4.
-- **Q2 — screen state over DATAGRAM vs a stream.** Datagrams keep latest-wins
-  semantics (no retransmitting stale screens); size is bounded by the path MTU,
-  so large diffs need splitting or a fallback to a stream. To prototype in
-  milestone 4.
+- **Q2 — screen state over DATAGRAM vs a stream. Resolved** in milestone 4:
+  datagrams, with a fallback to the control stream for a diff larger than the
+  datagram limit (a full snapshot of a big terminal); a large diff is held
+  back while 256 KiB of earlier ones are still queued, since a later diff
+  supersedes it.
 - **Security review** of the Noise ↔ QUIC binding before release: transcript
   binding of transport parameters, key separation between levels, nonce use.
 - **Dependency footprint**: acceptable (listed above); `cargo deny` stays green.
