@@ -67,6 +67,7 @@ crates/
 src/           runtime (client/server cores + UDP drivers), config, tty, ssh,
                forward (TCP/Unix), socks (-D), exec (remote command), xfer (file I/O)
 src/bin/       noissh (client), noisshd (server), noissh-keygen (key tool)
+bench/         noissh-bench: noissh vs OpenSSH over a simulated network path
 ```
 
 ### Dependency direction

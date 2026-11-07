@@ -13,6 +13,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`noise-quic` crate** (groundwork for 0.7, not used by the binaries yet):
   the Noise XX handshake as the crypto layer of `quinn-proto` QUIC
   connections, with tests.
+- **`noissh-bench`** (`bench/`): compares noissh with OpenSSH over a simulated
+  network path (delay, jitter, UDP loss): bulk throughput, echo latency idle and
+  under load, idle packets per second.
 
 ### Fixed
 

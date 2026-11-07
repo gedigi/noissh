@@ -1,7 +1,7 @@
 # Design: noissh 0.7 transport on QUIC (quinn-proto) with Noise
 
-Status: **in progress** — milestone 1 (`noise-quic`) implemented; the rest is
-the plan.
+Status: **in progress** — milestones 1 (`noise-quic`) and 2 (benchmark harness,
+0.6 baseline in section 9) implemented; the rest is the plan.
 
 ## 1. Why
 
@@ -226,9 +226,11 @@ Each milestone keeps `cargo test`, clippy and fmt green and is a separate PR.
 
 ## 9. Benchmark
 
-A `bench/` harness, run locally and in CI (Linux), with a userspace impairment
-proxy (UDP for noissh, TCP for ssh) adding configurable one-way delay, jitter
-and loss — no root or `tc` needed.
+A `bench/` harness (`noissh-bench`, see `bench/README.md`), with a userspace
+impairment proxy (UDP for noissh, TCP for ssh) adding configurable one-way
+delay, jitter and loss — no root or `tc` needed. Loss is simulated on UDP only:
+TCP's own retransmission hides userspace drops, so loss comparisons with ssh
+need `netem` (Linux, root), with the harness's own delay set to 0.
 
 Scenarios: RTT ∈ {1, 40, 150} ms × loss ∈ {0, 1, 5} %.
 
@@ -241,6 +243,27 @@ Metrics, each compared against OpenSSH over the same impairment:
 
 Targets: throughput ≥ ssh on clean links and ≥ 2× ssh at 1 % loss; echo latency
 during bulk transfer within 1.5× of idle; idle ≤ 1 pkt/s each way.
+
+Implemented so far: bulk throughput and echo latency through `-L`, idle and
+under load, and idle packets/s. File transfer and recovery times are still to
+add.
+
+### 0.6 baseline
+
+Measured with the harness on one Linux machine (loopback plus the userspace
+link), 5 MB bulk, release builds of 0.6.4 and OpenSSH 9.6:
+
+| path | tool | bulk MB/s | echo p50/p95 ms | echo under load p50/p95 ms | idle pkts/s up/down |
+|---|---|---|---|---|---|
+| 40 ms | noissh 0.6 | 1.67 | 55.9 / 56.9 | 55.7 / 59.5 | 3.4 / 3.4 |
+| 40 ms | OpenSSH | 21.05 | 41.2 / 41.6 | 62.4 / 117.4 | — |
+| 40 ms, 1 % loss | noissh 0.6 | 0.13 | 55.8 / 57.0 | 55.7 / 57.8 | 3.2 / 3.2 |
+| 150 ms | noissh 0.6 | timed out (> 120 s) | 163.9 / 165.4 | 163.9 / 167.8 | 3.4 / 5.4 |
+| 150 ms | OpenSSH | 7.34 | 151.6 / 152.2 | 151.5 / 186.9 | — |
+
+0.6 is 12× slower than ssh at 40 ms, collapses with loss or a long RTT, and
+adds ~15 ms of tick latency to every round trip; ssh's echo suffers under load
+(head-of-line blocking behind the bulk transfer in one TCP connection).
 
 ## 10. Risks and open questions
 

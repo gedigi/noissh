@@ -1,0 +1,17 @@
+[package]
+name = "noissh-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Benchmarks noissh against OpenSSH over a simulated network path"
+
+[[bin]]
+name = "noissh-bench"
+path = "src/main.rs"
+
+[dependencies]
+getrandom.workspace = true
+
+[lints]
+workspace = true

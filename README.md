@@ -210,6 +210,7 @@ sensitive.
 | [Protocol](docs/PROTOCOL.md) | The wire format and handshake, in detail |
 | [Security](docs/SECURITY.md) | Trust model and threat model |
 | [QUIC transport design](docs/design/quic-transport.md) | Proposal for the 0.7 transport (QUIC + Noise) |
+| [Benchmark](bench/README.md) | `noissh-bench`: noissh vs OpenSSH over a simulated network path |
 | [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) | Hacking on noissh · history |
 
 ## License

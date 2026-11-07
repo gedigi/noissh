@@ -32,6 +32,16 @@ cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 cargo test --workspace                            # all tests green
 ```
 
+### Benchmarks
+
+Changes to the transport should come with numbers from `noissh-bench` (see
+`bench/README.md`), before and after, on the same machine:
+
+```sh
+cargo build --release --bins
+./target/release/noissh-bench --rtt 40 --size 20
+```
+
 ### Documentation
 
 Every PR keeps the documentation accurate. Check each of these against the code
