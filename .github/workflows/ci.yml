@@ -15,6 +15,9 @@ jobs:
   test:
     name: build, test, lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test must fail the job in minutes, not hold a runner for the
+    # 6-hour default (as a macOS PTY test once did).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

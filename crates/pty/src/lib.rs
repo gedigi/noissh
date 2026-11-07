@@ -241,14 +241,14 @@ mod tests {
     }
 
     /// Run `script` under `/bin/sh -c` in a PTY and return what it prints, up to
-    /// and including `want`.
+    /// and including `want`, and its exit status.
     ///
-    /// The script must end by reading a line (`read _`), which this sends only
-    /// once `want` has been read. That keeps the child, and so the PTY's slave
-    /// side, alive until its output is collected: when the last slave
-    /// descriptor closes, macOS may discard output the master has not read yet
-    /// (Linux keeps it readable), so reading after a short-lived child exits
-    /// races its exit there.
+    /// The script must end with a short `sleep`, so the child, and with it the
+    /// PTY's slave side, outlives the moment its output is read: when the last
+    /// slave descriptor closes, macOS may discard output the master has not read
+    /// yet (Linux keeps it readable), so reading after a short-lived child exits
+    /// races its exit there. The child exits on its own; nothing here waits on
+    /// input it would have to read.
     fn capture_until(req: SpawnRequest, script: &str, want: &str) -> (String, i32) {
         let req = SpawnRequest {
             command: Some(vec!["/bin/sh".into(), "-c".into(), script.into()]),
@@ -256,8 +256,6 @@ mod tests {
         };
         let mut h = LocalLogin.spawn(&req).unwrap();
         let out = drain_until(&mut h, want);
-        // Release the script's final `read`, then reap it.
-        h.write(b"\n").unwrap();
         (out, h.wait().unwrap())
     }
 
@@ -289,7 +287,7 @@ mod tests {
     fn spawn_command_captures_output() {
         let (s, code) = capture_until(
             SpawnRequest::default(),
-            "/bin/echo hello-pty; read _",
+            "/bin/echo hello-pty; sleep 1",
             "hello-pty",
         );
         assert!(s.contains("hello-pty"), "got: {s:?}");
@@ -305,7 +303,7 @@ mod tests {
             .dir;
         let (s, _) = capture_until(
             SpawnRequest::default(),
-            "pwd; read _",
+            "pwd; sleep 1",
             &home.to_string_lossy(),
         );
         assert!(
@@ -333,7 +331,7 @@ mod tests {
             cols: 100,
             ..Default::default()
         };
-        let (s, _) = capture_until(req, "stty size; read _", "30 100");
+        let (s, _) = capture_until(req, "stty size; sleep 1", "30 100");
         assert!(s.contains("30 100"), "stty size returned: {s:?}");
     }
 
@@ -344,9 +342,9 @@ mod tests {
             command: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                // `read _` keeps the child alive until its output is read
-                // (see `capture_until`).
-                "sleep 0.3; stty size; read _".into(),
+                // The trailing sleep keeps the child alive until its output
+                // is read (see `capture_until`).
+                "sleep 0.3; stty size; sleep 1".into(),
             ]),
             rows: 24,
             cols: 80,
@@ -355,7 +353,6 @@ mod tests {
         let mut h = login.spawn(&req).unwrap();
         h.set_winsize(40, 120).unwrap();
         let s = drain_until(&mut h, "40 120");
-        h.write(b"\n").unwrap();
         assert_eq!(h.wait().unwrap(), 0);
         assert!(s.contains("40 120"), "after resize stty size: {s:?}");
     }
