@@ -98,6 +98,9 @@ struct Args {
     copy_id: bool,
     /// `-N`: run no remote command (forwards only), like `ssh -N`.
     no_command: bool,
+    /// `-T`: no TTY. Without a command this runs the login shell over plain
+    /// pipes, reading stdin, as `ssh -T host` does.
+    no_tty: bool,
     /// `-n`: give a remote command an empty stdin, like `ssh -n`.
     null_stdin: bool,
     /// `-F FILE`: the ssh config file to resolve host aliases from (also passed
@@ -153,6 +156,8 @@ Options:
                         forwards run alongside a command if one is given;
                         otherwise the session is forward-only (no shell)
   -N                    no remote command or shell (forwards only), like ssh -N
+  -T                    no TTY; without a command, run the login shell reading
+                        stdin (like ssh -T host), with any forwards alongside
   -n                    give the remote command an empty stdin, like ssh -n
   --put LOCAL:REMOTE    upload LOCAL to REMOTE, then exit
   --get REMOTE:LOCAL    download REMOTE to LOCAL, then exit
@@ -169,7 +174,7 @@ Options:
 ssh compatibility (so noissh can stand in for ssh, e.g. VS Code remote.SSH.path):
   -b -B -c -E -F -i -J -l -m -o -p   passed to ssh for the bootstrap (-F is also
                         used to resolve host aliases)
-  -4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y, -e CHAR   accepted, no effect
+  -4 -6 -a -C -g -k -K -q -s -t -x -X -Y -y, -e CHAR   accepted, no effect
 
 Examples:
   noissh user@host                 # interactive shell
@@ -231,6 +236,7 @@ fn parse_args() -> Args {
         forget_host: None,
         copy_id: false,
         no_command: false,
+        no_tty: false,
         null_stdin: false,
         ssh_config: None,
     };
@@ -303,6 +309,11 @@ fn parse_args() -> Args {
     a
 }
 
+/// The remote command `-T` runs when no command is given: the user's login
+/// shell, reading commands from stdin. `$SHELL` comes from the server
+/// process's environment; `/bin/sh` covers a daemon started without it.
+const LOGIN_SHELL_COMMAND: &str = "exec \"${SHELL:-/bin/sh}\" -l";
+
 /// ssh session options that noissh itself provides (or that would conflict with
 /// the bootstrap's own `ssh` invocation), so a `-o` setting them is dropped
 /// rather than handed to the bootstrap `ssh`. Compared case-insensitively.
@@ -334,11 +345,12 @@ fn ssh_option_name(opt: &str) -> String {
 /// in tools that invoke it (e.g. VS Code's `remote.SSH.path`).
 ///
 /// - noissh's flags: `-A -h -V -v -L -R -D`
-/// - ssh flags with a noissh meaning: `-N` (no command), `-n` (null stdin)
+/// - ssh flags with a noissh meaning: `-N` (no command), `-n` (null stdin),
+///   `-T` (no TTY: without a command, run the login shell over pipes)
 /// - ssh flags that only matter to the SSH bootstrap, passed through to `ssh`:
 ///   `-b -B -c -E -F -i -J -l -m -o -p`
 /// - ssh flags that are meaningless here and accepted as no-ops:
-///   `-4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y` and `-e CHAR`
+///   `-4 -6 -a -C -g -k -K -q -s -t -x -X -Y -y` and `-e CHAR`
 fn parse_short_options(arg: &str, it: &mut impl Iterator<Item = String>, a: &mut Args) {
     let flags = &arg[1..];
     for (i, c) in flags.char_indices() {
@@ -374,11 +386,11 @@ fn parse_short_options(arg: &str, it: &mut impl Iterator<Item = String>, a: &mut
             'A' => a.forward_agent = true,
             'N' => a.no_command = true,
             'n' => a.null_stdin = true,
+            'T' => a.no_tty = true,
             // Accepted for ssh compatibility; nothing to do for noissh (no TTY
             // is requested for a command, X11/compression/IP-family/GSSAPI are
             // not applicable).
-            '4' | '6' | 'a' | 'C' | 'g' | 'k' | 'K' | 'q' | 's' | 'T' | 't' | 'x' | 'X' | 'Y'
-            | 'y' => {}
+            '4' | '6' | 'a' | 'C' | 'g' | 'k' | 'K' | 'q' | 's' | 't' | 'x' | 'X' | 'Y' | 'y' => {}
             _ => usage_exit(&format!("unknown option \"-{c}\"")),
         }
     }
@@ -494,8 +506,14 @@ fn run() -> Result<(), RuntimeError> {
         || !args.remote_forwards.is_empty()
         || !args.dynamic_forwards.is_empty();
     // `-N` means no remote command at all, even if one was given (as with ssh).
+    // `-T` without a command means a shell without a TTY: like `ssh -T host`,
+    // run the login shell reading commands from stdin. VS Code Remote-SSH
+    // relies on this: it runs `ssh -T -D <port> host` and writes its setup
+    // script to stdin.
     let command = if args.no_command {
         Vec::new()
+    } else if args.command.is_empty() && args.no_tty {
+        vec![LOGIN_SHELL_COMMAND.to_string()]
     } else {
         args.command.clone()
     };
