@@ -62,6 +62,8 @@ crates/
   auth/        known_hosts (TOFU) + authorized_keys, X25519 key text format
   pty/         PTY allocation + login-shell launching (safe, via pty-process)
   proto/       handshake driver, control channel, state-sync plane, xfer request
+  noise-quic/  (0.7, not used by the binaries yet) Noise XX as the crypto layer
+               of quinn-proto QUIC connections
 src/           runtime (client/server cores + UDP drivers), config, tty, ssh,
                forward (TCP/Unix), socks (-D), exec (remote command), xfer (file I/O)
 src/bin/       noissh (client), noisshd (server), noissh-keygen (key tool)

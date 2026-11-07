@@ -1,6 +1,7 @@
 # Design: noissh 0.7 transport on QUIC (quinn-proto) with Noise
 
-Status: **proposal** — for review before implementation.
+Status: **in progress** — milestone 1 (`noise-quic`) implemented; the rest is
+the plan.
 
 ## 1. Why
 
@@ -94,42 +95,65 @@ usual implementation; noissh plugs in Noise.
 
 ### Handshake: Noise XX over QUIC CRYPTO frames
 
-`Noise_XX_25519_ChaChaPoly_BLAKE2s`, the pattern noissh already uses:
+Implemented in `crates/noise-quic` (milestone 1).
+
+`Noise_XX_25519_ChaChaPoly_BLAKE2s`, the pattern noissh already uses, with the
+prologue `"noissh-quic"` + the QUIC version so a transcript from another context
+can't be replayed here. Each Noise message travels in CRYPTO frames prefixed
+with its length (u16, big endian), since CRYPTO data can be split or merged
+arbitrarily:
 
 ```
-client                                   server
-  Initial:   msg1  → e          [payload: client QUIC transport params]
-  Initial:   msg2  ← e, ee, s, es [payload: server QUIC transport params + version]
-  Handshake: msg3  → s, se      [payload: empty]
+client                                         server
+  Initial:   msg1 → e            [payload: client transport parameters]
+  Handshake: msg2 ← e, ee, s, es [payload: server transport parameters]
+  Handshake: msg3 → s, se        [payload: empty]
   1-RTT keys from Noise Split()
 ```
 
-- **Transport parameters** travel in the Noise payloads, so they are bound to
-  the handshake transcript: tampering with the client's (msg1 payload is not
-  encrypted) changes the transcript hash and the handshake fails at msg2/msg3.
-  The server's are encrypted in msg2.
-- **Initial keys** are derived from the client's destination connection id
-  with a noissh-specific salt (as QUIC does): obfuscation only, like QUIC's.
-  Noise messages carry their own protection.
-- **Handshake-level keys** (for msg3 and handshake-space ACKs) are derived from
-  the Noise handshake hash after msg2 plus a key exported for the purpose; see
-  open question Q1.
+- **Why msg2 is at the Handshake level.** In quinn-proto a client becomes
+  established only on receiving a Handshake-level packet, and a server discards
+  the Handshake level as soon as its handshake completes. With msg2 at the
+  Initial level the server would have nothing to send at the Handshake level
+  after msg3 and the handshake could stall. So the client moves to the
+  Handshake level right after sending msg1, and msg2 and msg3 both travel there.
+- **Initial and Handshake keys are public**, i.e. obfuscation only, exactly
+  like QUIC's Initial keys: Initial from the client's destination connection
+  id, Handshake from the Noise handshake hash after msg1, each with its own
+  salt. Everything the handshake must protect is protected by Noise itself:
+  the static keys and the server's transport parameters are encrypted inside
+  msg2/msg3; the client's parameters (msg1, unencrypted) are bound to the
+  transcript, so changing them makes the client fail to decrypt msg2 (tested).
+  An on-path attacker can disrupt the handshake, as with any QUIC Initial
+  packet, but cannot impersonate either side or alter what they agree on.
 - **1-RTT keys**: `snow`'s split (feature `risky-raw-split`) gives the two raw
-  32-byte cipher keys. From each, HKDF-SHA256 derives the packet key, IV and
-  header-protection key (RFC 9001 §5 labels with a noissh prefix). Packets use
-  ChaCha20-Poly1305 with the QUIC nonce (IV XOR packet number) and the header as
-  AAD; header protection uses ChaCha20 (RFC 9001 §5.4.4). Both come from the
-  `chacha20poly1305` / `chacha20` crates already in the dependency tree.
-- **Key update** (`next_1rtt_keys`): HKDF "noissh ku" over the current secret,
-  as RFC 9001 §6.
-- **Authentication**: after msg3 the server checks the client's static key
-  against `authorized_keys`; the client checks the server's static key against
-  `known_hosts` or the ssh-bootstrap pin. Failure closes the connection with a
-  crypto error before any application stream is accepted. Peer identity is
-  exposed via `Session::peer_identity`.
-- **Retry tokens, stateless reset, address-validation tokens**: HMAC and AEAD
-  keys derived from a random per-process secret (server), provided through
-  quinn-proto's `HmacKey` / `HandshakeTokenKey` traits.
+  32-byte cipher keys; each is mixed with the final handshake hash into that
+  direction's secret. Packets use ChaCha20-Poly1305 with the QUIC nonce (IV XOR
+  packet number) and the header as AAD; header protection uses ChaCha20
+  (RFC 9001 §5.4.4).
+- **Key derivation** uses keyed BLAKE2s-256 as a PRF (the hash of the Noise
+  suite in use), one call per derived value with distinct labels: packet key,
+  IV and header-protection key per direction, the key-update chain
+  (RFC 9001 §6, header-protection keys unchanged across updates), and an
+  exporter secret for `export_keying_material`.
+- **Authentication**: the client checks the server's static key (against
+  `known_hosts` or the ssh-bootstrap pin) as soon as msg2 arrives, before
+  sending msg3; the server checks the client's against `authorized_keys` after
+  msg3. A rejected key fails the handshake with crypto error 0x2a
+  (`bad_certificate`) and a reason ("server key not trusted" / "client key not
+  authorized") before any 1-RTT key exists. The authenticated key is exposed
+  through `Session::peer_identity` as `noise_quic::PeerIdentity`.
+- **Retry integrity tag**: ChaCha20-Poly1305 with a fixed noissh key over the
+  RFC 9001 §5.8 pseudo-packet. **Stateless reset and address-validation
+  tokens**: keyed BLAKE2s and per-token ChaCha20-Poly1305 keys derived from
+  random per-process secrets (`Blake2sHmac`, `TokenKey`).
+
+Tests (`cargo test -p noise-quic`): a full handshake between two in-memory
+quinn-proto endpoints carrying a 200 KB stream and datagrams; rejection of an
+unexpected server key and of an unauthorized client; transcript binding of the
+client's parameters; 25 % packet loss during the handshake; key updates;
+CRYPTO reassembly from 1-byte chunks; packet and header protection round
+trips and tamper detection; retry tags.
 
 ### Version and ALPN
 
@@ -220,12 +244,9 @@ during bulk transfer within 1.5× of idle; idle ≤ 1 pkt/s each way.
 
 ## 10. Risks and open questions
 
-- **Q1 — handshake-level keys.** QUIC expects distinct Handshake-space keys
-  before the handshake completes. Options: (a) carry msg3 in the Initial space
-  and switch straight to 1-RTT (needs checking against quinn-proto's state
-  machine); (b) derive Handshake keys from an intermediate Noise secret. `snow`
-  exposes the handshake hash (public) but not the chaining key, so (b) needs
-  care. Milestone 1 settles this with a working implementation and tests.
+- **Q1 — handshake-level keys. Resolved** in milestone 1: public
+  (obfuscation-only) Handshake keys from the handshake hash after msg1, with
+  msg2 and msg3 at the Handshake level; see section 4.
 - **Q2 — screen state over DATAGRAM vs a stream.** Datagrams keep latest-wins
   semantics (no retransmitting stale screens); size is bounded by the path MTU,
   so large diffs need splitting or a fallback to a stream. To prototype in

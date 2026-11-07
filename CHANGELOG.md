@@ -10,6 +10,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Design proposal for the 0.7 transport** (`docs/design/quic-transport.md`):
   QUIC via `quinn-proto` with the Noise handshake in place of TLS.
+- **`noise-quic` crate** (groundwork for 0.7, not used by the binaries yet):
+  the Noise XX handshake as the crypto layer of `quinn-proto` QUIC
+  connections, with tests.
 
 ### Fixed
 

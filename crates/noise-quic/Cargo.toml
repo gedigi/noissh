@@ -1,0 +1,21 @@
+[package]
+name = "noise-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Noise XX handshake as the crypto layer of quinn-proto QUIC connections"
+
+[dependencies]
+quinn-proto.workspace = true
+bytes.workspace = true
+snow = { workspace = true, features = ["risky-raw-split"] }
+blake2.workspace = true
+chacha20.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+noise-core.workspace = true
+
+[lints]
+workspace = true
