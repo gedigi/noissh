@@ -81,12 +81,14 @@ fn e2e_server_announces_version_in_session() {
     )
     .unwrap();
 
-    // The version rides in the handshake (m2 payload), so it is known the instant
-    // the connection is established — no pumping/waiting needed.
+    // The version is the server's first control message, one round trip
+    // after the handshake (as `noissh` does, wait briefly for it).
     assert_eq!(
-        client.core().server_version(),
+        client
+            .wait_for_server_version(Duration::from_secs(2))
+            .as_deref(),
         Some(env!("CARGO_PKG_VERSION")),
-        "version should be available immediately from the handshake"
+        "the server should announce its version right after the handshake"
     );
     // And wait_for_server_version returns it instantly (the loop never iterates).
     let got = client.wait_for_server_version(Duration::from_secs(3));

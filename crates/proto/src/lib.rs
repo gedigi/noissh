@@ -1,18 +1,16 @@
 #![forbid(unsafe_code)]
-//! Protocol wiring for noissh: handshake driver, control channel, and the
-//! interactive-shell data plane that ties the Noise core, transport, terminal
-//! model, predictive echo, and auth crates together.
+//! Protocol wiring for noissh's session layer: the control channel, the
+//! interactive-shell data plane (terminal model + predictive echo), the file
+//! transfer request, and the authentication decisions.
 //!
-//! This crate is I/O-free: it consumes and produces bytes/frames. The binaries
-//! add UDP sockets and PTYs.
+//! This crate is I/O-free: it consumes and produces bytes/frames. The main
+//! crate carries them over QUIC and adds sockets and PTYs.
 
 pub mod control;
-pub mod handshake;
 pub mod shell;
 pub mod xfer;
 
 pub use control::{ControlError, ControlMsg};
-pub use handshake::{HandshakeError, Handshaker, HsOutcome};
 pub use shell::{ClientShell, ServerShell};
 pub use xfer::XferRequest;
 
@@ -40,66 +38,25 @@ pub fn verify_server(known: &mut KnownHosts, host: &str, server_static: &[u8]) -
 mod tests {
     use super::*;
     use auth::PublicKey;
-    use noise_core::generate_keypair;
-    use transport::random_session_id;
 
-    /// End-to-end handshake + authorization, the way the daemon will run it.
     #[test]
-    fn handshake_then_authorize_known_client() {
-        let client_kp = generate_keypair().unwrap();
-        let server_kp = generate_keypair().unwrap();
-        let sid = random_session_id();
-
-        // Server authorizes this client's public key.
+    fn authorize_accepts_only_listed_keys() {
+        let listed = [7u8; 32];
+        let other = [9u8; 32];
         let mut authorized = AuthorizedKeys::new();
-        authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "laptop");
-
-        let (mut client, p1) = Handshaker::client(&client_kp.private, sid).unwrap();
-        let mut server = Handshaker::server(&server_kp.private, sid, b"test").unwrap();
-
-        let p2 = server.read(body(&p1)).unwrap().reply.unwrap();
-        let p3 = client.read(body(&p2)).unwrap().reply.unwrap();
-        server.read(body(&p3)).unwrap();
-
-        assert!(server.is_finished());
-        // The server authorizes the authenticated client key BEFORE any session.
-        assert!(authorize_client(
-            &authorized,
-            &server.remote_static().unwrap()
-        ));
-
-        // The client pins the server on first contact (TOFU New).
-        let mut known = KnownHosts::new();
-        assert_eq!(
-            verify_server(&mut known, "host:9999", &client.remote_static().unwrap()),
-            Tofu::New
-        );
-        // Reconnect: same key -> Match.
-        assert_eq!(
-            verify_server(&mut known, "host:9999", &client.remote_static().unwrap()),
-            Tofu::Match
-        );
+        authorized.add(PublicKey::from_bytes(&listed).unwrap(), "laptop");
+        assert!(authorize_client(&authorized, &listed));
+        assert!(!authorize_client(&authorized, &other));
+        // A key of the wrong length is never authorized.
+        assert!(!authorize_client(&authorized, &[7u8; 31]));
     }
 
     #[test]
-    fn unauthorized_client_is_rejected() {
-        let client_kp = generate_keypair().unwrap();
-        let server_kp = generate_keypair().unwrap();
-        let sid = random_session_id();
-
-        // authorized_keys does NOT contain this client.
-        let authorized = AuthorizedKeys::new();
-
-        let (mut client, p1) = Handshaker::client(&client_kp.private, sid).unwrap();
-        let mut server = Handshaker::server(&server_kp.private, sid, b"test").unwrap();
-        let p2 = server.read(body(&p1)).unwrap().reply.unwrap();
-        let p3 = client.read(body(&p2)).unwrap().reply.unwrap();
-        server.read(body(&p3)).unwrap();
-
-        assert!(!authorize_client(
-            &authorized,
-            &server.remote_static().unwrap()
-        ));
+    fn tofu_pins_then_matches() {
+        let mut known = KnownHosts::new();
+        let key = [3u8; 32];
+        assert_eq!(verify_server(&mut known, "host:9999", &key), Tofu::New);
+        assert_eq!(verify_server(&mut known, "host:9999", &key), Tofu::Match);
     }
 
     #[test]
@@ -109,12 +66,5 @@ mod tests {
         let attacker = [2u8; 32];
         assert_eq!(verify_server(&mut known, "h", &real), Tofu::New);
         assert_eq!(verify_server(&mut known, "h", &attacker), Tofu::Mismatch);
-    }
-
-    fn body(pkt: &[u8]) -> &[u8] {
-        match transport::parse_packet(pkt).unwrap() {
-            transport::Packet::Handshake { body, .. } => body,
-            _ => panic!("expected handshake packet"),
-        }
     }
 }

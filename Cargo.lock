@@ -408,7 +408,6 @@ dependencies = [
 name = "noise-core"
 version = "0.6.4"
 dependencies = [
- "base64",
  "curve25519-dalek",
  "snow",
  "thiserror",
@@ -434,17 +433,19 @@ version = "0.6.4"
 dependencies = [
  "auth",
  "base64",
+ "bytes",
  "daemonize",
  "nix",
  "noise-core",
+ "noise-quic",
  "predict",
  "proto",
  "pty",
+ "quinn-proto",
  "signal-hook",
  "term",
  "terminal_size",
  "thiserror",
- "transport",
  "wire",
 ]
 
@@ -517,11 +518,9 @@ name = "proto"
 version = "0.6.4"
 dependencies = [
  "auth",
- "noise-core",
  "predict",
  "term",
  "thiserror",
- "transport",
  "wire",
 ]
 
@@ -826,16 +825,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "transport"
-version = "0.6.4"
-dependencies = [
- "getrandom 0.4.3",
- "noise-core",
- "thiserror",
- "wire",
 ]
 
 [[package]]

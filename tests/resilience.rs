@@ -68,7 +68,11 @@ fn run_harness(loss_pct: u64, roam: bool) -> String {
     let mut to_server: Vec<(SocketAddr, Vec<u8>)> = vec![(client_addr, first)];
     let mut to_client: Vec<Vec<u8>> = Vec::new();
 
-    for round in 0..800 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for round in 0.. {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
         // Roam to a new source address partway through.
         if roam && round == 60 {
             client_addr = "203.0.113.9:41000".parse().unwrap();

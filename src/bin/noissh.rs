@@ -738,7 +738,7 @@ fn run() -> Result<(), RuntimeError> {
             "noissh: trusting host key for {label} on first use (pinned in {})",
             kh_path.display()
         );
-        save_known_hosts(&kh_path, client.core().known_hosts())?;
+        save_known_hosts(&kh_path, &client.core().known_hosts())?;
     }
 
     // On a direct interactive connection, learn the standing daemon's version
@@ -782,18 +782,17 @@ fn run() -> Result<(), RuntimeError> {
     }
 }
 
-/// How often to send a keepalive while otherwise idle.
-const KEEPALIVE: Duration = Duration::from_secs(3);
-/// A faster keepalive cadence once the link looks stale, so a recovered network
-/// (Wi-Fi↔cellular handoff, NAT rebind) is detected within about a second.
-const STALE_KEEPALIVE: Duration = Duration::from_secs(1);
-/// Time since last contact after which we treat the link as stale: probe more
-/// often and wake every second so the status counter ticks.
-const STALE_AFTER: Duration = Duration::from_secs(2);
-/// Maximum idle poll wait while stale (keeps the "last contact" counter live).
+/// Longest the loop sleeps when nothing is due (QUIC's own timers — loss
+/// recovery, keep-alive every 3 s, idle timeout — usually wake it sooner).
+const IDLE_POLL: Duration = Duration::from_secs(3);
+/// Time since last contact after which we treat the link as stale: probe the
+/// path every second (so a recovered network — Wi-Fi↔cellular handoff, NAT
+/// rebind — is noticed within about a second, without waiting for QUIC's
+/// backed-off retransmission timer) and wake every second so the status
+/// counter ticks.
+const STALE_AFTER: Duration = Duration::from_secs(4);
+/// Probe interval and maximum poll wait while stale.
 const STALE_POLL: Duration = Duration::from_secs(1);
-/// Poll wakeup while there is unacked data to (re)transmit.
-const ACTIVE_POLL: Duration = Duration::from_millis(40);
 /// How long to probe for a direct (standing-daemon) UDP session before falling
 /// back to the SSH bootstrap — short so the fallback is snappy.
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -830,7 +829,7 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
 
     let mut last_size = terminal_size();
     let mut inbuf = [0u8; 4096];
-    let mut next_keepalive = Instant::now() + KEEPALIVE;
+    let mut next_probe = Instant::now() + STALE_POLL;
     // Last time we heard an authenticated datagram from the server. Drives the
     // status overlay ("last contact N s ago") and the adaptive keepalive below.
     let mut last_contact = Instant::now();
@@ -863,16 +862,14 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
         // event-driven: idle sessions wake only to keepalive, not in a busy loop.
         let since_contact = last_contact.elapsed();
         let stale = since_contact >= STALE_AFTER;
-        let timeout = if client.core().has_outgoing() {
-            ACTIVE_POLL
-        } else {
-            let base = next_keepalive
-                .saturating_duration_since(Instant::now())
-                .min(KEEPALIVE);
-            // When the link looks stale, wake at least once a second so the
-            // "last contact N s ago" counter ticks and we probe more often.
-            if stale { base.min(STALE_POLL) } else { base }
-        };
+        let base = client
+            .core_mut()
+            .timeout()
+            .unwrap_or(IDLE_POLL)
+            .min(IDLE_POLL);
+        // When the link looks stale, wake at least once a second so the
+        // "last contact N s ago" counter ticks and we probe more often.
+        let timeout = if stale { base.min(STALE_POLL) } else { base };
         {
             let sock = client.socket().as_fd();
             let inp = stdin.as_fd();
@@ -885,7 +882,7 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
             for fd in &agent_fds {
                 fds.push(PollFd::new(*fd, PollFlags::POLLIN));
             }
-            let ms: u16 = timeout.as_millis().min(u16::MAX as u128) as u16;
+            let ms = timeout.as_micros().div_ceil(1000).min(u16::MAX as u128) as u16;
             let _ = poll(&mut fds, PollTimeout::from(ms));
         }
 
@@ -927,8 +924,7 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
         if quit {
             // Tell the server we're done (best-effort) so the session tears down
             // promptly, restore the terminal, and exit cleanly.
-            client.core_mut().send_bye();
-            let _ = client.flush();
+            client.say_bye();
             stdout.write_all(b"\x1b[?25h\r\n")?;
             stdout.flush()?;
             drop(_raw);
@@ -945,16 +941,18 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
 
         client.flush()?;
 
-        // Keepalive. Probe faster while the link is stale so recovery (and the
-        // overlay clearing) happens within ~1 s of the network returning.
-        if Instant::now() >= next_keepalive {
+        // Probe while the link is stale so recovery (and the overlay clearing)
+        // happens within ~1 s of the network returning.
+        if stale && Instant::now() >= next_probe {
             client.send_keepalive()?;
-            let interval = if last_contact.elapsed() >= STALE_AFTER {
-                STALE_KEEPALIVE
-            } else {
-                KEEPALIVE
-            };
-            next_keepalive = Instant::now() + interval;
+            next_probe = Instant::now() + STALE_POLL;
+        }
+
+        // The connection is gone (an outage longer than the idle timeout,
+        // sleep, or the server restarted): open a new one. The server hands
+        // the running shell to it; until then the banner keeps counting.
+        if client.core().lost_reason().is_some() && client.core().exit_status().is_none() {
+            client.reconnect()?;
         }
 
         // Render the predicted overlay, with a connection-status banner stamped
@@ -966,6 +964,8 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
         renderer.paint(&overlay, &mut stdout)?;
 
         if let Some(status) = client.core().exit_status() {
+            // Close the connection so the server retires the session at once.
+            client.say_bye();
             stdout.write_all(b"\x1b[?25h\r\n")?;
             stdout.flush()?;
             drop(_raw);

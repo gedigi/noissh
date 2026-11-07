@@ -3,13 +3,16 @@
 //! server, plus configuration/key management.
 //!
 //! The interesting logic lives in socket-free cores ([`server::ServerCore`],
-//! [`client::ClientCore`]) so the resilience harness can drive them through an
-//! in-memory shim that injects loss/reorder and rewrites source addresses.
+//! [`client::ClientCore`]) so tests can drive them through an in-memory shim
+//! that injects loss/reorder and rewrites source addresses. The transport is
+//! QUIC (`quinn-proto`) secured by the Noise handshake (`noise-quic`); see
+//! [`quic`].
 
 pub mod client;
 pub mod config;
 pub mod exec;
 pub mod forward;
+pub mod quic;
 pub mod server;
 pub mod socks;
 pub mod ssh;
@@ -29,10 +32,6 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("encryption error: {0}")]
     Noise(#[from] noise_core::NoiseError),
-    #[error("transport error: {0}")]
-    Transport(#[from] transport::TransportError),
-    #[error("handshake error: {0}")]
-    HandshakeDriver(#[from] proto::HandshakeError),
     #[error("could not parse a key: {0}")]
     Auth(#[from] auth::AuthError),
     #[error(
@@ -64,4 +63,8 @@ pub enum RuntimeError {
     Transfer(String),
     #[error("remote command failed: {0}")]
     Exec(String),
+    #[error("QUIC error: {0}")]
+    Quic(String),
+    #[error("the connection was lost: {0}")]
+    ConnectionLost(String),
 }

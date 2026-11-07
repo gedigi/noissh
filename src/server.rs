@@ -1,55 +1,92 @@
-//! Server runtime: a socket-free [`ServerCore`] (drivable by the resilience
-//! harness) plus a [`Server`] UDP driver used by the `noisshd` binary.
+//! Server runtime: a socket-free [`ServerCore`] (drivable by in-memory tests)
+//! plus a [`Server`] UDP driver used by the `noisshd` binary.
+//!
+//! Each client session is one QUIC connection (`quinn-proto`, Noise handshake
+//! from `noise-quic`). A session's shell outlives its connection for a grace
+//! period, so a client that reconnects (after sleep or a network change QUIC
+//! migration couldn't cover, or a restart) gets the same running shell back.
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use auth::AuthorizedKeys;
+use bytes::BytesMut;
 use noise_core::Keypair;
-use proto::{ControlMsg, Handshaker, ServerShell, authorize_client};
+use proto::{ControlMsg, ServerShell, authorize_client};
 use pty::{LocalLogin, LoginSession, PtyError, PtyHandle, SpawnRequest};
-use transport::{Packet, Session, SessionId, StreamEvent, StreamMux};
+use quinn_proto::{
+    Connection, ConnectionError, ConnectionHandle, DatagramEvent, Endpoint, Event, VarInt,
+};
 use wire::{Frame, StreamKind};
 
 use crate::RuntimeError;
+use crate::quic::{self, Streams};
+pub use crate::quic::{SessionId, StreamEvent};
 
 struct ServerSession {
-    session: Session,
+    /// The session's QUIC connection; `None` once it has fully gone away.
+    conn: Option<(ConnectionHandle, Connection)>,
+    streams: Streams,
+    /// The connection completed its handshake (the client is authenticated).
+    established: bool,
+    /// The connection has been lost or closed.
+    lost: bool,
+    /// The peer closed the connection deliberately (application close).
+    closed_by_peer: bool,
+    /// The authenticated client static key, used to reattach a returning client.
+    client_key: Option<[u8; 32]>,
     shell: Option<ServerShell>,
     pty: Option<PtyHandle>,
     rows: u16,
     cols: u16,
-    /// The authenticated client static key, used to reattach a returning client.
-    client_key: Vec<u8>,
-    /// Ticks since we last received an authenticated packet from this client;
-    /// resets to 0 on activity. Drives detached-session reaping.
-    idle_ticks: u32,
-    /// Set once the shell has exited; carries its status for retransmission.
+    /// Set once the shell has exited (or the client said goodbye).
     exit_status: Option<i32>,
-    /// Ticks elapsed since exit, used to bound Exit retransmission before the
-    /// session is reclaimed.
-    exit_ticks: u32,
-    /// Reliable stream multiplexer (port forwarding etc.) for this session.
-    mux: StreamMux,
-    /// Whether we have sent our [`ControlMsg::ServerVersion`] to this client yet
-    /// (sent once, just after the session is established).
-    version_sent: bool,
+    exit_sent_at: Option<Instant>,
+    /// Last time a datagram arrived on this session's connection.
+    last_heard: Instant,
+    /// When the connection was lost while a shell kept running.
+    detached_at: Option<Instant>,
+    /// Screen-state pacing: the last diff sent and when.
+    diff_sent_seq: u64,
+    diff_sent_at: Instant,
 }
 
-/// How many ticks to keep retransmitting the Exit notice before reclaiming a
-/// finished session (the notice is best-effort; this bounds delivery + memory).
-const EXIT_RETRANSMIT_TICKS: u32 = 50;
+impl ServerSession {
+    fn conn(&mut self) -> Option<&mut Connection> {
+        self.conn.as_mut().map(|(_, c)| c)
+    }
 
-/// Reap a session whose client has been silent for this many ticks (no acks,
-/// no keepalives). A live client sends keepalives well within this window; this
-/// is also the grace during which a vanished client may reattach. At the
-/// server's tick cadence (~tens of ms) this is on the order of minutes.
-const IDLE_REAP_TICKS: u32 = 20_000;
+    fn shell_running(&self) -> bool {
+        self.exit_status.is_none() && self.pty.is_some()
+    }
+}
 
-/// Cap on simultaneously in-flight (incomplete) handshakes, bounding memory
-/// against a flood of fresh session-ids from a spoofed source.
-const MAX_PENDING_HANDSHAKES: usize = 512;
+/// How long a shell outlives a lost connection, waiting for its client to
+/// reconnect.
+pub const DETACH_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// A new connection asking for a shell takes over a running shell of the same
+/// client key once that shell's own connection has been silent this long
+/// (its client is gone: restarted, or moved without telling us). Twice the
+/// client's keep-alive interval plus margin.
+pub const REATTACH_SILENCE: Duration = Duration::from_secs(8);
+
+/// How long to wait, after sending a shell's exit status, for the client to
+/// close the connection before closing it ourselves.
+const EXIT_LINGER: Duration = Duration::from_secs(2);
+
+/// Minimum interval between screen updates (coalesces bursts of output).
+const DIFF_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Cap on sessions (connections in any state), bounding memory and processes
+/// against a flood of handshakes.
+const MAX_SESSIONS: usize = 512;
+
+/// Control-stream backlog above which a large screen diff is held back (a
+/// later, up-to-date diff replaces it).
+const DIFF_BACKLOG: usize = 256 * 1024;
 
 /// The per-user directory under which forwarded agent sockets live. Kept private
 /// to the owning user (mode 0700) so no other local user can reach the sockets.
@@ -63,24 +100,26 @@ fn agent_socket_dir() -> std::path::PathBuf {
 /// directory (created and locked down by the driver at bind time) is what keeps
 /// the socket private; see [`Server::ensure_agent_dir`].
 fn agent_socket_path(sid: SessionId) -> String {
-    let hex: String = sid.iter().map(|b| format!("{b:02x}")).collect();
     agent_socket_dir()
-        .join(format!("agent-{}-{hex}.sock", std::process::id()))
+        .join(format!("agent-{}-{sid:016x}.sock", std::process::id()))
         .to_string_lossy()
         .into_owned()
 }
 
-/// Per-session, socket-free server logic. Consumes raw packets and returns raw
-/// packets to send, so it can be driven directly by an in-memory shim.
+/// Socket-free server logic: consumes datagrams, returns datagrams to send.
 pub struct ServerCore {
-    keypair: Keypair,
-    authorized: AuthorizedKeys,
+    endpoint: Endpoint,
+    crypto: Arc<noise_quic::ServerConfig>,
+    public: Vec<u8>,
     login: Box<dyn LoginSession + Send>,
     command: Option<Vec<String>>,
     user: Option<String>,
-    pending: HashMap<SessionId, Handshaker>,
+    conns: HashMap<ConnectionHandle, SessionId>,
     sessions: HashMap<SessionId, ServerSession>,
+    next_sid: SessionId,
     ever_active: bool,
+    detach_grace: Duration,
+    reattach_silence: Duration,
     /// Stream lifecycle events surfaced to the driver, tagged by session.
     stream_events: Vec<(SessionId, StreamEvent)>,
     /// Remote-forward (`-R`) listen requests surfaced to the driver:
@@ -90,6 +129,8 @@ pub struct ServerCore {
     /// The driver binds a Unix listener at `path`; the spawned shell already has
     /// `SSH_AUTH_SOCK=path` in its environment.
     agent_socket_requests: Vec<(SessionId, String)>,
+    /// Datagrams produced outside `handle_packet`/`tick` results.
+    out: Vec<(SocketAddr, Vec<u8>)>,
 }
 
 impl ServerCore {
@@ -101,19 +142,60 @@ impl ServerCore {
         login: Box<dyn LoginSession + Send>,
         command: Option<Vec<String>>,
     ) -> Self {
+        Self::build(keypair, authorized, login, command, quic::IDLE_TIMEOUT)
+    }
+
+    fn build(
+        keypair: Keypair,
+        authorized: AuthorizedKeys,
+        login: Box<dyn LoginSession + Send>,
+        command: Option<Vec<String>>,
+        idle: Duration,
+    ) -> Self {
+        let private = quic::key32(&keypair.private).unwrap_or([0; 32]);
+        let check: noise_quic::PeerCheck =
+            Arc::new(move |key: &[u8; 32]| authorize_client(&authorized, key));
+        let crypto = Arc::new(noise_quic::ServerConfig::new(private, check));
+        let cfg = Self::server_config(crypto.clone(), idle);
         ServerCore {
-            keypair,
-            authorized,
+            endpoint: Endpoint::new(quic::endpoint_config(), Some(cfg), true, None),
+            crypto,
+            public: keypair.public,
             login,
             command,
             user: None,
-            pending: HashMap::new(),
+            conns: HashMap::new(),
             sessions: HashMap::new(),
+            next_sid: 1,
             ever_active: false,
+            detach_grace: DETACH_GRACE,
+            reattach_silence: REATTACH_SILENCE,
             stream_events: Vec::new(),
             remote_forward_requests: Vec::new(),
             agent_socket_requests: Vec::new(),
+            out: Vec::new(),
         }
+    }
+
+    fn server_config(
+        crypto: Arc<noise_quic::ServerConfig>,
+        idle: Duration,
+    ) -> Arc<quinn_proto::ServerConfig> {
+        let mut cfg =
+            quinn_proto::ServerConfig::new(crypto, Arc::new(noise_quic::TokenKey::random()));
+        cfg.transport_config(quic::transport_config(idle, None));
+        cfg.max_incoming(MAX_SESSIONS);
+        Arc::new(cfg)
+    }
+
+    /// Override the connection idle timeout, the detached-shell grace and the
+    /// reattach silence (tests).
+    pub fn with_timeouts(mut self, idle: Duration, grace: Duration, silence: Duration) -> Self {
+        let cfg = Self::server_config(self.crypto.clone(), idle);
+        self.endpoint.set_server_config(Some(cfg));
+        self.detach_grace = grace;
+        self.reattach_silence = silence;
+        self
     }
 
     /// Set the target user for spawned sessions (privsep backend).
@@ -133,10 +215,10 @@ impl ServerCore {
         self.user.is_some()
     }
 
-    /// One-shot lifecycle: true once a session existed and all sessions have
-    /// since reported their shell's exit.
+    /// One-shot lifecycle: true once a session existed and every session has
+    /// since ended.
     pub fn all_done(&self) -> bool {
-        self.ever_active && self.sessions.values().all(|s| s.exit_status.is_some())
+        self.ever_active && self.sessions.values().all(|s| !s.established)
     }
 
     /// Use the portable local-login backend running the current user's shell.
@@ -150,219 +232,175 @@ impl ServerCore {
         self
     }
 
+    /// Established sessions (connected, or detached with a running shell).
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        self.sessions.values().filter(|s| s.established).count()
     }
 
     /// The server's static public key (for clients to pin).
     pub fn public_key(&self) -> &[u8] {
-        &self.keypair.public
+        &self.public
     }
 
-    /// Handle one inbound datagram from `src`; returns datagrams to send.
+    /// Handle one inbound datagram from `src`; returns datagrams to send (for
+    /// a connection still in its handshake; an established session's events
+    /// and replies are processed by [`ServerCore::tick`]).
     pub fn handle_packet(&mut self, src: SocketAddr, buf: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
-        // Malformed/unauthorized packets are silently dropped.
-        self.try_handle_packet(src, buf).unwrap_or_default()
+        let now = Instant::now();
+        let mut resp = Vec::new();
+        let sid = match self
+            .endpoint
+            .handle(now, src, None, None, BytesMut::from(buf), &mut resp)
+        {
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                if self.sessions.len() >= MAX_SESSIONS {
+                    let t = self.endpoint.refuse(incoming, &mut resp);
+                    self.out.push((t.destination, resp[..t.size].to_vec()));
+                    None
+                } else {
+                    let mut buf = Vec::new();
+                    match self.endpoint.accept(incoming, now, &mut buf, None) {
+                        Ok((ch, conn)) => Some(self.add_session(ch, conn, now)),
+                        Err(e) => {
+                            if let Some(t) = e.response {
+                                self.out.push((t.destination, buf[..t.size].to_vec()));
+                            }
+                            None
+                        }
+                    }
+                }
+            }
+            Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
+                let sid = self.conns.get(&ch).copied();
+                match sid.and_then(|sid| self.sessions.get_mut(&sid)) {
+                    Some(s) => {
+                        if let Some(conn) = s.conn() {
+                            conn.handle_event(ev);
+                        }
+                        s.last_heard = now;
+                        // Established sessions are serviced once per batch of
+                        // datagrams, in `tick`; handshakes answer at once.
+                        if s.established { None } else { sid }
+                    }
+                    None => None,
+                }
+            }
+            Some(DatagramEvent::Response(t)) => {
+                self.out.push((t.destination, resp[..t.size].to_vec()));
+                None
+            }
+            None => None,
+        };
+        if let Some(sid) = sid {
+            self.service(sid, now);
+        }
+        std::mem::take(&mut self.out)
     }
 
-    fn try_handle_packet(
-        &mut self,
-        src: SocketAddr,
-        buf: &[u8],
-    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, RuntimeError> {
-        match transport::parse_packet(buf)? {
-            Packet::Handshake { session_id, body } => self.handle_handshake(src, session_id, body),
-            Packet::Transport { session_id, .. } => self.handle_transport(src, session_id, buf),
-        }
-    }
-
-    fn handle_handshake(
-        &mut self,
-        src: SocketAddr,
-        sid: SessionId,
-        body: &[u8],
-    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, RuntimeError> {
-        if self.sessions.contains_key(&sid) {
-            return Ok(Vec::new()); // already established
-        }
-        let (mut hs, was_pending) = match self.pending.remove(&sid) {
-            Some(hs) => (hs, true),
-            None => {
-                // Anti-amplification: a brand-new init must be padded to the
-                // floor. Refuse smaller ones so a spoofed small datagram can't
-                // reflect the larger handshake reply (and can't cheaply create
-                // state). `body` is the datagram minus the 9-byte packet header.
-                if body.len() + 9 < transport::MIN_HANDSHAKE_INIT {
-                    return Ok(Vec::new());
-                }
-                // New handshake: refuse if we're already tracking too many, to
-                // bound memory against a session-id flood.
-                if self.pending.len() >= MAX_PENDING_HANDSHAKES {
-                    return Ok(Vec::new());
-                }
-                // Carry our version in the handshake so a direct client learns
-                // it immediately (the in-session ControlMsg::ServerVersion below
-                // remains as a fallback for pre-handshake-signalling clients).
-                (
-                    Handshaker::server(
-                        &self.keypair.private,
-                        sid,
-                        env!("CARGO_PKG_VERSION").as_bytes(),
-                    )?,
-                    false,
-                )
-            }
-        };
-        // A failed read must NOT consume EXISTING pending state: the session id
-        // is plaintext, so otherwise anyone could kill an in-flight handshake by
-        // injecting one garbage packet with that id. Restore it and drop the
-        // bogus packet. (A freshly-created handshaker that fails its first read
-        // is just discarded — re-inserting it would only waste a slot.)
-        let outcome = match hs.read(body) {
-            Ok(o) => o,
-            Err(_) => {
-                if was_pending {
-                    self.pending.insert(sid, hs);
-                }
-                return Ok(Vec::new());
-            }
-        };
-        let mut out = Vec::new();
-        if let Some(reply) = outcome.reply {
-            out.push((src, reply));
-        }
-        if outcome.finished {
-            // Authorize the authenticated client key BEFORE any session/pty work.
-            let client_static = hs.remote_static().ok_or(RuntimeError::Handshake)?;
-            if !authorize_client(&self.authorized, &client_static) {
-                return Ok(out); // reject: no session created
-            }
-            let session = hs.into_session(Some(src))?;
-
-            // Reattach: if this client key already has a live session (its
-            // previous connection went silent but the shell is still running),
-            // move that running shell/pty onto the new transport session and
-            // resend the screen as a full snapshot.
-            // Only reattach to a session that actually has a running shell/pty;
-            // never steal another still-establishing session for the same key.
-            let existing = self.sessions.iter().find_map(|(k, s)| {
-                (s.client_key == client_static
-                    && s.exit_status.is_none()
-                    && (s.shell.is_some() || s.pty.is_some()))
-                .then_some(*k)
-            });
-
-            let mut new_sess = ServerSession {
-                session,
+    fn add_session(&mut self, ch: ConnectionHandle, conn: Connection, now: Instant) -> SessionId {
+        let sid = self.next_sid;
+        self.next_sid += 1;
+        self.conns.insert(ch, sid);
+        self.sessions.insert(
+            sid,
+            ServerSession {
+                conn: Some((ch, conn)),
+                streams: Streams::new(true),
+                established: false,
+                lost: false,
+                closed_by_peer: false,
+                client_key: None,
                 shell: None,
                 pty: None,
                 rows: 24,
                 cols: 80,
-                client_key: client_static,
-                idle_ticks: 0,
                 exit_status: None,
-                exit_ticks: 0,
-                mux: StreamMux::new(false),
-                version_sent: false,
-            };
-            if let Some(old_sid) = existing
-                && let Some(mut old) = self.sessions.remove(&old_sid)
-            {
-                if let Some(shell) = &mut old.shell {
-                    shell.rebind_to_new_client();
-                }
-                new_sess.shell = old.shell.take();
-                new_sess.pty = old.pty.take();
-                new_sess.rows = old.rows;
-                new_sess.cols = old.cols;
-            }
-            self.sessions.insert(sid, new_sess);
-            self.ever_active = true;
-        } else {
-            self.pending.insert(sid, hs);
-        }
-        Ok(out)
+                exit_sent_at: None,
+                last_heard: now,
+                detached_at: None,
+                diff_sent_seq: 0,
+                diff_sent_at: now,
+            },
+        );
+        sid
     }
 
-    fn handle_transport(
-        &mut self,
-        src: SocketAddr,
-        sid: SessionId,
-        buf: &[u8],
-    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, RuntimeError> {
-        // Decrypt + decode while borrowing the session, then release the borrow
-        // so per-frame handlers (e.g. OpenShell) can mutate the session map.
-        let frames = {
-            let Some(sess) = self.sessions.get_mut(&sid) else {
-                return Ok(Vec::new());
-            };
-            let frames = sess.session.open(src, buf)?; // roaming: peer_addr now = src
-            sess.idle_ticks = 0; // authenticated activity resets the idle timer
-            frames
-        };
-        let mut reply_frames: Vec<Frame> = Vec::new();
-        for frame in frames {
-            match frame {
-                Frame::Input { offset, data } => {
-                    if let Some(sess) = self.sessions.get_mut(&sid)
-                        && let Some(shell) = &mut sess.shell
-                    {
-                        let (fresh, ack) = shell.ingest_input(offset, &data);
-                        if let Some(pty) = &sess.pty {
-                            let _ = pty.write(&fresh);
-                        }
-                        reply_frames.push(ack);
-                    }
-                }
-                Frame::Ack { seq } => {
-                    if let Some(sess) = self.sessions.get_mut(&sid)
-                        && let Some(shell) = &mut sess.shell
-                    {
-                        shell.on_state_ack(seq);
-                    }
-                }
-                Frame::Control { data } => {
-                    if let Ok(msg) = ControlMsg::decode(&data) {
-                        self.handle_control(sid, msg);
-                    }
-                }
-                Frame::Ping { stamp } => reply_frames.push(Frame::Pong { stamp }),
-                f @ (Frame::StreamOpen { .. }
-                | Frame::StreamData { .. }
-                | Frame::StreamAck { .. }
-                | Frame::StreamClose { .. }
-                | Frame::StreamReset { .. }) => {
-                    if let Some(sess) = self.sessions.get_mut(&sid) {
-                        sess.mux.on_frame(f);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let evs = self
-            .sessions
-            .get_mut(&sid)
-            .map(|sess| sess.mux.take_events())
-            .unwrap_or_default();
-        for ev in evs {
-            self.stream_events.push((sid, ev));
-        }
-        let mut out = Vec::new();
-        if !reply_frames.is_empty()
-            && let Some(sess) = self.sessions.get_mut(&sid)
-            && let Some(addr) = sess.session.peer_addr()
+    /// Process a session's connection events and received frames, then queue
+    /// its outgoing datagrams.
+    fn service(&mut self, sid: SessionId, now: Instant) {
+        let mut frames = Vec::new();
         {
-            for pkt in sess
-                .session
-                .seal_many(&reply_frames, transport::MAX_DATAGRAM_PLAINTEXT)?
-            {
-                out.push((addr, pkt));
+            let Some(s) = self.sessions.get_mut(&sid) else {
+                return;
+            };
+            let Some((ch, conn)) = s.conn.as_mut() else {
+                return;
+            };
+            while let Some(ev) = conn.poll_endpoint_events() {
+                if let Some(cev) = self.endpoint.handle_event(*ch, ev) {
+                    conn.handle_event(cev);
+                }
+            }
+            while let Some(ev) = conn.poll() {
+                match ev {
+                    Event::Connected => {
+                        s.established = true;
+                        s.client_key = quic::peer_key(conn);
+                        self.ever_active = true;
+                        let v = ControlMsg::ServerVersion(env!("CARGO_PKG_VERSION").to_string());
+                        s.streams
+                            .send_frame(conn, &Frame::Control { data: v.encode() });
+                    }
+                    Event::ConnectionLost { reason } => {
+                        s.lost = true;
+                        s.closed_by_peer = matches!(reason, ConnectionError::ApplicationClosed(_));
+                        s.streams.fail_all();
+                    }
+                    Event::Stream(se) => s.streams.on_event(conn, se),
+                    Event::DatagramReceived => s.streams.read_datagrams(conn),
+                    _ => {}
+                }
+            }
+            frames.extend(s.streams.take_frames());
+            for ev in s.streams.take_events() {
+                self.stream_events.push((sid, ev));
             }
         }
-        Ok(out)
+        for f in frames {
+            self.handle_frame(sid, f, now);
+        }
+        if let Some(s) = self.sessions.get_mut(&sid)
+            && let Some((_, conn)) = s.conn.as_mut()
+        {
+            s.streams.flush(conn);
+            self.out.extend(quic::drain_transmits(conn, now));
+        }
     }
 
-    fn handle_control(&mut self, sid: SessionId, msg: ControlMsg) {
+    fn handle_frame(&mut self, sid: SessionId, frame: Frame, now: Instant) {
+        match frame {
+            Frame::Input { data, .. } => {
+                if let Some(s) = self.sessions.get(&sid)
+                    && let Some(pty) = &s.pty
+                {
+                    let _ = pty.write(&data);
+                }
+            }
+            Frame::Ack { seq } => {
+                if let Some(shell) = self.sessions.get_mut(&sid).and_then(|s| s.shell.as_mut()) {
+                    shell.on_state_ack(seq);
+                }
+            }
+            Frame::Control { data } => {
+                if let Ok(msg) = ControlMsg::decode(&data) {
+                    self.handle_control(sid, msg, now);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_control(&mut self, sid: SessionId, msg: ControlMsg, now: Instant) {
         match msg {
             ControlMsg::OpenShell {
                 cols,
@@ -370,18 +408,54 @@ impl ServerCore {
                 term,
                 agent,
             } => {
-                let Some(sess) = self.sessions.get_mut(&sid) else {
+                let Some(s) = self.sessions.get(&sid) else {
                     return;
                 };
-                if sess.pty.is_some() {
+                if s.pty.is_some() {
                     return; // already open
+                }
+                let key = s.client_key;
+                // Reattach: a running shell of the same client whose connection
+                // is gone (or silent long enough that its client must be).
+                let silence = self.reattach_silence;
+                let old = self.sessions.iter().find_map(|(k, o)| {
+                    (*k != sid
+                        && key.is_some()
+                        && o.client_key == key
+                        && o.shell_running()
+                        && (o.lost || now.duration_since(o.last_heard) >= silence))
+                        .then_some(*k)
+                });
+                if let Some(old_sid) = old
+                    && let Some(mut o) = self.sessions.remove(&old_sid)
+                {
+                    if let Some((ch, conn)) = o.conn.as_mut() {
+                        conn.close(now, VarInt::from_u32(1), "reattached elsewhere".into());
+                        self.out.extend(quic::drain_transmits(conn, now));
+                        self.conns.remove(ch);
+                    }
+                    let Some(s) = self.sessions.get_mut(&sid) else {
+                        return;
+                    };
+                    if let Some(shell) = &mut o.shell {
+                        shell.rebind_to_new_client();
+                        shell.resize(rows as usize, cols as usize);
+                    }
+                    if let Some(pty) = &o.pty {
+                        let _ = pty.set_winsize(rows, cols);
+                    }
+                    s.shell = o.shell.take();
+                    s.pty = o.pty.take();
+                    s.rows = rows;
+                    s.cols = cols;
+                    s.diff_sent_seq = 0;
+                    return;
                 }
                 // Agent forwarding: expose a Unix socket and point SSH_AUTH_SOCK
                 // at it. The driver binds the actual listener (I/O); connections
                 // to it are tunnelled back to the client's local agent. Refused
                 // under privsep: the driver (not the dropped shell user) would
-                // own the socket and accept its connections. (`self.user` field
-                // access avoids borrowing all of `self` while `sess` is held.)
+                // own the socket and accept its connections.
                 let mut env = Vec::new();
                 let agent_path = if agent && self.user.is_none() {
                     let path = agent_socket_path(sid);
@@ -398,27 +472,29 @@ impl ServerCore {
                     rows,
                     cols,
                 };
-                if let Ok(handle) = self.login.spawn(&req) {
+                if let Ok(handle) = self.login.spawn(&req)
+                    && let Some(s) = self.sessions.get_mut(&sid)
+                {
                     let _ = handle.set_nonblocking(true);
-                    sess.rows = rows;
-                    sess.cols = cols;
-                    sess.shell = Some(ServerShell::new(rows as usize, cols as usize));
-                    sess.pty = Some(handle);
+                    s.rows = rows;
+                    s.cols = cols;
+                    s.shell = Some(ServerShell::new(rows as usize, cols as usize));
+                    s.pty = Some(handle);
                     if let Some(path) = agent_path {
                         self.agent_socket_requests.push((sid, path));
                     }
                 }
             }
             ControlMsg::Resize { cols, rows } => {
-                let Some(sess) = self.sessions.get_mut(&sid) else {
+                let Some(s) = self.sessions.get_mut(&sid) else {
                     return;
                 };
-                sess.rows = rows;
-                sess.cols = cols;
-                if let Some(pty) = &sess.pty {
+                s.rows = rows;
+                s.cols = cols;
+                if let Some(pty) = &s.pty {
                     let _ = pty.set_winsize(rows, cols);
                 }
-                if let Some(shell) = &mut sess.shell {
+                if let Some(shell) = &mut s.shell {
                     shell.resize(rows as usize, cols as usize);
                 }
             }
@@ -426,132 +502,210 @@ impl ServerCore {
                 self.remote_forward_requests.push((sid, bind_port, target));
             }
             ControlMsg::Bye => {
-                // The client is done: mark the session finished so it is reclaimed
-                // promptly (and a one-shot server exits) instead of waiting out
-                // the idle-reap grace.
-                if let Some(sess) = self.sessions.get_mut(&sid) {
-                    sess.exit_status.get_or_insert(0);
-                    sess.exit_ticks = 0;
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    s.exit_status.get_or_insert(0);
                 }
             }
             _ => {}
         }
     }
 
-    /// Pump PTYs into the emulators and emit state diffs / exit notices.
+    /// Pump PTYs into the emulators, send screen updates and exit notices, run
+    /// connection timers, and retire finished sessions.
     pub fn tick(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut finished: Vec<SessionId> = Vec::new();
-        let mut events_buf: Vec<(SessionId, StreamEvent)> = Vec::new();
+        let now = Instant::now();
         let sids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        let mut finished = Vec::new();
         for sid in sids {
-            let Some(sess) = self.sessions.get_mut(&sid) else {
+            let Some(s) = self.sessions.get_mut(&sid) else {
                 continue;
             };
-            // Reap a session whose client has been silent past the grace window
-            // (detached and never reattached). Killing the PTY here lets the
-            // child exit; the exit path below then retires the session.
-            sess.idle_ticks = sess.idle_ticks.saturating_add(1);
-            if sess.idle_ticks >= IDLE_REAP_TICKS && sess.exit_status.is_none() {
-                if let Some(pty) = &mut sess.pty {
-                    let _ = pty.kill();
-                }
-                finished.push(sid);
-                continue;
-            }
-            // Announce our version once, so a directly-connected client can offer
-            // to upgrade an outdated standing daemon (the bootstrap learns the
-            // version from the connect line; this is the equivalent over the
-            // session). Best-effort: if the seal fails it is retried next tick.
-            if !sess.version_sent
-                && let Some(addr) = sess.session.peer_addr()
-                && let Ok(pkt) = sess.session.seal(&[Frame::Control {
-                    data: ControlMsg::ServerVersion(env!("CARGO_PKG_VERSION").to_string()).encode(),
-                }])
+            if let Some(conn) = s.conn()
+                && conn.poll_timeout().is_some_and(|t| t <= now)
             {
-                out.push((addr, pkt));
-                sess.version_sent = true;
+                conn.handle_timeout(now);
             }
-            // Drain available PTY output.
-            if let Some(pty) = &mut sess.pty {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match pty.read(&mut buf) {
-                        Ok(0) => break, // EOF (child closed the pty)
-                        Ok(n) => {
-                            if let Some(shell) = &mut sess.shell {
-                                shell.feed_output(&buf[..n]);
-                                // Answer terminal queries (DSR/DA) the shell sent
-                                // by writing the replies straight back to its
-                                // input, so a line editor doesn't stall its first
-                                // prompt waiting for a response.
-                                let reply = shell.take_responses();
-                                if !reply.is_empty() {
-                                    let _ = pty.write(&reply);
-                                }
-                            }
+            Self::pump_pty(s);
+            // Detect child exit: record the status and release the PTY.
+            if s.exit_status.is_none()
+                && let Some(pty) = &mut s.pty
+                && let Ok(Some(status)) = pty.try_wait()
+            {
+                // Drain whatever the shell printed last.
+                Self::pump_pty(s);
+                s.exit_status = Some(status);
+                s.pty = None;
+            }
+            if !s.lost && s.streams.has_control() {
+                Self::send_screen(s, now);
+                if let Some(status) = s.exit_status
+                    && let Some((_, conn)) = s.conn.as_mut()
+                {
+                    match s.exit_sent_at {
+                        None => {
+                            let msg = ControlMsg::Exit { status };
+                            s.streams
+                                .send_frame(conn, &Frame::Control { data: msg.encode() });
+                            s.exit_sent_at = Some(now);
                         }
-                        Err(PtyError::WouldBlock) => break, // no data ready now
-                        Err(_) => break,
+                        Some(t) if now.duration_since(t) >= EXIT_LINGER => {
+                            conn.close(now, VarInt::from_u32(0), "exit".into());
+                        }
+                        Some(_) => {}
                     }
                 }
             }
-            // Emit a state diff if the client is behind.
-            let addr = sess.session.peer_addr();
-            if let (Some(shell), Some(addr)) = (sess.shell.as_mut(), addr)
-                && let Some(diff) = shell.poll_diff()
-                && let Ok(pkt) = sess.session.seal(&[diff])
+            if let Some((ch, conn)) = s.conn.as_mut()
+                && conn.is_drained()
             {
-                out.push((addr, pkt));
+                self.conns.remove(ch);
+                s.conn = None;
+                s.lost = true;
             }
-            // Emit reliable-stream frames (port forwarding) and surface events.
-            let stream_frames = sess.mux.poll_transmit();
-            for ev in sess.mux.take_events() {
-                events_buf.push((sid, ev));
-            }
-            if !stream_frames.is_empty()
-                && let Some(addr) = sess.session.peer_addr()
-                && let Ok(pkts) = sess
-                    .session
-                    .seal_many(&stream_frames, transport::MAX_DATAGRAM_PLAINTEXT)
-            {
-                for pkt in pkts {
-                    out.push((addr, pkt));
+            // Once the connection is gone, keep a running shell for the grace
+            // period (unless the client said goodbye); otherwise stop it, and
+            // retire the session when the connection has drained.
+            if s.lost {
+                let keep = s.shell_running() && !s.closed_by_peer && s.established;
+                if keep {
+                    let since = *s.detached_at.get_or_insert(now);
+                    if now.duration_since(since) < self.detach_grace {
+                        continue;
+                    }
                 }
-            }
-            // Detect child exit: record the status and release the PTY.
-            if sess.exit_status.is_none()
-                && let Some(pty) = &mut sess.pty
-                && let Ok(Some(status)) = pty.try_wait()
-            {
-                sess.exit_status = Some(status);
-                sess.pty = None;
-            }
-            // While exited, retransmit the Exit notice for a bounded number of
-            // ticks, then reclaim the session.
-            if let Some(status) = sess.exit_status {
-                if let Some(addr) = sess.session.peer_addr()
-                    && let Ok(pkt) = sess.session.seal(&[Frame::Control {
-                        data: ControlMsg::Exit { status }.encode(),
-                    }])
-                {
-                    out.push((addr, pkt));
+                if let Some(pty) = &mut s.pty {
+                    let _ = pty.kill();
                 }
-                sess.exit_ticks += 1;
-                if sess.exit_ticks >= EXIT_RETRANSMIT_TICKS {
+                s.pty = None;
+                if s.conn.is_none() {
                     finished.push(sid);
                 }
             }
         }
-        // Reclaim fully-finished sessions so memory does not grow without bound.
+        for sid in self.sessions.keys().copied().collect::<Vec<_>>() {
+            self.service(sid, now);
+        }
         for sid in finished {
             self.sessions.remove(&sid);
         }
-        self.stream_events.append(&mut events_buf);
-        out
+        std::mem::take(&mut self.out)
     }
 
-    // --- reliable streams (port forwarding) ---
+    fn pump_pty(s: &mut ServerSession) {
+        let Some(pty) = &mut s.pty else {
+            return;
+        };
+        let mut buf = [0u8; 16384];
+        loop {
+            match pty.read(&mut buf) {
+                Ok(0) => break, // EOF (child closed the pty)
+                Ok(n) => {
+                    if let Some(shell) = &mut s.shell {
+                        shell.feed_output(&buf[..n]);
+                        // Answer terminal queries (DSR/DA) the shell sent by
+                        // writing the replies straight back to its input, so a
+                        // line editor doesn't stall its first prompt.
+                        let reply = shell.take_responses();
+                        if !reply.is_empty() {
+                            let _ = pty.write(&reply);
+                        }
+                    }
+                }
+                Err(PtyError::WouldBlock) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Send the client the screen state it lacks: a new diff once the screen
+    /// changed (at most every [`DIFF_INTERVAL`]), else a resend of the
+    /// unacknowledged one after a retransmission timeout.
+    fn send_screen(s: &mut ServerSession, now: Instant) {
+        let Some((_, conn)) = s.conn.as_mut() else {
+            return;
+        };
+        let Some(shell) = s.shell.as_mut() else {
+            return;
+        };
+        if now.duration_since(s.diff_sent_at) < DIFF_INTERVAL {
+            return;
+        }
+        let rto = (conn.rtt() * 3 / 2 + Duration::from_millis(10)).max(Duration::from_millis(30));
+        let changed = shell.has_new_output();
+        if !changed && (!shell.unacked() || now.duration_since(s.diff_sent_at) < rto) {
+            return;
+        }
+        if s.streams.control_backlog() > DIFF_BACKLOG {
+            return;
+        }
+        if let Some(diff) = shell.poll_diff() {
+            if let Frame::StateDiff { seq, .. } = &diff {
+                s.diff_sent_seq = *seq;
+            }
+            s.streams.send_datagram(conn, &diff);
+            s.diff_sent_at = now;
+        }
+    }
+
+    /// When the driver should call [`ServerCore::tick`] next, at the latest.
+    pub fn next_wakeup(&mut self) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        let mut take = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        for s in self.sessions.values_mut() {
+            if let Some(conn) = s.conn()
+                && let Some(t) = conn.poll_timeout()
+            {
+                take(t);
+            }
+            if let (Some(shell), Some((_, conn))) = (s.shell.as_ref(), s.conn.as_ref()) {
+                if shell.has_new_output() {
+                    take(s.diff_sent_at + DIFF_INTERVAL);
+                } else if shell.unacked() {
+                    take(s.diff_sent_at + conn.rtt() * 3 / 2 + Duration::from_millis(30));
+                }
+            }
+            if s.pty.is_some() && s.exit_status.is_none() {
+                // Child exit has no fd to wait on.
+                take(Instant::now() + Duration::from_millis(250));
+            }
+            if let Some(t) = s.exit_sent_at {
+                take(t + EXIT_LINGER);
+            }
+            if let Some(t) = s.detached_at {
+                take(t + self.detach_grace);
+            }
+        }
+        next
+    }
+
+    /// PTY descriptors to wait on for shell output.
+    pub fn poll_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        self.sessions
+            .values()
+            .filter_map(|s| s.pty.as_ref().map(|p| p.as_fd()))
+            .collect()
+    }
+
+    // --- streams ---
+
+    fn with_stream<R>(
+        &mut self,
+        sid: SessionId,
+        f: impl FnOnce(&mut Streams, Option<&mut Connection>) -> R,
+    ) -> Option<R> {
+        let s = self.sessions.get_mut(&sid)?;
+        let conn = if s.lost {
+            None
+        } else {
+            s.conn.as_mut().map(|(_, c)| c)
+        };
+        let r = f(&mut s.streams, conn);
+        // Surface events the call produced (e.g. a read reaching FIN).
+        for ev in s.streams.take_events() {
+            self.stream_events.push((sid, ev));
+        }
+        Some(r)
+    }
 
     /// Drain stream lifecycle events (tagged by session).
     pub fn take_stream_events(&mut self) -> Vec<(SessionId, StreamEvent)> {
@@ -572,82 +726,74 @@ impl ServerCore {
 
     /// Open an agent-forwarding stream from the server side; returns its id.
     pub fn open_agent(&mut self, sid: SessionId) -> Option<u64> {
-        self.sessions
-            .get_mut(&sid)
-            .map(|s| s.mux.open(StreamKind::Agent, Vec::new()))
+        self.with_stream(sid, |st, c| st.open(c, StreamKind::Agent, &[]))
     }
 
     /// Open an exec stream from the server side (used for a command's stderr);
     /// returns its id.
     pub fn open_exec(&mut self, sid: SessionId) -> Option<u64> {
-        self.sessions
-            .get_mut(&sid)
-            .map(|s| s.mux.open(StreamKind::Exec, Vec::new()))
+        self.with_stream(sid, |st, c| st.open(c, StreamKind::Exec, &[]))
     }
 
-    /// Close our send half of a stream with an explicit status (exec exit code).
+    /// Report an exec's exit code (on the control stream), then finish its
+    /// stdout stream.
     pub fn stream_close_status(&mut self, sid: SessionId, id: u64, status: i32) {
-        if let Some(s) = self.sessions.get_mut(&sid) {
-            s.mux.close(id, status);
-        }
+        self.with_stream(sid, |st, c| {
+            if let Some(c) = c {
+                let msg = ControlMsg::ExecExit { id, status };
+                st.send_frame(c, &Frame::Control { data: msg.encode() });
+                st.close(Some(c), id);
+            }
+        });
     }
 
-    /// Read available contiguous bytes from a stream within a session.
+    /// Read available bytes from a stream within a session.
     pub fn stream_read(&mut self, sid: SessionId, id: u64) -> Vec<u8> {
-        self.sessions
-            .get_mut(&sid)
-            .map(|s| s.mux.read(id))
+        self.with_stream(sid, |st, c| st.read(c, id))
             .unwrap_or_default()
     }
 
     /// Queue bytes to send on a stream within a session.
     pub fn stream_write(&mut self, sid: SessionId, id: u64, data: &[u8]) {
-        if let Some(s) = self.sessions.get_mut(&sid) {
-            s.mux.write(id, data);
-        }
+        self.with_stream(sid, |st, c| st.write(c, id, data));
     }
 
     /// Close our send half of a stream within a session.
     pub fn stream_close(&mut self, sid: SessionId, id: u64) {
-        if let Some(s) = self.sessions.get_mut(&sid) {
-            s.mux.close(id, 0);
-        }
+        self.with_stream(sid, |st, c| st.close(c, id));
     }
 
     /// Abort a stream within a session (signals failure to the peer).
     pub fn stream_reset(&mut self, sid: SessionId, id: u64) {
-        if let Some(s) = self.sessions.get_mut(&sid) {
-            s.mux.reset(id);
-        }
+        self.with_stream(sid, |st, c| st.reset(c, id));
     }
 
     /// Open a forward stream from the server side (used by remote `-R`
     /// forwarding); returns the new stream id.
     pub fn open_forward(&mut self, sid: SessionId, target: &str) -> Option<u64> {
-        self.sessions
-            .get_mut(&sid)
-            .map(|s| s.mux.open(StreamKind::Forward, target.as_bytes().to_vec()))
+        self.with_stream(sid, |st, c| {
+            st.open(c, StreamKind::Forward, target.as_bytes())
+        })
     }
 
-    /// Whether a session still exists (for the driver to prune `-R` listeners).
+    /// Whether a session's connection is still up (for the driver to prune
+    /// listeners and connections tied to it).
     pub fn has_session(&self, sid: SessionId) -> bool {
-        self.sessions.contains_key(&sid)
+        self.sessions.get(&sid).is_some_and(|s| !s.lost)
     }
 
-    /// Bytes written to a stream but not yet acked (driver backpressure).
+    /// Bytes written to a stream but not yet taken by QUIC (backpressure).
     pub fn stream_in_flight(&self, sid: SessionId, id: u64) -> u64 {
         self.sessions
             .get(&sid)
-            .map(|s| s.mux.in_flight(id))
-            .unwrap_or(0)
+            .map_or(0, |s| s.streams.in_flight(id))
     }
 
     /// True once the peer closed its send half and we've read every byte.
     pub fn stream_recv_finished(&self, sid: SessionId, id: u64) -> bool {
         self.sessions
             .get(&sid)
-            .map(|s| s.mux.is_recv_finished(id))
-            .unwrap_or(true)
+            .is_none_or(|s| s.streams.recv_finished(id))
     }
 }
 
@@ -674,7 +820,12 @@ pub struct Server {
         HashMap<(SessionId, u64), crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
     /// Running remote commands, keyed by (session, stdin/stdout stream id).
     execs: HashMap<(SessionId, u64), ExecState>,
+    /// Receive buffer, reused for every datagram.
+    rbuf: Vec<u8>,
 }
+
+/// Per-stream cap on bytes queued for QUIC but not yet taken by it.
+const SEND_CAP: u64 = 1024 * 1024;
 
 /// Server side of a file transfer: writing an upload, or reading a download.
 enum XferState {
@@ -692,7 +843,7 @@ struct ExecState {
 impl Server {
     pub fn bind(addr: SocketAddr, core: ServerCore) -> Result<Self, RuntimeError> {
         let socket = UdpSocket::bind(addr)?;
-        socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+        socket.set_nonblocking(true)?;
         Ok(Server {
             core,
             socket,
@@ -702,6 +853,7 @@ impl Server {
             agent_listeners: Vec::new(),
             agent_conns: HashMap::new(),
             execs: HashMap::new(),
+            rbuf: vec![0u8; 65536],
         })
     }
 
@@ -868,7 +1020,7 @@ impl Server {
                         Some(conn) => {
                             self.forwards.insert((sid, id), conn);
                         }
-                        None => self.core.stream_close(sid, id), // unreachable target
+                        None => self.core.stream_reset(sid, id), // unreachable target
                     }
                 }
                 StreamEvent::Opened {
@@ -939,7 +1091,7 @@ impl Server {
                 }
                 // Draining happens in the bounded pump loop below.
                 StreamEvent::Readable { .. } => {}
-                StreamEvent::Closed { id, .. } => {
+                StreamEvent::Closed { id } => {
                     if let Some(c) = self.forwards.get_mut(&(sid, id)) {
                         c.mark_peer_closed();
                     }
@@ -955,6 +1107,8 @@ impl Server {
                     // event can precede the final data segments).
                 }
                 StreamEvent::Reset { id } => {
+                    // Forget the stream (the peer already aborted it).
+                    self.core.stream_reset(sid, id);
                     self.forwards.remove(&(sid, id));
                     self.xfers.remove(&(sid, id));
                     self.agent_conns.remove(&(sid, id));
@@ -967,7 +1121,6 @@ impl Server {
             }
         }
         // Pump both directions, with caps, propagate half-close, reap.
-        const SEND_CAP: u64 = 512 * 1024;
         // Drop forwards/xfers whose session has gone away (e.g. idle-reaped or
         // replaced by a reattach): otherwise their TCP fds / file handles leak,
         // and an interrupted upload would be wrongly finalized as complete.
@@ -994,12 +1147,13 @@ impl Server {
                     }
                     c.queue_to_tcp(&d);
                 }
-                // TCP → session, bounded by unacked in-flight bytes.
-                if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
+                // TCP → session, bounded by bytes QUIC hasn't taken yet.
+                while self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
                     let d = c.read_tcp();
-                    if !d.is_empty() {
-                        self.core.stream_write(k.0, k.1, &d);
+                    if d.is_empty() {
+                        break;
                     }
+                    self.core.stream_write(k.0, k.1, &d);
                 }
                 if c.needs_fin() {
                     self.core.stream_close(k.0, k.1);
@@ -1036,7 +1190,7 @@ impl Server {
                     // written; or aborted on a write error.
                     abort || self.core.stream_recv_finished(k.0, k.1)
                 }
-                Some(XferState::Get(src)) if get_has_window => match src.read_chunk(64 * 1024) {
+                Some(XferState::Get(src)) if get_has_window => match src.read_chunk(256 * 1024) {
                     Ok(d) if !d.is_empty() => {
                         self.core.stream_write(k.0, k.1, &d);
                         false
@@ -1093,11 +1247,12 @@ impl Server {
                     }
                     c.queue_to_tcp(&d);
                 }
-                if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
+                while self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
                     let d = c.read_tcp();
-                    if !d.is_empty() {
-                        self.core.stream_write(k.0, k.1, &d);
+                    if d.is_empty() {
+                        break;
                     }
+                    self.core.stream_write(k.0, k.1, &d);
                 }
                 if c.needs_fin() {
                     self.core.stream_close(k.0, k.1);
@@ -1165,27 +1320,108 @@ impl Server {
         Ok(self.socket.local_addr()?)
     }
 
+    /// Wait until the socket, a shell, a forwarded connection or a timer
+    /// needs attention (at most `max`).
+    fn wait(&mut self, max: Duration) {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd;
+
+        let deadline = self.core.next_wakeup();
+        let mut timeout = deadline.map_or(max, |t| {
+            t.saturating_duration_since(Instant::now()).min(max)
+        });
+        // A running command's exit has no descriptor to wait on.
+        if !self.execs.is_empty() {
+            timeout = timeout.min(Duration::from_millis(20));
+        }
+        let mut fds = vec![PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
+        for fd in self.core.poll_fds() {
+            fds.push(PollFd::new(fd, PollFlags::POLLIN));
+        }
+        let io = |c_in: bool, wants_write: bool| {
+            let mut f = PollFlags::empty();
+            if c_in {
+                f |= PollFlags::POLLIN;
+            }
+            if wants_write {
+                f |= PollFlags::POLLOUT;
+            }
+            f
+        };
+        for (k, c) in &self.forwards {
+            let f = io(
+                self.core.stream_in_flight(k.0, k.1) < SEND_CAP,
+                c.wants_write(),
+            );
+            if !f.is_empty() {
+                fds.push(PollFd::new(c.as_fd(), f));
+            }
+        }
+        for (k, c) in &self.agent_conns {
+            let f = io(
+                self.core.stream_in_flight(k.0, k.1) < SEND_CAP,
+                c.wants_write(),
+            );
+            if !f.is_empty() {
+                fds.push(PollFd::new(c.as_fd(), f));
+            }
+        }
+        for (l, _, _) in &self.remote_listeners {
+            fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
+        }
+        for (l, _, _) in &self.agent_listeners {
+            fds.push(PollFd::new(l.as_fd(), PollFlags::POLLIN));
+        }
+        for (k, e) in &self.execs {
+            if self.core.stream_in_flight(k.0, k.1) < SEND_CAP {
+                for fd in e.proc.output_fds() {
+                    fds.push(PollFd::new(fd, PollFlags::POLLIN));
+                }
+            }
+        }
+        // Downloads with room in their window are ready to read the file now.
+        let xfer_ready = self.xfers.iter().any(|(k, x)| {
+            matches!(x, XferState::Get(_)) && self.core.stream_in_flight(k.0, k.1) < SEND_CAP
+        });
+        if xfer_ready {
+            timeout = Duration::ZERO;
+        }
+        let ms = timeout.as_micros().div_ceil(1000).min(u16::MAX as u128) as u16;
+        let _ = poll(&mut fds, PollTimeout::from(ms));
+    }
+
     pub fn core(&self) -> &ServerCore {
         &self.core
     }
 
-    /// One service iteration: drain ready packets, then tick. Returns false on
-    /// fatal socket error (the loop should stop).
+    /// One service iteration: wait for something to do (at most 100 ms),
+    /// drain ready datagrams, move forwarded data, then tick. Returns false on
+    /// a fatal socket error (the loop should stop).
     pub fn poll_once(&mut self) -> bool {
-        let mut buf = [0u8; 65536];
-        match self.socket.recv_from(&mut buf) {
-            Ok((n, src)) => {
-                for (addr, pkt) in self.core.handle_packet(src, &buf[..n]) {
-                    let _ = self.socket.send_to(&pkt, addr);
+        self.wait(Duration::from_millis(100));
+        // Bounded, so a flood can't starve the shells and forwards.
+        for _ in 0..256 {
+            match self.socket.recv_from(&mut self.rbuf) {
+                Ok((n, src)) => {
+                    for (addr, pkt) in self.core.handle_packet(src, &self.rbuf[..n]) {
+                        let _ = self.socket.send_to(&pkt, addr);
+                    }
                 }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    break;
+                }
+                // ICMP errors (port unreachable from a vanished client) surface
+                // here on Linux; they concern one peer, not the socket.
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
+                Err(_) => return false,
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => return false,
         }
-        // Move bytes between forwarded TCP connections and their session streams
-        // before ticking, so freshly-read TCP data ships out in this iteration.
+        // Move bytes between forwarded connections and their session streams
+        // before ticking, so freshly-read data ships out in this iteration.
         self.pump_forwards();
         for (addr, pkt) in self.core.tick() {
             let _ = self.socket.send_to(&pkt, addr);

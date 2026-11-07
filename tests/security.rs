@@ -173,11 +173,10 @@ fn forged_transport_packet_is_rejected() {
 
 #[test]
 fn injected_garbage_does_not_kill_inflight_handshake() {
-    // The session id is plaintext, so an attacker could try to abort an
-    // in-progress handshake by injecting a packet with that id. A bogus packet
-    // must NOT destroy the pending state: the legitimate handshake still
-    // completes.
-    use transport::build_handshake_packet;
+    // The connection ids are plaintext, so an attacker could try to abort an
+    // in-progress handshake by injecting a packet for that connection. A bogus
+    // packet must NOT destroy the pending state: the legitimate handshake
+    // still completes.
 
     let server_kp = generate_keypair().unwrap();
     let client_kp = generate_keypair().unwrap();
@@ -196,21 +195,24 @@ fn injected_garbage_does_not_kill_inflight_handshake() {
         DisplayMode::Adaptive,
     )
     .unwrap();
-    let mut sid = [0u8; 8];
-    sid.copy_from_slice(&first[1..9]);
-
     // msg1 -> server creates pending state and replies msg2.
     let reply = server.handle_packet(addr, &first);
     assert!(!reply.is_empty(), "server should answer msg1");
 
-    // Attacker injects a (large enough to pass the floor) garbage packet for the
-    // same session id from a different address; it must be ignored.
-    let garbage = build_handshake_packet(&sid, &vec![7u8; 1300]);
+    // Attacker injects a full-size packet with the same header (connection
+    // ids) but a garbage payload, from a different address and from the
+    // client's own; neither may be acted on.
+    let mut garbage = first.clone();
+    let n = garbage.len();
+    for b in &mut garbage[n - 64..] {
+        *b ^= 0x5a;
+    }
     assert!(
         server
             .handle_packet("198.51.100.9:1".parse().unwrap(), &garbage)
             .is_empty()
     );
+    let _ = server.handle_packet(addr, &garbage);
 
     // The legitimate client finishes the handshake; a session must result.
     let mut to_client: Vec<Vec<u8>> = reply.into_iter().map(|(_, p)| p).collect();
@@ -244,10 +246,9 @@ fn injected_garbage_does_not_kill_inflight_handshake() {
 
 #[test]
 fn undersized_handshake_init_gets_no_reply() {
-    // Anti-amplification: a small, unpadded new-session init must not draw the
+    // Anti-amplification: a small, unpadded first packet must not draw the
     // (larger) handshake reply, and must not create state. A properly padded
-    // init from a real client does get a reply.
-    use transport::{build_handshake_packet, random_session_id};
+    // one from a real client does get a reply (QUIC requires 1200 bytes).
 
     let server_kp = generate_keypair().unwrap();
     let client_kp = generate_keypair().unwrap();
@@ -256,16 +257,6 @@ fn undersized_handshake_init_gets_no_reply() {
     let mut server = ServerCore::new(server_kp, authorized, Box::new(LocalLogin), None);
     let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
 
-    // A tiny init: header + a handful of bytes (well under the floor).
-    let sid = random_session_id();
-    let small = build_handshake_packet(&sid, &[1, 2, 3, 4, 5]);
-    assert!(
-        server.handle_packet(addr, &small).is_empty(),
-        "server replied to an undersized init (amplification vector)"
-    );
-    assert_eq!(server.session_count(), 0);
-
-    // A real, padded client init does get a reply.
     let (_client, first) = ClientCore::new(
         &client_kp,
         KnownHosts::new(),
@@ -277,9 +268,16 @@ fn undersized_handshake_init_gets_no_reply() {
     )
     .unwrap();
     assert!(
-        first.len() >= transport::MIN_HANDSHAKE_INIT,
-        "client init must be padded to the floor"
+        first.len() >= 1200,
+        "client init must be padded to 1200 bytes"
     );
+
+    // The same packet cut short (well under the floor) gets no reply.
+    assert!(
+        server.handle_packet(addr, &first[..200]).is_empty(),
+        "server replied to an undersized init (amplification vector)"
+    );
+    assert_eq!(server.session_count(), 0);
     assert!(
         !server.handle_packet(addr, &first).is_empty(),
         "server should answer a properly padded init"

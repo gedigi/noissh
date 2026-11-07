@@ -100,6 +100,18 @@ impl ExecProc {
         })
     }
 
+    /// The open output pipes (stdout, stderr), for registering with `poll()`.
+    pub fn output_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        let mut fds = Vec::new();
+        if let Some(o) = &self.stdout {
+            fds.push(o.as_fd());
+        }
+        if let Some(e) = &self.stderr {
+            fds.push(e.as_fd());
+        }
+        fds
+    }
+
     /// Drain available stdout bytes (empty once EOF).
     pub fn read_stdout(&mut self) -> Vec<u8> {
         read_pipe(&mut self.stdout)

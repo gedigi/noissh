@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use auth::{AuthorizedKeys, KnownHosts, PublicKey};
 use noise_core::generate_keypair;
 use noissh::client::ClientCore;
+use noissh::client::StreamEvent;
 use noissh::server::{Server, ServerCore};
 use predict::DisplayMode;
 use pty::LocalLogin;
-use transport::StreamEvent;
 use wire::StreamKind;
 
 #[test]
@@ -79,7 +79,7 @@ fn exec_streams_stdout_stderr_and_exit_code() {
                     kind: StreamKind::Exec,
                     ..
                 } => err_id = Some(id),
-                StreamEvent::Closed { id, status } if Some(id) == e => code = Some(status),
+                StreamEvent::Exited { id, status } if Some(id) == e => code = Some(status),
                 _ => {}
             }
         }
