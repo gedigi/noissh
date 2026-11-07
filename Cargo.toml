@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 license = "MIT"
 authors = ["Gerardo <gedigi@live.com>"]
@@ -40,7 +40,7 @@ proto = { path = "crates/proto" }
 
 [package]
 name = "noissh"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 license.workspace = true
 authors.workspace = true
