@@ -128,6 +128,18 @@ fn parse_dynamic(s: &str) -> Option<(String, u16)> {
     }
 }
 
+/// What `-V`/`--version` print. Tools that run noissh in place of `ssh` check
+/// the binary first: VS Code Remote-SSH runs `<remote.SSH.path> -V`, rejects
+/// any output that doesn't match /OpenSSH/, and silently falls back to the
+/// system `ssh`. So the line says noissh speaks ssh's command line, in words
+/// that pass that check, without claiming to be a particular OpenSSH version.
+fn version_line() -> String {
+    format!(
+        "noissh {} (OpenSSH-compatible command line)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn print_help() {
     println!(
         "noissh {ver} — resilient remote shell over the Noise Protocol
@@ -256,7 +268,7 @@ fn parse_args() -> Args {
                 exit(0);
             }
             "--version" => {
-                println!("noissh {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", version_line());
                 exit(0);
             }
             "--ssh" => a.ssh = true,
@@ -379,7 +391,7 @@ fn parse_short_options(arg: &str, it: &mut impl Iterator<Item = String>, a: &mut
                 exit(0);
             }
             'V' => {
-                println!("noissh {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", version_line());
                 exit(0);
             }
             'v' => a.verbose = true,

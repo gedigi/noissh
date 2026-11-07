@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **VS Code Remote-SSH now actually uses noissh.** Before using
+  `remote.SSH.path`, Remote-SSH runs `<path> -V` and silently falls back to the
+  system `ssh` unless the output matches `/OpenSSH/` (its log says
+  `ssh output did not match /OpenSSH/`). `noissh -V` printed only
+  `noissh <version>`, so VS Code never ran noissh. It now prints
+  `noissh <version> (OpenSSH-compatible command line)`.
+
 ## [0.6.2]
 
 ### Fixed
