@@ -186,7 +186,25 @@ struct StreamState {
     close_received: bool, // a StreamClose has been surfaced as an event
     close_ticks: u32,     // polls spent waiting for a lost FIN after close
     reset: bool,
+
+    // --- ack pacing ---
+    /// The (ack, window) last advertised to the peer, if any.
+    last_ack: Option<(u64, u32)>,
+    /// Data arrived since our last ack (possibly a retransmit whose ack was
+    /// lost), so the peer needs an ack even if the values didn't change.
+    ack_pending: bool,
+    /// Tick of the last ack sent, for the periodic refresh.
+    last_ack_at: u64,
+    /// Tick the graceful StreamClose was last sent, if it has been.
+    close_sent_at: Option<u64>,
 }
+
+/// An idle stream re-advertises its (unchanged) ack and window this often, in
+/// `poll_transmit` rounds, as a safety net against a lost ack; otherwise acks
+/// are sent only when something changed or data arrived. Sending one every
+/// round made an idle connection (and a vanished client) receive a datagram
+/// every tick.
+const ACK_REFRESH_TICKS: u64 = 100;
 
 /// After a graceful close, how many `poll_transmit` rounds to wait for the
 /// FIN-bearing `StreamData` before force-reclaiming the stream. This only
@@ -223,6 +241,10 @@ impl StreamState {
             close_received: false,
             close_ticks: 0,
             reset: false,
+            last_ack: None,
+            ack_pending: false,
+            last_ack_at: 0,
+            close_sent_at: None,
         }
     }
 
@@ -416,24 +438,42 @@ impl StreamState {
                 self.rto_start = Some(now);
             }
         }
-        // Always advertise our current receive window via an ack (saturating
-        // cast guards against a misbehaving peer pushing past 4 GiB unread).
+        // Advertise our ack point and receive window (saturating cast guards
+        // against a misbehaving peer pushing past 4 GiB unread) when they
+        // changed, when data arrived since the last ack (the peer may be
+        // retransmitting because our ack was lost), or as a slow periodic
+        // refresh. Not every round: an idle stream must not emit a datagram
+        // every tick.
         let unread = self.recv.unread().min(DEFAULT_WINDOW as u64) as u32;
         self.recv_window = DEFAULT_WINDOW.saturating_sub(unread);
-        out.push(Frame::StreamAck {
-            id: self.id,
-            ack: self.recv.ack_point(),
-            window: self.recv_window,
-        });
-        // Retransmit the graceful close until the peer has acked all our data;
-        // then stop (no perpetual StreamClose on a settled stream).
+        let current = (self.recv.ack_point(), self.recv_window);
+        if self.ack_pending
+            || self.last_ack != Some(current)
+            || now.saturating_sub(self.last_ack_at) >= ACK_REFRESH_TICKS
+        {
+            out.push(Frame::StreamAck {
+                id: self.id,
+                ack: current.0,
+                window: current.1,
+            });
+            self.last_ack = Some(current);
+            self.ack_pending = false;
+            self.last_ack_at = now;
+        }
+        // Retransmit the graceful close until the peer has acked all our data:
+        // promptly the first time, then on the retransmit timer (not every
+        // round), and not at all once the stream is settled.
         if let Some(status) = self.close_status
             && !self.fin_acked
+            && self
+                .close_sent_at
+                .is_none_or(|t| now.saturating_sub(t) >= self.rto as u64)
         {
             out.push(Frame::StreamClose {
                 id: self.id,
                 status,
             });
+            self.close_sent_at = Some(now);
         }
         // Count down the close grace window once the peer has gracefully closed
         // (StreamClose surfaced) but we're still missing its FIN-bearing data
@@ -569,6 +609,7 @@ impl StreamMux {
                         s.peer_fin = HalfState::Finished(end);
                     }
                     s.recv.insert(offset, data);
+                    s.ack_pending = true;
                     if s.recv.ack_point() > had {
                         self.events.push(StreamEvent::Readable { id });
                     }
@@ -829,6 +870,78 @@ mod tests {
             server.poll_transmit().is_empty(),
             "server still chattering on a closed stream"
         );
+    }
+
+    #[test]
+    fn idle_open_stream_does_not_ack_every_poll() {
+        // An open but idle stream (e.g. a quiet forwarded connection) must not
+        // emit a frame every poll: that sent a datagram per tick on an idle
+        // session, and kept flooding a client that had vanished. It acks when
+        // something changes, then only refreshes every ACK_REFRESH_TICKS.
+        let mut client = StreamMux::new(true);
+        let mut server = StreamMux::new(false);
+        let id = client.open(StreamKind::Forward, b"127.0.0.1:1".to_vec());
+        client.write(id, b"hello");
+        pump(&mut client, &mut server, 6, |_| false);
+        assert_eq!(drain(&mut server, id), b"hello");
+        pump(&mut client, &mut server, 6, |_| false);
+
+        // Now idle: count frames over two refresh periods.
+        let rounds = 2 * ACK_REFRESH_TICKS as usize;
+        let mut client_frames = 0;
+        let mut server_frames = 0;
+        for _ in 0..rounds {
+            client_frames += client.poll_transmit().len();
+            server_frames += server.poll_transmit().len();
+        }
+        assert!(
+            client_frames <= 3 && server_frames <= 3,
+            "idle stream sent {client_frames} (client) / {server_frames} (server) frames \
+             in {rounds} polls"
+        );
+
+        // New data still gets through and is acked promptly.
+        client.write(id, b"again");
+        pump(&mut client, &mut server, 6, |_| false);
+        assert_eq!(drain(&mut server, id), b"again");
+        pump(&mut client, &mut server, 6, |_| false);
+        assert_eq!(client.in_flight(id), 0, "new data must be acked promptly");
+    }
+
+    #[test]
+    fn duplicate_data_is_reacked_even_if_ack_unchanged() {
+        // If our ack is lost, the peer retransmits data we already have. The
+        // ack values don't change, but we must still answer, or the peer
+        // retransmits until the next periodic refresh.
+        let mut client = StreamMux::new(true);
+        let mut server = StreamMux::new(false);
+        let id = client.open(StreamKind::Forward, b"127.0.0.1:1".to_vec());
+        client.write(id, b"x");
+        // Deliver client → server, drop the server's acks for a while.
+        for _ in 0..4 {
+            for f in client.poll_transmit() {
+                server.on_frame(f);
+            }
+            let _ = server.poll_transmit(); // acks lost
+        }
+        // The retransmitted data must elicit an ack from the server.
+        let mut acked = false;
+        for _ in 0..(INIT_RTO as usize * 4) {
+            let frames = client.poll_transmit();
+            let carried_data = frames.iter().any(|f| matches!(f, Frame::StreamData { .. }));
+            for f in frames {
+                server.on_frame(f);
+            }
+            let replies = server.poll_transmit();
+            if carried_data {
+                acked |= replies.iter().any(|f| matches!(f, Frame::StreamAck { .. }));
+            }
+            for f in replies {
+                client.on_frame(f);
+            }
+        }
+        assert!(acked, "a retransmit must be answered with an ack");
+        assert_eq!(client.in_flight(id), 0);
     }
 
     #[test]

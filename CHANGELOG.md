@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4]
+
+### Fixed
+
+- **An idle connection no longer sends a packet every tick.** Every open stream
+  (each port-forwarded or SOCKS connection; VS Code keeps several open)
+  re-sent its acknowledgement on every internal tick, roughly every 10 ms,
+  even when nothing had changed, and closing streams re-sent their close the
+  same way. Both directions were affected. When a client vanished, the server
+  kept sending ~90 packets a second to its old address until the session was
+  reaped minutes later, which can make a home router block the server for a
+  while. Acks now go out only when something changed or data arrived, plus a
+  slow periodic refresh, and the close is resent on the retransmit timer.
+
 ## [0.6.3]
 
 ### Fixed
