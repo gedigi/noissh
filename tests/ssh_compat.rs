@@ -76,10 +76,24 @@ fn socks5_connect(s: &mut TcpStream, target: SocketAddr) -> std::io::Result<()> 
 
 #[test]
 fn noissh_runs_a_command_and_a_socks_forward_like_vscode_remote_ssh() {
+    // Older Remote-SSH: `ssh -T -D <port> … host bash`.
+    run_like_vscode_remote_ssh("cmd", &["sh"]);
+}
+
+#[test]
+fn noissh_runs_the_login_shell_for_t_without_a_command() {
+    // Current Remote-SSH: `ssh -v -T -D <port> -o ConnectTimeout=15 host`, no
+    // command; the setup script goes to the login shell's stdin.
+    run_like_vscode_remote_ssh("noarg", &[]);
+}
+
+/// Drive the `noissh` binary like VS Code Remote-SSH, with `trailing` after the
+/// host (the remote command, if any).
+fn run_like_vscode_remote_ssh(tag: &str, trailing: &[&str]) {
     let noissh = env!("CARGO_BIN_EXE_noissh");
     let noisshd = env!("CARGO_BIN_EXE_noisshd");
 
-    let dir = std::env::temp_dir().join(format!("noissh-compat-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("noissh-compat-test-{}-{tag}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let args_log = dir.join("ssh-args");
@@ -107,6 +121,7 @@ fn noissh_runs_a_command_and_a_socks_forward_like_vscode_remote_ssh() {
 
     // The invocation, shaped like VS Code Remote-SSH's.
     let mut child = Command::new(noissh)
+        .args(["-v"])
         .args([
             "--server-cmd",
             noisshd,
@@ -120,9 +135,12 @@ fn noissh_runs_a_command_and_a_socks_forward_like_vscode_remote_ssh() {
             "-p",
             "2222",
             "127.0.0.1",
-            "sh",
         ])
+        .args(trailing)
         .env("NOISSH_SSH", &fake_ssh)
+        // The login shell `-T` starts is `$SHELL`; pin it so the test doesn't
+        // depend on the runner's shell or its profile files.
+        .env("SHELL", "/bin/sh")
         .env("XDG_CONFIG_HOME", &dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -265,7 +265,17 @@ settings that shape the session itself (RemoteCommand, RequestTTY, SessionType,
 the *Forward options, ForwardAgent, StdinNull, ForkAfterAuthentication, and the
 Control* options) are not passed on.
 .TP
-.B "\-4 \-6 \-a \-C \-g \-k \-K \-q \-s \-T \-t \-x \-X \-Y \-y \-e" " CHAR"
+.B \-T
+No TTY. With no remote command, run the login shell
+.RB ( "$SHELL \-l" )
+on the server reading commands from standard input, as
+.B "ssh \-T"
+.I host
+does, with any
+.BR \-L / \-R / \-D
+forwards alongside. VS Code Remote\-SSH connects this way.
+.TP
+.B "\-4 \-6 \-a \-C \-g \-k \-K \-q \-s \-t \-x \-X \-Y \-y \-e" " CHAR"
 .BR ssh (1)
 options accepted for compatibility; they have no effect.
 .TP

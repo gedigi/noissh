@@ -497,9 +497,17 @@ For **VS Code Remote-SSH**, point `remote.SSH.path` at noissh in your
 
 Connect to hosts as usual (aliases come from `~/.ssh/config`, or from the file in
 `remote.SSH.configFile`, which VS Code passes with `-F`). VS Code runs something
-like `noissh -T -D 53412 -o ConnectTimeout=15 myhost bash`: noissh runs the
-remote shell, feeds it VS Code's setup script over stdin, and serves the `-D`
-SOCKS proxy that VS Code uses to reach its server, all on one resilient session.
+like `noissh -v -T -D 53412 -o ConnectTimeout=15 myhost` (older versions add
+`bash` at the end): noissh runs your login shell (or the given command) on the
+server, feeds it VS Code's setup script over stdin, and serves the `-D` SOCKS
+proxy that VS Code uses to reach its server, all on one resilient session.
+
+After changing `remote.SSH.path`, run **Remote-SSH: Kill Local Connection
+Server And Reload** before reconnecting: on macOS, Remote-SSH keeps a local
+connection server that reuses its existing `ssh` connection until killed. To
+check that VS Code really is using noissh, look for its process on your machine
+(`pgrep -fl noissh`) or for `noisshd` on the server (`pgrep -a noisshd`); a
+plain-ssh connection shows `ssh … myhost` and no `noisshd`.
 
 How ssh's flags are treated:
 
@@ -507,8 +515,9 @@ How ssh's flags are treated:
 |---|---|
 | `-L` `-R` `-D` `-A` `-v` | noissh's own forwarding, agent forwarding and verbose output |
 | `-N` / `-n` | no remote command / empty stdin for the command, as in ssh |
+| `-T` | no TTY; with no command, runs your login shell (`$SHELL -l`) reading stdin, as `ssh -T host` does, with any forwards alongside |
 | `-b -B -c -E -F -i -J -l -m -o -p` | passed to `ssh` for the [SSH bootstrap](#ssh-bootstrap-the-automatic-fallback); `-F` is also used to resolve host aliases |
-| `-4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y`, `-e CHAR` | accepted and ignored |
+| `-4 -6 -a -C -g -k -K -q -s -t -x -X -Y -y`, `-e CHAR` | accepted and ignored |
 
 Flags can be clustered or have their value attached (`-NT`, `-p2222`,
 `-oBatchMode=yes`), as with ssh. `-o` settings that shape the session itself
@@ -561,7 +570,8 @@ noissh [OPTIONS] [user@]host [command ...] [-- <ssh args>]
   -- <args>       pass remaining args to ssh (only with --ssh)
 ssh-compatible flags (see "Using noissh as ssh"):
   -b -B -c -E -F -i -J -l -m -o -p   passed to ssh for the bootstrap
-  -4 -6 -a -C -g -k -K -q -s -T -t -x -X -Y -y, -e CHAR   ignored
+  -T              no TTY; with no command, run the login shell reading stdin
+  -4 -6 -a -C -g -k -K -q -s -t -x -X -Y -y, -e CHAR   ignored
 ```
 
 All options must come before the host.

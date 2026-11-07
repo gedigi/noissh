@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **VS Code Remote-SSH works with current versions.** Remote-SSH now runs
+  `ssh -T -D <port> host` with no command and writes its setup script to the
+  login shell's stdin. noissh treated forwards without a command as
+  forward-only, so it ran no shell and the setup hung. Now `-T` without a
+  command runs the login shell (`$SHELL -l`) reading stdin, as `ssh -T host`
+  does, with any forwards alongside. Without `-T`, forwards with no command
+  still mean forward-only.
+
 ## [0.6.1]
 
 ### Changed
