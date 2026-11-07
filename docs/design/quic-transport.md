@@ -10,8 +10,8 @@ hand-written transport:
 
 | Problem | Measured | Root cause |
 |---|---|---|
-| Throughput | 2 MB in 14 s (140 KB/s) in 0.6.4; 880 KB/s with the 0.6.5 timer fix, against a 256 KiB window that allows ~6 MB/s at 40 ms | RTO/RTT counted in loop iterations (fixed in 0.6.5); sending only on ticks; 1 KiB chunks; per-stream acks; timeout-only loss recovery; no pacing |
-| Idle chatter | server ~90 pkts/s (0.6.3), client ~50 pkts/s (0.6.4) | acks re-sent on every tick (fixed in 0.6.4 / 0.6.5) |
+| Throughput | 2 MB in 14 s (140 KB/s) in 0.6.4; 880 KB/s with the wall-clock timer fix (unreleased), against a 256 KiB window that allows ~6 MB/s at 40 ms | RTO/RTT counted in loop iterations (fixed, unreleased); sending only on ticks; 1 KiB chunks; per-stream acks; timeout-only loss recovery; no pacing |
+| Idle chatter | server ~90 pkts/s (0.6.3), client ~50 pkts/s (0.6.4) | acks re-sent on every tick (fixed in 0.6.4 and unreleased) |
 | Router blocking the server | after ~20 s of the above | consequence of the chatter |
 | Terminal lag during transfers | typing stalls while VS Code syncs | no prioritisation between interactive and bulk data |
 

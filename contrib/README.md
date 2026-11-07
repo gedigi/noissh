@@ -31,7 +31,9 @@ Runs the standalone server daemon on UDP port 51820 with sensible sandboxing.
 
 4. Authorize client keys by adding their public key lines to
    `~noissh/.config/noissh/authorized_keys` (one `noissh-x25519 <base64>` per
-   line). A client prints its line with `noissh-keygen`.
+   line). A client prints its line with `noissh-keygen`. The daemon reads this
+   file only at startup, so restart it afterwards:
+   `sudo systemctl restart noisshd`.
 
 5. Open UDP 51820 in your firewall. Check status / logs:
 

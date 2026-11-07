@@ -32,6 +32,24 @@ cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 cargo test --workspace                            # all tests green
 ```
 
+### Documentation
+
+Every PR keeps the documentation accurate. Check each of these against the code
+as it will be after your change, and fix anything wrong or missing in the same
+PR, including inaccuracies that were already there:
+
+- [ ] `README.md`
+- [ ] `docs/USER_GUIDE.md`, including the command reference and troubleshooting
+- [ ] `docs/ARCHITECTURE.md`, `docs/PROTOCOL.md`, `docs/SECURITY.md`
+- [ ] `docs/design/*.md`
+- [ ] `docs/man/*.1` (shipped in the release packages; check with `man -l`)
+- [ ] `--help` text in `src/bin/*.rs`
+- [ ] `contrib/`
+- [ ] `CHANGELOG.md`: user-visible changes under `## [Unreleased]`
+
+Check claims against the code (constants, defaults, flags, paths), not against
+other documents, and list the documentation changes in the PR description.
+
 ### Supply-chain checks
 
 CI also runs supply-chain hardening jobs (see `.github/workflows/ci.yml`). To

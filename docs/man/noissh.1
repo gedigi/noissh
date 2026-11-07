@@ -1,4 +1,4 @@
-.TH NOISSH 1 "2026-11-07" "noissh 0.6.5" "User Commands"
+.TH NOISSH 1 "2026-11-07" "noissh 0.6.4" "User Commands"
 .SH NAME
 noissh \- resilient remote shell over the Noise Protocol Framework (client)
 .SH SYNOPSIS
@@ -123,14 +123,12 @@ Remote server command used with
 .IR noisshd ).
 .TP
 .BI \-\-server\-port " N"
-Pin the bootstrapped server to UDP port
-.I N
-instead of an ephemeral one, so the port can be opened in a firewall/NAT. Useful
-when a host permits SSH but blocks arbitrary inbound UDP: open
-.I N
-and pass the same
-.I N
-here.
+UDP port the bootstrapped server should bind (default: the
+.B \-\-port
+value, 51820), so one firewall rule covers both direct and bootstrapped
+sessions. If that port is already taken, for example by another bootstrapped
+session, the server falls back to a random port, which a firewall usually
+blocks; run a standalone server to serve several sessions on one port.
 .TP
 .BI \-L " LPORT:HOST:PORT"
 Local port forward: connections to

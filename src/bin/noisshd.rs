@@ -59,7 +59,7 @@ Options:
   --listen ADDR         UDP listen address (default 0.0.0.0:51820)
   --bind ADDR           one-shot: UDP bind address (default 0.0.0.0:0)
   --key PATH            server keypair path (standalone)
-  --authorized-keys P   authorized client keys path (standalone)
+  --authorized-keys P   authorized client keys path (standalone; read at start)
   --authorize B64       one-shot: the single client public key to trust
   --user NAME           drop sessions to this user (standalone; requires root).
                         File transfer, agent forwarding, and exec are refused in

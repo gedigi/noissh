@@ -5,6 +5,12 @@ why the pieces are split the way they are. For the wire format and protocol
 details see [PROTOCOL.md](PROTOCOL.md); for the trust/threat model see
 [SECURITY.md](SECURITY.md).
 
+> **Planned for 0.7:** the transport described here (session ids, anti-replay,
+> the stream mux) is to be replaced by QUIC (`quinn-proto`) with the Noise
+> handshake kept in place of TLS. See the design proposal in
+> [design/quic-transport.md](design/quic-transport.md). This document describes
+> the current (0.6) implementation.
+
 ## Goals
 
 noissh aims to be **highly resilient** and **as rich as SSH**, with all
@@ -150,8 +156,10 @@ rather than after the first keystroke.
 Alongside the latest-wins interactive plane, `transport::StreamMux` provides
 reliable, ordered, flow-controlled byte streams over the same Noise/UDP session,
 which roam exactly like the v1 datagram path: ARQ retransmit on an **RTT-derived
-timeout** with a **congestion window** (slow start / congestion avoidance),
-in-order reassembly, and a sliding receive window. It is hardened against a
+timeout** (wall-clock, so it doesn't depend on how often the driver polls) with a
+**congestion window** (slow start / congestion avoidance), in-order reassembly,
+and a sliding receive window. Acks go out only when something changed, plus a
+once-a-second refresh, so idle streams cost (almost) nothing on the wire. It is hardened against a
 misbehaving peer (out-of-window/overflow frames dropped, stream-id parity
 enforced, concurrent streams capped).
 

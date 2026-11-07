@@ -131,9 +131,9 @@ noissh you@server
 Authorize a client by adding its public key (printed on first run, stored at
 `~/.config/noissh/id.pub`) to `~/.config/noissh/authorized_keys` on the server.
 
-> **Tip:** noissh talks over **UDP**. If SSH works but noissh times out, the
-> usual culprit is a firewall blocking the UDP port. Open a port and pin the
-> server to it with `--server-port N` (e.g. `noissh --server-port 51820 you@server`).
+> **Tip:** noissh talks over **UDP**, on port **51820** by default. If SSH works
+> but noissh times out, the usual culprit is a firewall blocking that port: open
+> UDP 51820 (or pick another with `--server-port N` and open that one).
 
 **Port forwarding** works like SSH's `-L`/`-R` and rides the same session:
 
@@ -209,6 +209,7 @@ sensitive.
 | [Architecture](docs/ARCHITECTURE.md) | How the pieces fit together (with diagrams) |
 | [Protocol](docs/PROTOCOL.md) | The wire format and handshake, in detail |
 | [Security](docs/SECURITY.md) | Trust model and threat model |
+| [QUIC transport design](docs/design/quic-transport.md) | Proposal for the 0.7 transport (QUIC + Noise) |
 | [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) | Hacking on noissh · history |
 
 ## License

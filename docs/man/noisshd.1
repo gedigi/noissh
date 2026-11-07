@@ -1,4 +1,4 @@
-.TH NOISSHD 1 "2026-11-07" "noissh 0.6.5" "System Administration"
+.TH NOISSHD 1 "2026-11-07" "noissh 0.6.4" "System Administration"
 .SH NAME
 noisshd \- resilient remote shell over the Noise Protocol Framework (server)
 .SH SYNOPSIS
@@ -39,12 +39,14 @@ Used by the
 bootstrap. Generates an ephemeral key, trusts only the single client key given
 with
 .BR \-\-authorize ,
-binds an ephemeral UDP port, prints a line of the form
+binds the UDP port given with
+.B \-\-bind
+(or an ephemeral one if that port is taken), prints a line of the form
 .RS
 .B NOISSH CONNECT <port> <base64 server pubkey>
 .RE
 on standard output, detaches from the controlling terminal, and serves one
-session.
+session. It exits if no client connects within 60 seconds.
 .SH OPTIONS
 .TP
 .BI \-\-listen " ADDR"
@@ -56,7 +58,8 @@ with the public key written to the same path plus
 .IR .pub .
 .TP
 .BI \-\-authorized\-keys " PATH"
-Authorized client keys (default <config>/authorized_keys).
+Authorized client keys (default <config>/authorized_keys). Read once at
+startup: restart the daemon after adding a key.
 .TP
 .BI \-\-command " CMD ..."
 Run this command instead of the login shell (the remaining arguments form the
@@ -78,7 +81,10 @@ Ephemeral key; serve a single session, then exit.
 In one\-shot mode, the single base64 client public key to trust.
 .TP
 .BI \-\-bind " ADDR"
-Bind address in one\-shot mode (default 0.0.0.0:0, an ephemeral port).
+Bind address in one\-shot mode (default 0.0.0.0:0, an ephemeral port). The
+.B noissh
+client passes the port it wants (51820 by default); if it is taken, the
+server falls back to an ephemeral port and reports it in the connect line.
 .TP
 .BR \-v ", " \-\-verbose
 Log session lifecycle (each session established and ended, with the current

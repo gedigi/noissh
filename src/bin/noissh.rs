@@ -159,7 +159,7 @@ Options:
   --ssh                 force the SSH bootstrap (skip the direct probe)
   --direct              direct connection only; never fall back to SSH
   --port N              UDP port for the direct connection (default 51820)
-  --server-port N       pin the bootstrapped server's UDP port (firewall-friendly)
+  --server-port N       UDP port for the bootstrapped server (default: --port)
   --server-cmd CMD      remote server command for --ssh (default \"noisshd\")
   --no-install          do not auto-install noisshd on the remote if missing
   -L LPORT:HOST:PORT    local port forward (repeatable)

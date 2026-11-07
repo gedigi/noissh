@@ -149,8 +149,12 @@ a monotonically increasing `seq`, and emits `StateDiff{seq, base, data}` where
 either a full snapshot (applicable regardless of base; e.g. after a resize) or a
 delta listing only changed cells. The client applies full snapshots
 unconditionally and deltas only when `base` matches its current state and `seq`
-is newer, then sends `Ack{seq}`. This converges under arbitrary loss/reorder
-(latest-wins): only the newest screen matters.
+is newer. After **every** received `StateDiff`, applied or not, it sends
+`Ack{seq}` with its current seq: a resent diff means the previous ack was lost
+or the server is diffing from a stale base, and the ack tells it where to diff
+from. It sends no screen ack otherwise, so an idle session stays quiet. This
+converges under arbitrary loss/reorder (latest-wins): only the newest screen
+matters.
 
 ### Screen diff encoding
 
@@ -194,7 +198,14 @@ of concurrent peer-opened streams is capped. Per stream:
   avoidance, collapsing to one segment on loss). Unacked data is retransmitted
   after a **retransmit timeout derived from a smoothed RTT estimate**
   (Jacobson/Karels, with Karn's algorithm and exponential backoff), not on every
-  poll. `fin` marks the last byte.
+  poll. Timers run on wall-clock milliseconds (initial RTO 300 ms, clamped to
+  60 ms–3 s), independent of how often the driver polls. `fin` marks the last
+  byte.
+- **Acks:** `StreamAck{ack, window}` is sent when the ack point or window changed,
+  when data arrived since the last ack (the peer may be retransmitting because an
+  ack was lost), and otherwise at most once a second as a refresh. A graceful
+  `StreamClose` is sent once, then again on the retransmit timer until the peer
+  has acked all data.
 - **Receive:** out-of-order segments are reassembled into a contiguous stream; the
   receiver advertises a window of `DEFAULT_WINDOW - unread` so an idle reader
   applies backpressure (flow control). Frames that overflow or fall outside the
@@ -217,16 +228,22 @@ carries a `PUT <size> <path>` / `GET <path>` request; `Exec` carries the command
   too-old nonces.
 - A datagram is authenticated **before** it is allowed to update the peer address,
   so a forged datagram from a new address cannot hijack a session.
+- The server follows the client to the source address of its latest
+  authenticated datagram. An idle client sends a keepalive every few seconds, and
+  a client that rebinds its socket sends one immediately, so the server learns a
+  new address within one keepalive interval at most.
 
 ## 9. SSH bootstrap (optional)
 
 An SSH bootstrap: `ssh <host> noisshd --one-shot --authorize <client pub>`.
-The one-shot server binds an ephemeral UDP port, prints
+The one-shot server binds the UDP port the client asks for with `--bind` (51820
+by default), or an ephemeral one if that port is taken, prints
 
 ```
 NOISSH CONNECT <port> <base64 server pubkey>
 ```
 
-on stdout, then detaches (daemonizes) and serves one session. The client parses
+on stdout, then detaches (daemonizes) and serves one session, exiting if no
+client connects within 60 seconds. The client parses
 that line, pins the server key (delivered over the authenticated SSH channel), and
 connects over the normal Noise/UDP protocol above.

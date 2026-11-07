@@ -4,10 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.5]
+## [Unreleased]
+
+### Added
+
+- **Design proposal for the 0.7 transport** (`docs/design/quic-transport.md`):
+  QUIC via `quinn-proto` with the Noise handshake in place of TLS.
 
 ### Fixed
 
+- **Docs: the SSH bootstrap's UDP port.** The user guide, protocol notes and man
+  pages said the bootstrapped server binds an ephemeral port; it asks for 51820
+  (or `--server-port`) and falls back to an ephemeral port only if that is
+  taken. The guide now also covers running several sessions at once, restarting
+  the daemon after changing `authorized_keys`, and a systemd user service.
 - **Much faster port forwarding over real links (VS Code Remote-SSH).** The
   stream retransmit timer and RTT estimate were counted in loop iterations,
   not time. Drivers iterate on every received packet as well as on a timer, so
