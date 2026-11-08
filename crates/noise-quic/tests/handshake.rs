@@ -384,3 +384,40 @@ fn key_update_keeps_the_connection_working() {
         );
     }
 }
+
+#[test]
+fn forged_initial_with_extreme_header_protection_sample_is_dropped() {
+    // An off-path attacker needs no key to pick the header-protection sample
+    // of a forged Initial packet. A sample whose counter is 0xffffffff once
+    // panicked the endpoint (one packet crashed the server).
+    let (spriv, _) = keypair();
+    let server_crypto = Arc::new(noise_quic::ServerConfig::new(
+        spriv,
+        Arc::new(|_: &[u8; 32]| true),
+    ));
+    let server_cfg = ServerConfig::new(server_crypto, Arc::new(TokenKey::random()));
+    let mut server = Endpoint::new(endpoint_config(), Some(Arc::new(server_cfg)), true, None);
+
+    // Long header, Initial: flags, version, dcid (8), scid (0), token (0),
+    // length (2-byte varint), then the packet number and payload.
+    let mut pkt = vec![0u8; 1200];
+    pkt[0] = 0xc0;
+    pkt[1..5].copy_from_slice(&VERSION.to_be_bytes());
+    pkt[5] = 8;
+    pkt[6..14].copy_from_slice(&[0xab; 8]);
+    pkt[14] = 0; // scid length
+    pkt[15] = 0; // token length
+    let len = (1200 - 18) as u16;
+    pkt[16..18].copy_from_slice(&(0x4000 | len).to_be_bytes());
+    let pn_offset = 18;
+    pkt[pn_offset + 4..pn_offset + 8].copy_from_slice(&[0xff; 4]);
+    let mut resp = Vec::new();
+    let _ = server.handle(
+        Instant::now(),
+        CLIENT_ADDR.parse().unwrap(),
+        None,
+        None,
+        BytesMut::from(&pkt[..]),
+        &mut resp,
+    );
+}

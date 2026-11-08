@@ -48,6 +48,8 @@ struct ServerSession {
     last_heard: Instant,
     /// When the connection was lost while a shell kept running.
     detached_at: Option<Instant>,
+    /// When the connection arrived (bounds how long a handshake may take).
+    created_at: Instant,
     /// Screen-state pacing: the last diff sent and when.
     diff_sent_seq: u64,
     diff_sent_at: Instant,
@@ -80,9 +82,22 @@ const EXIT_LINGER: Duration = Duration::from_secs(2);
 /// Minimum interval between screen updates (coalesces bursts of output).
 const DIFF_INTERVAL: Duration = Duration::from_millis(8);
 
-/// Cap on sessions (connections in any state), bounding memory and processes
-/// against a flood of handshakes.
+/// Cap on established sessions (connected or detached), bounding memory and
+/// processes.
 const MAX_SESSIONS: usize = 512;
+
+/// Cap on handshakes in progress, separate from established sessions so a
+/// flood of half-open handshakes can't lock out real clients (or a client
+/// coming back to its detached shell).
+const MAX_HANDSHAKES: usize = 256;
+
+/// Above this many handshakes in progress, a client must first prove it owns
+/// its source address (a QUIC Retry round trip), so spoofed-source packets
+/// create no state at all.
+const RETRY_ABOVE: usize = 16;
+
+/// A handshake that hasn't completed within this time is dropped.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Control-stream backlog above which a large screen diff is held back (a
 /// later, up-to-date diff replaces it).
@@ -120,6 +135,8 @@ pub struct ServerCore {
     ever_active: bool,
     detach_grace: Duration,
     reattach_silence: Duration,
+    /// Handshakes in progress above which new clients get a Retry.
+    retry_above: usize,
     /// Stream lifecycle events surfaced to the driver, tagged by session.
     stream_events: Vec<(SessionId, StreamEvent)>,
     /// Remote-forward (`-R`) listen requests surfaced to the driver:
@@ -130,7 +147,9 @@ pub struct ServerCore {
     /// `SSH_AUTH_SOCK=path` in its environment.
     agent_socket_requests: Vec<(SessionId, String)>,
     /// Datagrams produced outside `handle_packet`/`tick` results.
-    out: Vec<(SocketAddr, Vec<u8>)>,
+    out: Vec<quic::Batch>,
+    /// Datagrams per batch the driver's socket can send at once (GSO).
+    max_segments: usize,
 }
 
 impl ServerCore {
@@ -170,10 +189,12 @@ impl ServerCore {
             ever_active: false,
             detach_grace: DETACH_GRACE,
             reattach_silence: REATTACH_SILENCE,
+            retry_above: RETRY_ABOVE,
             stream_events: Vec::new(),
             remote_forward_requests: Vec::new(),
             agent_socket_requests: Vec::new(),
             out: Vec::new(),
+            max_segments: 1,
         }
     }
 
@@ -195,6 +216,13 @@ impl ServerCore {
         self.endpoint.set_server_config(Some(cfg));
         self.detach_grace = grace;
         self.reattach_silence = silence;
+        self
+    }
+
+    /// Send every new client a Retry (address validation) first, or only
+    /// above [`RETRY_ABOVE`] handshakes in progress (the default; tests).
+    pub fn with_retry_always(mut self, always: bool) -> Self {
+        self.retry_above = if always { 0 } else { RETRY_ABOVE };
         self
     }
 
@@ -246,51 +274,102 @@ impl ServerCore {
     /// a connection still in its handshake; an established session's events
     /// and replies are processed by [`ServerCore::tick`]).
     pub fn handle_packet(&mut self, src: SocketAddr, buf: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
+        quic::split_batches(self.handle_datagram(src, None, None, buf))
+    }
+
+    /// Datagrams per batch the driver's socket can send in one call (GSO);
+    /// 1 (the default) yields single datagrams.
+    pub fn set_max_segments(&mut self, n: usize) {
+        self.max_segments = n.max(1);
+    }
+
+    /// [`ServerCore::handle_packet`] with the local address the datagram
+    /// arrived on and its ECN marking (from the socket), returning batches for
+    /// a GSO-capable socket.
+    pub fn handle_datagram(
+        &mut self,
+        src: SocketAddr,
+        local_ip: Option<std::net::IpAddr>,
+        ecn: Option<quinn_proto::EcnCodepoint>,
+        buf: &[u8],
+    ) -> Vec<quic::Batch> {
         let now = Instant::now();
         let mut resp = Vec::new();
-        let sid = match self
-            .endpoint
-            .handle(now, src, None, None, BytesMut::from(buf), &mut resp)
-        {
-            Some(DatagramEvent::NewConnection(incoming)) => {
-                if self.sessions.len() >= MAX_SESSIONS {
-                    let t = self.endpoint.refuse(incoming, &mut resp);
-                    self.out.push((t.destination, resp[..t.size].to_vec()));
-                    None
-                } else {
-                    let mut buf = Vec::new();
-                    match self.endpoint.accept(incoming, now, &mut buf, None) {
-                        Ok((ch, conn)) => Some(self.add_session(ch, conn, now)),
-                        Err(e) => {
-                            if let Some(t) = e.response {
-                                self.out.push((t.destination, buf[..t.size].to_vec()));
+        let sid =
+            match self
+                .endpoint
+                .handle(now, src, local_ip, ecn, BytesMut::from(buf), &mut resp)
+            {
+                Some(DatagramEvent::NewConnection(incoming)) => {
+                    let handshakes = self.sessions.values().filter(|s| !s.established).count();
+                    let established = self.sessions.len() - handshakes;
+                    if handshakes >= self.retry_above
+                        && !incoming.remote_address_validated()
+                        && incoming.may_retry()
+                    {
+                        match self.endpoint.retry(incoming, &mut resp) {
+                            Ok(t) => self.out.push(quic::Batch {
+                                dest: t.destination,
+                                data: resp[..t.size].to_vec(),
+                                segment_size: t.segment_size,
+                                ecn: t.ecn,
+                            }),
+                            Err(e) => self.endpoint.ignore(e.into_incoming()),
+                        }
+                        None
+                    } else if handshakes >= MAX_HANDSHAKES || established >= MAX_SESSIONS {
+                        let t = self.endpoint.refuse(incoming, &mut resp);
+                        self.out.push(quic::Batch {
+                            dest: t.destination,
+                            data: resp[..t.size].to_vec(),
+                            segment_size: t.segment_size,
+                            ecn: t.ecn,
+                        });
+                        None
+                    } else {
+                        let mut buf = Vec::new();
+                        match self.endpoint.accept(incoming, now, &mut buf, None) {
+                            Ok((ch, conn)) => Some(self.add_session(ch, conn, now)),
+                            Err(e) => {
+                                if let Some(t) = e.response {
+                                    self.out.push(quic::Batch {
+                                        dest: t.destination,
+                                        data: buf[..t.size].to_vec(),
+                                        segment_size: t.segment_size,
+                                        ecn: t.ecn,
+                                    });
+                                }
+                                None
                             }
-                            None
                         }
                     }
                 }
-            }
-            Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
-                let sid = self.conns.get(&ch).copied();
-                match sid.and_then(|sid| self.sessions.get_mut(&sid)) {
-                    Some(s) => {
-                        if let Some(conn) = s.conn() {
-                            conn.handle_event(ev);
+                Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
+                    let sid = self.conns.get(&ch).copied();
+                    match sid.and_then(|sid| self.sessions.get_mut(&sid)) {
+                        Some(s) => {
+                            if let Some(conn) = s.conn() {
+                                conn.handle_event(ev);
+                            }
+                            s.last_heard = now;
+                            // Established sessions are serviced once per batch of
+                            // datagrams, in `tick`; handshakes answer at once.
+                            if s.established { None } else { sid }
                         }
-                        s.last_heard = now;
-                        // Established sessions are serviced once per batch of
-                        // datagrams, in `tick`; handshakes answer at once.
-                        if s.established { None } else { sid }
+                        None => None,
                     }
-                    None => None,
                 }
-            }
-            Some(DatagramEvent::Response(t)) => {
-                self.out.push((t.destination, resp[..t.size].to_vec()));
-                None
-            }
-            None => None,
-        };
+                Some(DatagramEvent::Response(t)) => {
+                    self.out.push(quic::Batch {
+                        dest: t.destination,
+                        data: resp[..t.size].to_vec(),
+                        segment_size: t.segment_size,
+                        ecn: t.ecn,
+                    });
+                    None
+                }
+                None => None,
+            };
         if let Some(sid) = sid {
             self.service(sid, now);
         }
@@ -317,6 +396,7 @@ impl ServerCore {
                 exit_status: None,
                 exit_sent_at: None,
                 last_heard: now,
+                created_at: now,
                 detached_at: None,
                 diff_sent_seq: 0,
                 diff_sent_at: now,
@@ -373,7 +453,8 @@ impl ServerCore {
             && let Some((_, conn)) = s.conn.as_mut()
         {
             s.streams.flush(conn);
-            self.out.extend(quic::drain_transmits(conn, now));
+            self.out
+                .extend(quic::drain_transmits(conn, now, self.max_segments));
         }
     }
 
@@ -431,7 +512,8 @@ impl ServerCore {
                 {
                     if let Some((ch, conn)) = o.conn.as_mut() {
                         conn.close(now, VarInt::from_u32(1), "reattached elsewhere".into());
-                        self.out.extend(quic::drain_transmits(conn, now));
+                        self.out
+                            .extend(quic::drain_transmits(conn, now, self.max_segments));
                         self.conns.remove(ch);
                     }
                     let Some(s) = self.sessions.get_mut(&sid) else {
@@ -513,6 +595,11 @@ impl ServerCore {
     /// Pump PTYs into the emulators, send screen updates and exit notices, run
     /// connection timers, and retire finished sessions.
     pub fn tick(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+        quic::split_batches(self.tick_batches())
+    }
+
+    /// [`ServerCore::tick`], returning batches for a GSO-capable socket.
+    pub fn tick_batches(&mut self) -> Vec<quic::Batch> {
         let now = Instant::now();
         let sids: Vec<SessionId> = self.sessions.keys().copied().collect();
         let mut finished = Vec::new();
@@ -554,6 +641,16 @@ impl ServerCore {
                         Some(_) => {}
                     }
                 }
+            }
+            // A handshake that drags on (a spoofed or vanished client) is
+            // dropped rather than holding a slot until the idle timeout.
+            if !s.established
+                && !s.lost
+                && now.duration_since(s.created_at) >= HANDSHAKE_TIMEOUT
+                && let Some((_, conn)) = s.conn.as_mut()
+            {
+                conn.close(now, VarInt::from_u32(0), "handshake timeout".into());
+                s.lost = true;
             }
             if let Some((ch, conn)) = s.conn.as_mut()
                 && conn.is_drained()
@@ -673,6 +770,9 @@ impl ServerCore {
             }
             if let Some(t) = s.detached_at {
                 take(t + self.detach_grace);
+            }
+            if !s.established && !s.lost {
+                take(s.created_at + HANDSHAKE_TIMEOUT);
             }
         }
         next
@@ -800,7 +900,7 @@ impl ServerCore {
 /// UDP driver around [`ServerCore`] for the `noisshd` binary.
 pub struct Server {
     core: ServerCore,
-    socket: UdpSocket,
+    io: crate::udp::UdpIo,
     /// Forwarded TCP connections (both `-L` dial-outs and `-R` accepts), keyed
     /// by (session, stream id).
     forwards: HashMap<(SessionId, u64), crate::forward::ForwardConn>,
@@ -820,8 +920,6 @@ pub struct Server {
         HashMap<(SessionId, u64), crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
     /// Running remote commands, keyed by (session, stdin/stdout stream id).
     execs: HashMap<(SessionId, u64), ExecState>,
-    /// Receive buffer, reused for every datagram.
-    rbuf: Vec<u8>,
 }
 
 /// Per-stream cap on bytes queued for QUIC but not yet taken by it.
@@ -842,18 +940,18 @@ struct ExecState {
 
 impl Server {
     pub fn bind(addr: SocketAddr, core: ServerCore) -> Result<Self, RuntimeError> {
-        let socket = UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
+        let io = crate::udp::UdpIo::new(UdpSocket::bind(addr)?)?;
+        let mut core = core;
+        core.set_max_segments(io.max_segments());
         Ok(Server {
             core,
-            socket,
+            io,
             forwards: HashMap::new(),
             remote_listeners: Vec::new(),
             xfers: HashMap::new(),
             agent_listeners: Vec::new(),
             agent_conns: HashMap::new(),
             execs: HashMap::new(),
-            rbuf: vec![0u8; 65536],
         })
     }
 
@@ -1317,7 +1415,7 @@ impl Server {
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, RuntimeError> {
-        Ok(self.socket.local_addr()?)
+        Ok(self.io.local_addr()?)
     }
 
     /// Wait until the socket, a shell, a forwarded connection or a timer
@@ -1334,7 +1432,12 @@ impl Server {
         if !self.execs.is_empty() {
             timeout = timeout.min(Duration::from_millis(20));
         }
-        let mut fds = vec![PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
+        let sock_flags = if self.io.wants_write() {
+            PollFlags::POLLIN | PollFlags::POLLOUT
+        } else {
+            PollFlags::POLLIN
+        };
+        let mut fds = vec![PollFd::new(self.io.as_fd(), sock_flags)];
         for fd in self.core.poll_fds() {
             fds.push(PollFd::new(fd, PollFlags::POLLIN));
         }
@@ -1399,33 +1502,24 @@ impl Server {
     /// a fatal socket error (the loop should stop).
     pub fn poll_once(&mut self) -> bool {
         self.wait(Duration::from_millis(100));
+        self.io.flush();
         // Bounded, so a flood can't starve the shells and forwards.
-        for _ in 0..256 {
-            match self.socket.recv_from(&mut self.rbuf) {
-                Ok((n, src)) => {
-                    for (addr, pkt) in self.core.handle_packet(src, &self.rbuf[..n]) {
-                        let _ = self.socket.send_to(&pkt, addr);
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::Interrupted =>
-                {
-                    break;
-                }
-                // ICMP errors (port unreachable from a vanished client) surface
-                // here on Linux; they concern one peer, not the socket.
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
-                Err(_) => return false,
+        for _ in 0..64 {
+            let mut replies = Vec::new();
+            let core = &mut self.core;
+            let n = self.io.recv(|r| {
+                replies.extend(core.handle_datagram(r.from, r.local_ip, r.ecn, r.data));
+            });
+            self.io.send(replies);
+            if n == 0 {
+                break;
             }
         }
         // Move bytes between forwarded connections and their session streams
         // before ticking, so freshly-read data ships out in this iteration.
         self.pump_forwards();
-        for (addr, pkt) in self.core.tick() {
-            let _ = self.socket.send_to(&pkt, addr);
-        }
+        let out = self.core.tick_batches();
+        self.io.send(out);
         true
     }
 

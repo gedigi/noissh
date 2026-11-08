@@ -283,3 +283,100 @@ fn undersized_handshake_init_gets_no_reply() {
         "server should answer a properly padded init"
     );
 }
+
+/// Run a client's handshake against `server` from `addr` (in memory).
+fn connect_from(
+    server: &mut ServerCore,
+    client_kp: &noise_core::Keypair,
+    addr: SocketAddr,
+) -> ClientCore {
+    let (mut client, first) = ClientCore::new(
+        client_kp,
+        KnownHosts::new(),
+        "h:1",
+        addr,
+        10,
+        40,
+        DisplayMode::Adaptive,
+    )
+    .unwrap();
+    let mut to_server = vec![first];
+    for _ in 0..20 {
+        let mut to_client = Vec::new();
+        for p in to_server.drain(..) {
+            for (a, o) in server.handle_packet(addr, &p) {
+                if a == addr {
+                    to_client.push(o);
+                }
+            }
+        }
+        for p in to_client {
+            if let Ok(r) = client.handle_packet(&p) {
+                to_server.extend(r);
+            }
+        }
+        to_server.extend(client.tick());
+        for (a, o) in server.tick() {
+            if a == addr {
+                let _ = client.handle_packet(&o);
+            }
+        }
+        if client.is_established() && server.session_count() > 0 {
+            break;
+        }
+    }
+    client
+}
+
+#[test]
+fn handshake_completes_through_a_retry() {
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "ok");
+    let mut server =
+        ServerCore::new(server_kp, authorized, Box::new(LocalLogin), None).with_retry_always(true);
+    let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+    let client = connect_from(&mut server, &client_kp, addr);
+    assert!(
+        client.is_established(),
+        "client never got through the Retry"
+    );
+    assert_eq!(server.session_count(), 1);
+}
+
+#[test]
+fn half_open_handshake_flood_does_not_lock_out_clients() {
+    // Spoofed-source first packets (their answers go nowhere) must not use up
+    // the server: past a threshold every new client must answer a Retry
+    // first, which a spoofer can't, and a real client still gets in.
+    let server_kp = generate_keypair().unwrap();
+    let client_kp = generate_keypair().unwrap();
+    let mut authorized = AuthorizedKeys::new();
+    authorized.add(PublicKey::from_bytes(&client_kp.public).unwrap(), "ok");
+    let mut server = ServerCore::new(server_kp, authorized, Box::new(LocalLogin), None);
+    let attacker_kp = generate_keypair().unwrap();
+    for i in 0..300u32 {
+        let spoofed: SocketAddr = format!("198.51.{}.{}:{}", i / 250, i % 250, 1000 + i)
+            .parse()
+            .unwrap();
+        let (_c, first) = ClientCore::new(
+            &attacker_kp,
+            KnownHosts::new(),
+            "h:1",
+            spoofed,
+            10,
+            40,
+            DisplayMode::Adaptive,
+        )
+        .unwrap();
+        let _ = server.handle_packet(spoofed, &first);
+    }
+    let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+    let client = connect_from(&mut server, &client_kp, addr);
+    assert!(
+        client.is_established(),
+        "a real client was locked out by the flood"
+    );
+    assert_eq!(server.session_count(), 1);
+}

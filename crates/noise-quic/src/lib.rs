@@ -47,7 +47,8 @@ use std::sync::Arc;
 use blake2::Blake2sMac256;
 use blake2::digest::{KeyInit, Mac};
 use bytes::BytesMut;
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::cipher::consts::U10;
+use chacha20::cipher::{KeyIvInit, StreamCipherCore, StreamCipherSeekCore};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
 use quinn_proto::crypto::{
@@ -56,6 +57,7 @@ use quinn_proto::crypto::{
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// noissh's QUIC version: "nois" in ASCII.
 pub const VERSION: u32 = 0x6e6f_6973;
@@ -102,8 +104,8 @@ fn kdf(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 const INITIAL_SALT: &[u8] = b"noissh-quic initial v1 salt";
 const HANDSHAKE_SALT: &[u8] = b"noissh-quic handshake v1 salt";
 
-/// Per-direction secrets for one encryption level.
-#[derive(Clone)]
+/// Per-direction secrets for one encryption level (wiped when dropped).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct Secrets {
     client: [u8; 32],
     server: [u8; 32],
@@ -233,13 +235,21 @@ impl HeaderProtection {
 
     /// The 5-byte mask for a 16-byte sample: the first four bytes are the
     /// block counter (little endian), the rest the nonce.
+    ///
+    /// The counter comes from the packet, so an attacker chooses it freely,
+    /// any of 2^32 values. The keystream block is computed with the ChaCha20
+    /// core directly: the stream-cipher wrapper refuses (panics on) a
+    /// position in the last block of the counter space, which a single forged
+    /// packet with a sample starting `ff ff ff ff` would reach.
     fn mask(&self, sample: &[u8]) -> [u8; 5] {
         let counter = u32::from_le_bytes(sample[..4].try_into().expect("4 bytes"));
         let nonce: [u8; 12] = sample[4..SAMPLE_LEN].try_into().expect("12 bytes");
-        let mut cipher = chacha20::ChaCha20::new((&self.key).into(), (&nonce).into());
-        cipher.seek(u64::from(counter) * 64);
+        let mut core = chacha20::ChaChaCore::<U10>::new((&self.key).into(), (&nonce).into());
+        core.set_block_pos(counter);
+        let mut block = Default::default();
+        core.write_keystream_block(&mut block);
         let mut mask = [0u8; 5];
-        cipher.apply_keystream(&mut mask);
+        mask.copy_from_slice(&block[..5]);
         mask
     }
 
@@ -316,7 +326,7 @@ struct NoiseSession {
     /// Current 1-RTT secrets, for key updates.
     one_rtt: Option<Secrets>,
     /// Secret for `export_keying_material`.
-    exporter: Option<[u8; 32]>,
+    exporter: Option<Zeroizing<[u8; 32]>>,
     /// CRYPTO bytes received but not yet forming a whole framed Noise message.
     inbound: Vec<u8>,
     got_handshake_data: bool,
@@ -458,7 +468,7 @@ impl NoiseSession {
             client: kdf(&c2s, &[b"noissh 1rtt", &h]),
             server: kdf(&s2c, &[b"noissh 1rtt", &h]),
         });
-        self.exporter = Some(kdf(&c2s, &[b"noissh exporter", &s2c, &h]));
+        self.exporter = Some(Zeroizing::new(kdf(&c2s, &[b"noissh exporter", &s2c, &h])));
     }
 }
 
@@ -533,6 +543,17 @@ impl crypto::Session for NoiseSession {
                         "unexpected handshake message",
                     ));
                 }
+            }
+            // Each side receives exactly one message per encryption level,
+            // and the level changes after it (RFC 9001 §4.1.3: a message must
+            // not span a key change). Bytes after it are outside the Noise
+            // transcript: refuse them rather than carry them into the next
+            // message.
+            if !self.inbound.is_empty() {
+                return Err(crypto_error(
+                    ALERT_DECODE_ERROR,
+                    "data after a handshake message",
+                ));
             }
         }
         Ok(handshake_data_ready)
@@ -612,9 +633,26 @@ impl crypto::Session for NoiseSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        let secret = self.exporter.ok_or(ExportKeyingMaterialError)?;
+        let secret = self.exporter.as_ref().ok_or(ExportKeyingMaterialError)?;
+        // Length-prefixed fields, and the output length bound in, so no two
+        // (label, context, length) requests share any output.
+        let (label_len, context_len, out_len) = (
+            (label.len() as u64).to_be_bytes(),
+            (context.len() as u64).to_be_bytes(),
+            (output.len() as u64).to_be_bytes(),
+        );
         for (i, chunk) in output.chunks_mut(32).enumerate() {
-            let block = kdf(&secret, &[label, &[0], context, &(i as u32).to_be_bytes()]);
+            let block = kdf(
+                &secret[..],
+                &[
+                    &label_len,
+                    label,
+                    &context_len,
+                    context,
+                    &out_len,
+                    &(i as u64).to_be_bytes(),
+                ],
+            );
             chunk.copy_from_slice(&block[..chunk.len()]);
         }
         Ok(())
@@ -640,14 +678,14 @@ fn retry_integrity_tag(pseudo: &[u8]) -> [u8; TAG_LEN] {
 
 /// Client side: our static key and how to check the server's.
 pub struct ClientConfig {
-    private_key: [u8; KEY_LEN],
+    private_key: Zeroizing<[u8; KEY_LEN]>,
     verify_server: PeerCheck,
 }
 
 impl ClientConfig {
     pub fn new(private_key: [u8; KEY_LEN], verify_server: PeerCheck) -> Self {
         ClientConfig {
-            private_key,
+            private_key: Zeroizing::new(private_key),
             verify_server,
         }
     }
@@ -666,7 +704,7 @@ impl crypto::ClientConfig for ClientConfig {
         let session = NoiseSession::new(
             Side::Client,
             version,
-            &self.private_key,
+            &self.private_key[..],
             params,
             self.verify_server.clone(),
         )
@@ -677,14 +715,14 @@ impl crypto::ClientConfig for ClientConfig {
 
 /// Server side: our static key and how to authorize clients.
 pub struct ServerConfig {
-    private_key: [u8; KEY_LEN],
+    private_key: Zeroizing<[u8; KEY_LEN]>,
     authorize_client: PeerCheck,
 }
 
 impl ServerConfig {
     pub fn new(private_key: [u8; KEY_LEN], authorize_client: PeerCheck) -> Self {
         ServerConfig {
-            private_key,
+            private_key: Zeroizing::new(private_key),
             authorize_client,
         }
     }
@@ -719,7 +757,7 @@ impl crypto::ServerConfig for ServerConfig {
             NoiseSession::new(
                 Side::Server,
                 version,
-                &self.private_key,
+                &self.private_key[..],
                 params,
                 self.authorize_client.clone(),
             )
@@ -999,6 +1037,58 @@ mod tests {
             h.decrypt(10, &mut pkt);
             assert_eq!(pkt, orig);
         }
+    }
+
+    #[test]
+    fn header_protection_mask_matches_chacha20_over_the_whole_counter_range() {
+        use chacha20::cipher::{StreamCipher, StreamCipherSeek};
+        let h = HeaderProtection::from_secret(&[7u8; 32]);
+        let mut sample = [0u8; SAMPLE_LEN];
+        sample[4..].copy_from_slice(&[3u8; 12]);
+        // Where the stream-cipher API works, the core gives the same mask.
+        for counter in [0u32, 1, 0x1234_5678, 0xffff_fffe] {
+            sample[..4].copy_from_slice(&counter.to_le_bytes());
+            let mut c = chacha20::ChaCha20::new((&h.key).into(), (&[3u8; 12]).into());
+            c.seek(u64::from(counter) * 64);
+            let mut want = [0u8; 5];
+            c.apply_keystream(&mut want);
+            assert_eq!(h.mask(&sample), want, "counter {counter:#x}");
+        }
+        // The last counter value: the stream-cipher API panics here, and the
+        // sample is attacker-controlled. This must simply work.
+        sample[..4].copy_from_slice(&[0xff; 4]);
+        let mut pkt = vec![0u8; 64];
+        pkt[0] = 0xc1;
+        pkt[14..30].copy_from_slice(&sample);
+        h.decrypt(10, &mut pkt);
+        h.encrypt(10, &mut pkt);
+    }
+
+    #[test]
+    fn data_after_a_handshake_message_is_refused() {
+        // Bytes appended to msg1 are outside the Noise transcript (the
+        // Initial keys are public, so anyone can add them).
+        let (mut c, mut s) = sessions(None);
+        let err = exchange(&mut c, &mut s, |m| m.extend_from_slice(&[0, 9, 1, 2]))
+            .expect_err("trailing bytes must be refused");
+        assert!(format!("{err:?}").contains("data after a handshake message"));
+    }
+
+    #[test]
+    fn exporter_separates_label_context_and_length() {
+        let (mut c, mut s) = sessions(None);
+        exchange(&mut c, &mut s, |_| {}).unwrap();
+        let export = |sess: &NoiseSession, label: &[u8], ctx: &[u8], n: usize| {
+            let mut out = vec![0u8; n];
+            sess.export_keying_material(&mut out, label, ctx).unwrap();
+            out
+        };
+        assert_eq!(export(&c, b"a", b"b", 32), export(&s, b"a", b"b", 32));
+        assert_ne!(export(&c, b"a", b"\0b", 32), export(&c, b"a\0", b"b", 32));
+        assert_ne!(
+            export(&c, b"a", b"b", 64)[..32],
+            export(&c, b"a", b"b", 32)[..]
+        );
     }
 
     #[test]

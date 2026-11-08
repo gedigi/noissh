@@ -62,7 +62,17 @@ pub struct ClientCore {
     /// The server's version, from its first control message.
     server_version: Option<String>,
     /// Datagrams produced while handling input, returned by the next call.
-    out: Vec<Vec<u8>>,
+    out: Vec<quic::Batch>,
+    /// Datagrams per batch the driver's socket can send at once (GSO).
+    max_segments: usize,
+}
+
+/// The individual datagrams of `batches`.
+fn flatten(batches: Vec<quic::Batch>) -> Vec<Vec<u8>> {
+    quic::split_batches(batches)
+        .into_iter()
+        .map(|(_, d)| d)
+        .collect()
 }
 
 /// Validate a server-supplied version string before storing it — it is later
@@ -173,15 +183,24 @@ impl ClientCore {
             remote_forwards: Vec::new(),
             server_version: None,
             out: Vec::new(),
+            max_segments: 1,
         };
         core.start_connection()?;
-        let mut first = core.transmits();
+        let mut first = flatten(core.batches());
         let head = if first.is_empty() {
             Vec::new()
         } else {
             first.remove(0)
         };
-        core.out = first;
+        core.out = first
+            .into_iter()
+            .map(|d| quic::Batch {
+                dest: server_addr,
+                data: d,
+                segment_size: None,
+                ecn: None,
+            })
+            .collect();
         Ok((core, head))
     }
 
@@ -207,7 +226,7 @@ impl ClientCore {
     /// the running shell and sends it in full. Returns the datagrams to send.
     pub fn reconnect(&mut self) -> Result<Vec<Vec<u8>>, RuntimeError> {
         self.start_connection()?;
-        Ok(self.transmits())
+        Ok(flatten(self.batches()))
     }
 
     /// Whether the session has been established (the first handshake
@@ -321,16 +340,26 @@ impl ClientCore {
     /// handshake failure (host key mismatch, rejected client key) is an error;
     /// a lost connection after that is reported by [`ClientCore::lost_reason`].
     pub fn handle_packet(&mut self, buf: &[u8]) -> Result<Vec<Vec<u8>>, RuntimeError> {
+        let from = self.server_addr;
+        self.handle_datagram(from, None, None, buf).map(flatten)
+    }
+
+    /// [`ClientCore::handle_packet`] with the datagram's source, the local
+    /// address it arrived on and its ECN marking (from the socket), returning
+    /// batches for a GSO-capable socket.
+    pub fn handle_datagram(
+        &mut self,
+        from: SocketAddr,
+        local_ip: Option<std::net::IpAddr>,
+        ecn: Option<quinn_proto::EcnCodepoint>,
+        buf: &[u8],
+    ) -> Result<Vec<quic::Batch>, RuntimeError> {
         let now = Instant::now();
         let mut resp = Vec::new();
-        match self.endpoint.handle(
-            now,
-            self.server_addr,
-            None,
-            None,
-            BytesMut::from(buf),
-            &mut resp,
-        ) {
+        match self
+            .endpoint
+            .handle(now, from, local_ip, ecn, BytesMut::from(buf), &mut resp)
+        {
             Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
                 if let Some((h, conn)) = self.conn.as_mut()
                     && *h == ch
@@ -338,7 +367,12 @@ impl ClientCore {
                     conn.handle_event(ev);
                 }
             }
-            Some(DatagramEvent::Response(t)) => self.out.push(resp[..t.size].to_vec()),
+            Some(DatagramEvent::Response(t)) => self.out.push(quic::Batch {
+                dest: t.destination,
+                data: resp[..t.size].to_vec(),
+                segment_size: t.segment_size,
+                ecn: t.ecn,
+            }),
             _ => {}
         }
         if self.established {
@@ -349,11 +383,22 @@ impl ClientCore {
         if let Some(e) = self.failure.take() {
             return Err(e);
         }
-        Ok(self.transmits())
+        Ok(self.batches())
     }
 
     /// Run timers and the application logic; returns datagrams to send.
     pub fn tick(&mut self) -> Vec<Vec<u8>> {
+        flatten(self.tick_batches())
+    }
+
+    /// Datagrams per batch the driver's socket can send in one call (GSO);
+    /// 1 (the default) yields single datagrams.
+    pub fn set_max_segments(&mut self, n: usize) {
+        self.max_segments = n.max(1);
+    }
+
+    /// [`ClientCore::tick`], returning batches for a GSO-capable socket.
+    pub fn tick_batches(&mut self) -> Vec<quic::Batch> {
         let now = Instant::now();
         if let Some((_, conn)) = self.conn.as_mut()
             && conn.poll_timeout().is_some_and(|t| t <= now)
@@ -361,7 +406,7 @@ impl ClientCore {
             conn.handle_timeout(now);
         }
         self.process(now);
-        self.transmits()
+        self.batches()
     }
 
     /// A handshake failure recorded by [`ClientCore::tick`], if any.
@@ -382,14 +427,14 @@ impl ClientCore {
         false
     }
 
-    fn transmits(&mut self) -> Vec<Vec<u8>> {
+    fn batches(&mut self) -> Vec<quic::Batch> {
         let mut out = std::mem::take(&mut self.out);
         if let Some((_, conn)) = self.conn.as_mut() {
-            out.extend(
-                quic::drain_transmits(conn, Instant::now())
-                    .into_iter()
-                    .map(|(_, d)| d),
-            );
+            out.extend(quic::drain_transmits(
+                conn,
+                Instant::now(),
+                self.max_segments,
+            ));
         }
         out
     }
@@ -569,14 +614,14 @@ impl ClientCore {
         if let Some(conn) = self.conn() {
             conn.ping();
         }
-        self.transmits()
+        flatten(self.batches())
     }
 }
 
 /// UDP driver around [`ClientCore`] for the `noissh` binary.
 pub struct Client {
     core: ClientCore,
-    socket: UdpSocket,
+    io: crate::udp::UdpIo,
     server_addr: SocketAddr,
     /// Local SSH agent socket path (`$SSH_AUTH_SOCK`) to bridge forwarded agent
     /// streams to. `None` disables agent forwarding.
@@ -584,8 +629,6 @@ pub struct Client {
     /// Live agent-forwarding connections (client side), keyed by stream id.
     agent_conns:
         std::collections::HashMap<u64, crate::forward::ForwardConn<std::os::unix::net::UnixStream>>,
-    /// Receive buffer, reused for every datagram.
-    rbuf: Vec<u8>,
 }
 
 impl Client {
@@ -633,8 +676,7 @@ impl Client {
         } else {
             "0.0.0.0:0".parse().unwrap()
         };
-        let socket = UdpSocket::bind(bind)?;
-        socket.set_read_timeout(Some(Duration::from_millis(20)))?;
+        let io = crate::udp::UdpIo::new(UdpSocket::bind(bind)?)?;
         let (mut core, first) = ClientCore::new(
             keypair,
             known,
@@ -648,24 +690,24 @@ impl Client {
         // Agent forwarding must be requested before the handshake completes, as
         // the OpenShell carrying the flag is sent the instant the session is up.
         core.set_want_agent(agent_sock.is_some());
-        let _ = socket.send_to(&first, server_addr);
+        core.set_max_segments(io.max_segments());
         let mut client = Client {
             core,
-            socket,
+            io,
             server_addr,
             agent_sock,
             agent_conns: std::collections::HashMap::new(),
-            rbuf: vec![0u8; 65536],
         };
+        client.send_dgram(&first)?;
         // Drive the handshake to completion within the connect timeout.
         let deadline = std::time::Instant::now() + connect_timeout;
         while !client.core.is_established() {
             if std::time::Instant::now() > deadline {
                 return Err(RuntimeError::Timeout);
             }
+            client.wait_readable(Duration::from_millis(20));
             client.pump_once()?;
         }
-        client.socket.set_nonblocking(true)?;
         Ok(client)
     }
 
@@ -685,9 +727,8 @@ impl Client {
         } else {
             "0.0.0.0:0".parse().unwrap()
         };
-        let socket = UdpSocket::bind(bind)?;
-        socket.set_nonblocking(true)?;
-        self.socket = socket;
+        self.io = crate::udp::UdpIo::new(UdpSocket::bind(bind)?)?;
+        self.core.set_max_segments(self.io.max_segments());
         // Announce the new address at once: the server migrates the
         // connection to whatever address its latest packet came from, and an
         // idle client would otherwise stay silent until its next keep-alive.
@@ -696,7 +737,26 @@ impl Client {
 
     /// Borrow the UDP socket (e.g. to register it with a poller).
     pub fn socket(&self) -> &UdpSocket {
-        &self.socket
+        self.io.socket()
+    }
+
+    /// The events to wait for on the UDP socket: readable, plus writable
+    /// while datagrams are queued for it.
+    pub fn socket_flags(&self) -> nix::poll::PollFlags {
+        use nix::poll::PollFlags;
+        if self.io.wants_write() {
+            PollFlags::POLLIN | PollFlags::POLLOUT
+        } else {
+            PollFlags::POLLIN
+        }
+    }
+
+    /// Wait until the socket is readable (or writable while datagrams are
+    /// queued), at most `max`.
+    fn wait_readable(&self, max: Duration) {
+        use nix::poll::{PollFd, poll};
+        let mut fds = [PollFd::new(self.io.as_fd(), self.socket_flags())];
+        let _ = poll(&mut fds, poll_timeout(max));
     }
 
     /// Whether agent forwarding is active (a local agent socket was provided).
@@ -787,19 +847,17 @@ impl Client {
         remote: &[(u16, String)],
         dynamic: &[(String, u16)],
     ) -> Result<(), RuntimeError> {
-        use nix::poll::{PollFd, PollFlags, poll};
-        use std::os::fd::AsFd;
+        use nix::poll::{PollFd, poll};
 
         // The loop waits via poll(); the UDP socket must be non-blocking so
         // recv drains to WouldBlock instead of blocking.
-        self.socket.set_nonblocking(true)?;
         let mut fwd = Forwarder::bind(&mut self.core, self.server_addr, local, remote, dynamic)?;
 
         loop {
             let timeout = self.wait_time(fwd.is_busy());
             {
-                let sock = self.socket.as_fd();
-                let mut fds = vec![PollFd::new(sock, PollFlags::POLLIN)];
+                let sock = self.io.as_fd();
+                let mut fds = vec![PollFd::new(sock, self.socket_flags())];
                 for (fd, flags) in fwd.poll_fds(&self.core) {
                     fds.push(PollFd::new(fd, flags));
                 }
@@ -834,11 +892,9 @@ impl Client {
         req: &proto::XferRequest,
         local: &str,
     ) -> Result<(), RuntimeError> {
-        use nix::poll::{PollFd, PollFlags, poll};
-        use std::os::fd::AsFd;
+        use nix::poll::{PollFd, poll};
 
         // poll()-driven loop, so the UDP socket must be non-blocking.
-        self.socket.set_nonblocking(true)?;
 
         const SEND_CAP: u64 = 4 * 1024 * 1024;
         const CHUNK: usize = 64 * 1024;
@@ -868,8 +924,8 @@ impl Client {
             let busy = source.is_some() && !sent_fin && self.core.stream_in_flight(id) < SEND_CAP;
             let timeout = self.wait_time(busy);
             {
-                let sock = self.socket.as_fd();
-                let mut fds = [PollFd::new(sock, PollFlags::POLLIN)];
+                let sock = self.io.as_fd();
+                let mut fds = [PollFd::new(sock, self.socket_flags())];
                 let _ = poll(&mut fds, poll_timeout(timeout));
             }
 
@@ -956,7 +1012,6 @@ impl Client {
         use std::io::Read;
         use std::os::fd::AsFd;
 
-        self.socket.set_nonblocking(true)?;
         let mut fwd = Forwarder::bind(
             &mut self.core,
             self.server_addr,
@@ -983,9 +1038,9 @@ impl Client {
         loop {
             let timeout = self.wait_time(fwd.is_busy());
             {
-                let sock = self.socket.as_fd();
+                let sock = self.io.as_fd();
                 let inp = stdin.as_fd();
-                let mut fds = vec![PollFd::new(sock, PollFlags::POLLIN)];
+                let mut fds = vec![PollFd::new(sock, self.socket_flags())];
                 // Stop reading stdin while the stream is backed up.
                 if !stdin_eof && self.core.stream_in_flight(e) < FORWARD_SEND_CAP {
                     fds.push(PollFd::new(inp, PollFlags::POLLIN));
@@ -1123,36 +1178,47 @@ impl Client {
     /// e.g. while roaming between Wi-Fi and cellular) just drops the datagram —
     /// QUIC's loss recovery retransmits, and the connection migrates to the
     /// new address once connectivity returns.
-    fn send_dgram(&self, pkt: &[u8]) -> Result<(), RuntimeError> {
-        let _ = self.socket.send_to(pkt, self.server_addr);
+    fn send_dgram(&mut self, pkt: &[u8]) -> Result<(), RuntimeError> {
+        self.io.send([crate::quic::Batch {
+            dest: self.server_addr,
+            data: pkt.to_vec(),
+            segment_size: None,
+            ecn: None,
+        }]);
         Ok(())
     }
 
-    /// Drain a single ready datagram (non-blocking) and send any replies.
-    /// Returns true if a datagram was processed. Receive errors are treated as
-    /// "nothing right now" (transient) rather than fatal, so a network outage
-    /// doesn't tear the session down.
+    /// Receive the datagrams that are ready (one batch, non-blocking) and send
+    /// any replies. Returns true if any datagram was processed. Receive errors
+    /// are treated as "nothing right now" (transient) rather than fatal, so a
+    /// network outage doesn't tear the session down.
     pub fn recv_and_handle(&mut self) -> Result<bool, RuntimeError> {
-        match self.socket.recv_from(&mut self.rbuf) {
-            Ok((n, _src)) => {
-                // `?` so a handshake-time failure (e.g. HOST KEY MISMATCH) still
-                // aborts; transport-layer junk is dropped inside handle_packet.
-                for pkt in self.core.handle_packet(&self.rbuf[..n])? {
-                    self.send_dgram(&pkt)?;
-                }
-                Ok(true)
+        let mut replies = Vec::new();
+        let mut failure = None;
+        let core = &mut self.core;
+        let n = self.io.recv(|r| {
+            if failure.is_some() {
+                return;
             }
-            // Any receive error (would-block, timed out, or a transient
-            // network-down/unreachable during roaming) means "no data now".
-            Err(_) => Ok(false),
+            // A handshake-time failure (e.g. HOST KEY MISMATCH) aborts;
+            // transport-layer junk is dropped inside handle_datagram.
+            match core.handle_datagram(r.from, r.local_ip, r.ecn, r.data) {
+                Ok(b) => replies.extend(b),
+                Err(e) => failure = Some(e),
+            }
+        });
+        self.io.send(replies);
+        if let Some(e) = failure {
+            return Err(e);
         }
+        Ok(n > 0)
     }
 
     /// Run timers and send whatever the connection has queued.
     pub fn flush(&mut self) -> Result<(), RuntimeError> {
-        for pkt in self.core.tick() {
-            self.send_dgram(&pkt)?;
-        }
+        self.io.flush();
+        let out = self.core.tick_batches();
+        self.io.send(out);
         match self.core.take_failure() {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1185,15 +1251,7 @@ impl Client {
             if remaining.is_zero() {
                 break;
             }
-            {
-                use nix::poll::{PollFd, PollFlags, poll};
-                use std::os::fd::AsFd;
-                let mut fds = [PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
-                let _ = poll(
-                    &mut fds,
-                    poll_timeout(remaining.min(Duration::from_millis(20))),
-                );
-            }
+            self.wait_readable(remaining.min(Duration::from_millis(20)));
             if self.pump_once().is_err() {
                 break;
             }

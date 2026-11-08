@@ -36,14 +36,30 @@ struct Args {
     size_mb: u64,
     tools: Vec<String>,
     bin_dir: PathBuf,
+    /// Run without the userspace link (the path is impaired outside, e.g. by
+    /// `netem`, or not at all).
+    no_link: bool,
+    noissh_port: Option<u16>,
+    ssh_port: Option<u16>,
+    timeout: Duration,
+}
+
+/// How a tool is reached: through the userspace link with this impairment,
+/// or directly; and on which server port (random if `None`).
+#[derive(Clone, Copy)]
+struct Path_ {
+    link: Option<Impairment>,
+    port: Option<u16>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: noissh-bench [--rtt MS] [--jitter MS] [--loss PCT] [--size MB]\n\
-         \x20                   [--tools noissh,ssh] [--bin-dir DIR]\n\
+         \x20                   [--tools noissh,ssh] [--bin-dir DIR] [--timeout S]\n\
+         \x20                   [--no-link] [--noissh-port N] [--ssh-port N]\n\
          defaults: --rtt 40 --jitter 0 --loss 0 --size 20 --tools noissh,ssh\n\
-         \x20         --bin-dir target/release (noissh, noisshd, noissh-keygen)"
+         \x20         --bin-dir target/release (noissh, noisshd, noissh-keygen)\n\
+         \x20         --timeout 120 (per transfer); random server ports"
     );
     std::process::exit(2)
 }
@@ -56,6 +72,10 @@ fn parse_args() -> Args {
         size_mb: 20,
         tools: vec!["noissh".into(), "ssh".into()],
         bin_dir: PathBuf::from("target/release"),
+        no_link: false,
+        noissh_port: None,
+        ssh_port: None,
+        timeout: Duration::from_secs(120),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -67,6 +87,12 @@ fn parse_args() -> Args {
             "--size" => a.size_mb = val().parse().unwrap_or_else(|_| usage()),
             "--tools" => a.tools = val().split(',').map(str::to_string).collect(),
             "--bin-dir" => a.bin_dir = PathBuf::from(val()),
+            "--no-link" => a.no_link = true,
+            "--noissh-port" => a.noissh_port = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--ssh-port" => a.ssh_port = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--timeout" => {
+                a.timeout = Duration::from_secs(val().parse().unwrap_or_else(|_| usage()))
+            }
             _ => usage(),
         }
     }
@@ -166,13 +192,18 @@ fn echo(port: u16, n: usize) -> Option<(Duration, Duration)> {
 }
 
 /// Echo while bulk downloads run back to back on another connection.
-fn echo_under_load(port: u16, n: usize, bulk_bytes: u64) -> Option<(Duration, Duration)> {
+fn echo_under_load(
+    port: u16,
+    n: usize,
+    bulk_bytes: u64,
+    timeout: Duration,
+) -> Option<(Duration, Duration)> {
     let stop = Arc::new(AtomicBool::new(false));
     let loader = {
         let stop = stop.clone();
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                if bulk(port, bulk_bytes, Duration::from_secs(120)).is_none() {
+                if bulk(port, bulk_bytes, timeout).is_none() {
                     break;
                 }
             }
@@ -250,7 +281,7 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-fn start_noissh(bin: &Path, data: SocketAddr, imp: Impairment) -> Result<Running, String> {
+fn start_noissh(bin: &Path, data: SocketAddr, path: Path_) -> Result<Running, String> {
     let dir = TempDir::new("noissh");
     let cfg = dir.0.join("cfg");
     let run = |name: &str| {
@@ -262,21 +293,26 @@ fn start_noissh(bin: &Path, data: SocketAddr, imp: Impairment) -> Result<Running
         .output()
         .map_err(|e| format!("noissh-keygen: {e}"))?;
     std::fs::write(cfg.join("noissh/authorized_keys"), &out.stdout).map_err(|e| e.to_string())?;
-    let server_port = free_udp_port();
+    let server_port = path.port.unwrap_or_else(free_udp_port);
     let daemon = run("noisshd")
         .args(["--listen", &format!("127.0.0.1:{server_port}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("noisshd: {e}"))?;
-    let udp =
-        UdpLink::start(([127, 0, 0, 1], server_port).into(), imp).map_err(|e| e.to_string())?;
+    let udp = match path.link {
+        Some(imp) => Some(
+            UdpLink::start(([127, 0, 0, 1], server_port).into(), imp).map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+    let connect_port = udp.as_ref().map_or(server_port, |u| u.front.port());
     let fwd = free_tcp_port();
     let client = run("noissh")
         .args([
             "--direct",
             "--port",
-            &udp.front.port().to_string(),
+            &connect_port.to_string(),
             "-N",
             "-L",
             &format!("{fwd}:{data}"),
@@ -289,7 +325,7 @@ fn start_noissh(bin: &Path, data: SocketAddr, imp: Impairment) -> Result<Running
     let running = Running {
         children: vec![client, daemon],
         forward_port: fwd,
-        udp: Some(udp),
+        udp,
         _tcp: None,
         _dir: dir,
     };
@@ -299,7 +335,7 @@ fn start_noissh(bin: &Path, data: SocketAddr, imp: Impairment) -> Result<Running
     Ok(running)
 }
 
-fn start_ssh(data: SocketAddr, imp: Impairment) -> Result<Running, String> {
+fn start_ssh(data: SocketAddr, path: Path_) -> Result<Running, String> {
     let dir = TempDir::new("ssh");
     let d = &dir.0;
     for (key, path) in [("host", d.join("host")), ("client", d.join("client"))] {
@@ -313,7 +349,7 @@ fn start_ssh(data: SocketAddr, imp: Impairment) -> Result<Running, String> {
         }
     }
     std::fs::copy(d.join("client.pub"), d.join("authorized_keys")).map_err(|e| e.to_string())?;
-    let port = free_tcp_port();
+    let port = path.port.unwrap_or_else(free_tcp_port);
     let config = format!(
         "Port {port}\nListenAddress 127.0.0.1\nHostKey {host}\nAuthorizedKeysFile {ak}\n\
          PidFile {pid}\nStrictModes no\nUsePAM no\nPermitRootLogin yes\n\
@@ -338,11 +374,17 @@ fn start_ssh(data: SocketAddr, imp: Impairment) -> Result<Running, String> {
     if !wait_for_port(port, Duration::from_secs(10)) {
         return Err("sshd never listened".into());
     }
-    let tcp = TcpLink::start(([127, 0, 0, 1], port).into(), imp).map_err(|e| e.to_string())?;
+    let tcp = match path.link {
+        Some(imp) => {
+            Some(TcpLink::start(([127, 0, 0, 1], port).into(), imp).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+    let connect_port = tcp.as_ref().map_or(port, |t| t.front.port());
     let fwd = free_tcp_port();
     let client = Command::new("ssh")
         .args(["-N", "-L", &format!("{fwd}:{data}"), "-p"])
-        .arg(tcp.front.port().to_string())
+        .arg(connect_port.to_string())
         .arg("-i")
         .arg(d.join("client"))
         .args([
@@ -365,7 +407,7 @@ fn start_ssh(data: SocketAddr, imp: Impairment) -> Result<Running, String> {
         children: vec![client, daemon],
         forward_port: fwd,
         udp: None,
-        _tcp: Some(tcp),
+        _tcp: tcp,
         _dir: dir,
     };
     if !wait_for_port(fwd, Duration::from_secs(15)) {
@@ -389,18 +431,36 @@ fn main() {
     };
     let data = start_data_server();
     let bytes = a.size_mb * 1_000_000;
-    println!(
-        "path: RTT {} ms, jitter {} ms, loss {}% (loss applies to UDP only)",
-        a.rtt_ms, a.jitter_ms, a.loss_pct
-    );
+    if a.no_link {
+        println!("path: no userspace link (impaired outside the harness, if at all)");
+    } else {
+        println!(
+            "path: RTT {} ms, jitter {} ms, loss {}% (loss applies to UDP only)",
+            a.rtt_ms, a.jitter_ms, a.loss_pct
+        );
+    }
+    let link = (!a.no_link).then_some(imp);
     println!(
         "{:<8} {:>12} {:>16} {:>18} {:>16}",
         "tool", "bulk MB/s", "echo p50/p95", "echo loaded p50/95", "idle pkts/s"
     );
     for tool in &a.tools {
         let started = match tool.as_str() {
-            "noissh" => start_noissh(&a.bin_dir, data, imp),
-            "ssh" => start_ssh(data, imp),
+            "noissh" => start_noissh(
+                &a.bin_dir,
+                data,
+                Path_ {
+                    link,
+                    port: a.noissh_port,
+                },
+            ),
+            "ssh" => start_ssh(
+                data,
+                Path_ {
+                    link,
+                    port: a.ssh_port,
+                },
+            ),
             other => Err(format!("unknown tool {other}")),
         };
         let r = match started {
@@ -411,13 +471,13 @@ fn main() {
             }
         };
         let port = r.forward_port;
-        let mbps = bulk(port, bytes, Duration::from_secs(120))
+        let mbps = bulk(port, bytes, a.timeout)
             .map(|t| format!("{:.2}", bytes as f64 / 1e6 / t.as_secs_f64()))
             .unwrap_or_else(|| "timeout".into());
         let idle = echo(port, 50)
             .map(|(a, b)| format!("{}/{}", ms(a), ms(b)))
             .unwrap_or_else(|| "failed".into());
-        let loaded = echo_under_load(port, 50, bytes)
+        let loaded = echo_under_load(port, 50, bytes, a.timeout)
             .map(|(a, b)| format!("{}/{}", ms(a), ms(b)))
             .unwrap_or_else(|| "failed".into());
         let pps = match &r.udp {

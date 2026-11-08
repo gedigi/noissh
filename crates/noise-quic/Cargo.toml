@@ -6,6 +6,7 @@ license.workspace = true
 description = "Noise XX handshake as the crypto layer of quinn-proto QUIC connections"
 
 [dependencies]
+zeroize = { version = "1", features = ["derive"] }
 quinn-proto.workspace = true
 bytes.workspace = true
 snow = { workspace = true, features = ["risky-raw-split"] }

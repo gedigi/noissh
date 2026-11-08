@@ -588,15 +588,49 @@ impl Streams {
     }
 }
 
-/// Drain a connection's outgoing datagrams.
+/// Outgoing datagrams for one destination: one datagram, or (with GSO)
+/// several of `segment_size` bytes each (the last may be shorter), sent in
+/// one system call.
+#[derive(Debug, Clone)]
+pub struct Batch {
+    pub dest: std::net::SocketAddr,
+    pub data: Vec<u8>,
+    pub segment_size: Option<usize>,
+    pub ecn: Option<quinn_proto::EcnCodepoint>,
+}
+
+impl Batch {
+    /// The individual datagrams.
+    pub fn datagrams(&self) -> impl Iterator<Item = &[u8]> {
+        let size = self.segment_size.unwrap_or(self.data.len()).max(1);
+        self.data.chunks(size)
+    }
+}
+
+/// Split batches into individual datagrams (for callers without GSO).
+pub fn split_batches(batches: Vec<Batch>) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+    let mut out = Vec::new();
+    for b in &batches {
+        out.extend(b.datagrams().map(|d| (b.dest, d.to_vec())));
+    }
+    out
+}
+
+/// Drain a connection's outgoing datagrams, up to `max_segments` per batch.
 pub fn drain_transmits(
     conn: &mut Connection,
     now: std::time::Instant,
-) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+    max_segments: usize,
+) -> Vec<Batch> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
-    while let Some(t) = conn.poll_transmit(now, 1, &mut buf) {
-        out.push((t.destination, buf[..t.size].to_vec()));
+    while let Some(t) = conn.poll_transmit(now, max_segments.max(1), &mut buf) {
+        out.push(Batch {
+            dest: t.destination,
+            data: buf[..t.size].to_vec(),
+            segment_size: t.segment_size,
+            ecn: t.ecn,
+        });
         buf.clear();
     }
     out

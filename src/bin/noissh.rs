@@ -813,9 +813,7 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     let _raw = RawMode::enable()?;
     let mut renderer = Renderer::new();
 
-    // The loop waits via poll(); make the UDP socket non-blocking so draining
-    // recv returns WouldBlock instead of blocking on each retransmit.
-    client.socket().set_nonblocking(true).ok();
+    // The loop waits via poll(); the UDP socket is non-blocking.
 
     let stdin = std::io::stdin();
     set_nonblocking(stdin.as_fd());
@@ -874,7 +872,7 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
             let sock = client.socket().as_fd();
             let inp = stdin.as_fd();
             let mut fds = vec![
-                PollFd::new(sock, PollFlags::POLLIN),
+                PollFd::new(sock, client.socket_flags()),
                 PollFd::new(inp, PollFlags::POLLIN),
             ];
             // Also wait on any forwarded agent connections (no busy-spin).

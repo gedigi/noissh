@@ -19,6 +19,7 @@ pub mod ssh;
 pub mod sshconfig;
 pub mod status;
 pub mod tty;
+pub mod udp;
 pub mod xfer;
 
 use thiserror::Error;
