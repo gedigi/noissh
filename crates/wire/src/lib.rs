@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
-//! Wire frame codec for noissh.
+//! Frame codec for noissh's session layer.
 //!
-//! Defines the plaintext frame format carried inside each Noise-encrypted
-//! datagram. Reserves both datagram (v1) and stream (v2) frame classes from
-//! day one so v2 needs no protocol break.
+//! These frames travel inside QUIC (see the main crate's `quic` module):
+//! screen-state diffs as QUIC datagrams (or on the control stream when too
+//! large), and acks, keystrokes and control messages on the control stream.
+//! Each stream of another kind starts with a [`StreamKind`] byte.
 
 use thiserror::Error;
 
@@ -21,12 +22,11 @@ pub enum WireError {
     BadUtf8,
 }
 
-/// Stream kinds for v2 multiplexed streams.
+/// What a QUIC stream carries, from the first byte of its header. (Byte 0 is
+/// the control stream.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
-    /// A shell/exec channel.
-    Session = 0,
-    /// A forwarded TCP connection (-L/-R).
+    /// A forwarded TCP connection (-L/-R/-D).
     Forward = 1,
     /// File-transfer subsystem.
     FileTransfer = 2,
@@ -37,95 +37,36 @@ pub enum StreamKind {
 }
 
 impl StreamKind {
-    fn from_u8(v: u8) -> Result<Self, WireError> {
-        Ok(match v {
-            0 => StreamKind::Session,
+    /// The kind for a header byte, if it names one.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
             1 => StreamKind::Forward,
             2 => StreamKind::FileTransfer,
             3 => StreamKind::Agent,
             4 => StreamKind::Exec,
-            other => return Err(WireError::UnknownFrame(other)),
+            _ => return None,
         })
     }
 }
 
-/// A single protocol frame. Many frames are packed into one datagram payload.
+/// A session-layer frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    // --- v1 datagram class ---
-    /// Acknowledge the highest contiguous state-sync sequence applied.
-    Ack {
-        seq: u64,
-    },
-    /// Client keystroke bytes as a reliable append-only stream from `offset`.
-    Input {
-        offset: u64,
-        data: Vec<u8>,
-    },
-    /// Latest-wins terminal state diff: `seq` is this state's id, `base` is the
-    /// state id it was diffed against (0 = full snapshot).
-    StateDiff {
-        seq: u64,
-        base: u64,
-        data: Vec<u8>,
-    },
-    /// Window resize.
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    /// Liveness probe carrying an opaque timestamp.
-    Ping {
-        stamp: u64,
-    },
-    Pong {
-        stamp: u64,
-    },
-
-    // --- v2 stream class ---
-    StreamOpen {
-        id: u64,
-        kind: StreamKind,
-        meta: Vec<u8>,
-    },
-    StreamData {
-        id: u64,
-        offset: u64,
-        data: Vec<u8>,
-        fin: bool,
-    },
-    StreamAck {
-        id: u64,
-        ack: u64,
-        window: u32,
-    },
-    StreamClose {
-        id: u64,
-        status: i32,
-    },
-    StreamReset {
-        id: u64,
-    },
-
-    // --- control ---
-    /// Opaque control-channel message (proto crate defines payload).
-    Control {
-        data: Vec<u8>,
-    },
+    /// Client → server: the highest screen state (`seq`) the client applied.
+    Ack { seq: u64 },
+    /// Client → server: keystroke bytes for the shell.
+    Input { data: Vec<u8> },
+    /// Server → client: latest-wins terminal state diff: `seq` is this state's
+    /// id, `base` is the state id it was diffed against (0 = full snapshot).
+    StateDiff { seq: u64, base: u64, data: Vec<u8> },
+    /// Control-channel message (the proto crate defines the payload).
+    Control { data: Vec<u8> },
 }
 
 // Frame type tags.
 const T_ACK: u8 = 0x01;
 const T_INPUT: u8 = 0x02;
 const T_STATEDIFF: u8 = 0x03;
-const T_RESIZE: u8 = 0x04;
-const T_PING: u8 = 0x05;
-const T_PONG: u8 = 0x06;
-const T_STREAM_OPEN: u8 = 0x10;
-const T_STREAM_DATA: u8 = 0x11;
-const T_STREAM_ACK: u8 = 0x12;
-const T_STREAM_CLOSE: u8 = 0x13;
-const T_STREAM_RESET: u8 = 0x14;
 const T_CONTROL: u8 = 0x20;
 
 /// Append a LEB128 unsigned varint.
@@ -190,9 +131,8 @@ impl Frame {
                 out.push(T_ACK);
                 put_varint(out, *seq);
             }
-            Frame::Input { offset, data } => {
+            Frame::Input { data } => {
                 out.push(T_INPUT);
-                put_varint(out, *offset);
                 put_bytes(out, data);
             }
             Frame::StateDiff { seq, base, data } => {
@@ -200,53 +140,6 @@ impl Frame {
                 put_varint(out, *seq);
                 put_varint(out, *base);
                 put_bytes(out, data);
-            }
-            Frame::Resize { cols, rows } => {
-                out.push(T_RESIZE);
-                put_varint(out, *cols as u64);
-                put_varint(out, *rows as u64);
-            }
-            Frame::Ping { stamp } => {
-                out.push(T_PING);
-                put_varint(out, *stamp);
-            }
-            Frame::Pong { stamp } => {
-                out.push(T_PONG);
-                put_varint(out, *stamp);
-            }
-            Frame::StreamOpen { id, kind, meta } => {
-                out.push(T_STREAM_OPEN);
-                put_varint(out, *id);
-                out.push(*kind as u8);
-                put_bytes(out, meta);
-            }
-            Frame::StreamData {
-                id,
-                offset,
-                data,
-                fin,
-            } => {
-                out.push(T_STREAM_DATA);
-                put_varint(out, *id);
-                put_varint(out, *offset);
-                out.push(if *fin { 1 } else { 0 });
-                put_bytes(out, data);
-            }
-            Frame::StreamAck { id, ack, window } => {
-                out.push(T_STREAM_ACK);
-                put_varint(out, *id);
-                put_varint(out, *ack);
-                put_varint(out, *window as u64);
-            }
-            Frame::StreamClose { id, status } => {
-                out.push(T_STREAM_CLOSE);
-                put_varint(out, *id);
-                // zig-zag encode signed status
-                put_varint(out, zigzag(*status as i64));
-            }
-            Frame::StreamReset { id } => {
-                out.push(T_STREAM_RESET);
-                put_varint(out, *id);
             }
             Frame::Control { data } => {
                 out.push(T_CONTROL);
@@ -262,7 +155,6 @@ impl Frame {
                 seq: get_varint(buf, pos)?,
             },
             T_INPUT => Frame::Input {
-                offset: get_varint(buf, pos)?,
                 data: get_bytes(buf, pos)?,
             },
             T_STATEDIFF => Frame::StateDiff {
@@ -270,59 +162,12 @@ impl Frame {
                 base: get_varint(buf, pos)?,
                 data: get_bytes(buf, pos)?,
             },
-            T_RESIZE => Frame::Resize {
-                cols: get_varint(buf, pos)? as u16,
-                rows: get_varint(buf, pos)? as u16,
-            },
-            T_PING => Frame::Ping {
-                stamp: get_varint(buf, pos)?,
-            },
-            T_PONG => Frame::Pong {
-                stamp: get_varint(buf, pos)?,
-            },
-            T_STREAM_OPEN => Frame::StreamOpen {
-                id: get_varint(buf, pos)?,
-                kind: StreamKind::from_u8(get_u8(buf, pos)?)?,
-                meta: get_bytes(buf, pos)?,
-            },
-            T_STREAM_DATA => {
-                let id = get_varint(buf, pos)?;
-                let offset = get_varint(buf, pos)?;
-                let fin = get_u8(buf, pos)? != 0;
-                let data = get_bytes(buf, pos)?;
-                Frame::StreamData {
-                    id,
-                    offset,
-                    data,
-                    fin,
-                }
-            }
-            T_STREAM_ACK => Frame::StreamAck {
-                id: get_varint(buf, pos)?,
-                ack: get_varint(buf, pos)?,
-                window: get_varint(buf, pos)? as u32,
-            },
-            T_STREAM_CLOSE => Frame::StreamClose {
-                id: get_varint(buf, pos)?,
-                status: unzigzag(get_varint(buf, pos)?) as i32,
-            },
-            T_STREAM_RESET => Frame::StreamReset {
-                id: get_varint(buf, pos)?,
-            },
             T_CONTROL => Frame::Control {
                 data: get_bytes(buf, pos)?,
             },
             other => return Err(WireError::UnknownFrame(other)),
         })
     }
-}
-
-fn zigzag(v: i64) -> u64 {
-    ((v << 1) ^ (v >> 63)) as u64
-}
-
-fn unzigzag(v: u64) -> i64 {
-    ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 
 /// Encode a sequence of frames into a payload buffer.
@@ -394,7 +239,6 @@ mod tests {
     fn roundtrip_all_variants() {
         roundtrip(Frame::Ack { seq: 42 });
         roundtrip(Frame::Input {
-            offset: 1000,
             data: b"hello world".to_vec(),
         });
         roundtrip(Frame::StateDiff {
@@ -402,35 +246,6 @@ mod tests {
             base: 8,
             data: vec![0, 1, 2, 255],
         });
-        roundtrip(Frame::Resize { cols: 80, rows: 24 });
-        roundtrip(Frame::Ping { stamp: 123456789 });
-        roundtrip(Frame::Pong { stamp: 987654321 });
-        roundtrip(Frame::StreamOpen {
-            id: 3,
-            kind: StreamKind::Forward,
-            meta: b"127.0.0.1:22".to_vec(),
-        });
-        roundtrip(Frame::StreamData {
-            id: 3,
-            offset: 4096,
-            data: vec![7; 100],
-            fin: true,
-        });
-        roundtrip(Frame::StreamData {
-            id: 3,
-            offset: 0,
-            data: vec![],
-            fin: false,
-        });
-        roundtrip(Frame::StreamAck {
-            id: 3,
-            ack: 4096,
-            window: 65535,
-        });
-        roundtrip(Frame::StreamClose { id: 3, status: 0 });
-        roundtrip(Frame::StreamClose { id: 3, status: -1 });
-        roundtrip(Frame::StreamClose { id: 3, status: 137 });
-        roundtrip(Frame::StreamReset { id: 3 });
         roundtrip(Frame::Control {
             data: b"open-shell".to_vec(),
         });
@@ -441,16 +256,26 @@ mod tests {
         let frames = vec![
             Frame::Ack { seq: 1 },
             Frame::Input {
-                offset: 0,
                 data: b"ls\n".to_vec(),
             },
-            Frame::Resize {
-                cols: 120,
-                rows: 40,
-            },
+            Frame::Control { data: vec![2, 80] },
         ];
         let bytes = encode_frames(&frames);
         assert_eq!(decode_frames(&bytes).unwrap(), frames);
+    }
+
+    #[test]
+    fn stream_kinds_round_trip_through_their_byte() {
+        for k in [
+            StreamKind::Forward,
+            StreamKind::FileTransfer,
+            StreamKind::Agent,
+            StreamKind::Exec,
+        ] {
+            assert_eq!(StreamKind::from_u8(k as u8), Some(k));
+        }
+        assert_eq!(StreamKind::from_u8(0), None);
+        assert_eq!(StreamKind::from_u8(5), None);
     }
 
     #[test]
@@ -465,8 +290,8 @@ mod tests {
 
     #[test]
     fn truncated_length_prefixed_errors() {
-        // Input frame: tag, offset=0, len=10 but no data
-        let buf = [T_INPUT, 0x00, 0x0a];
+        // Input frame: tag, len=10 but no data
+        let buf = [T_INPUT, 0x0a];
         assert_eq!(decode_frames(&buf), Err(WireError::BadLength));
     }
 
@@ -486,13 +311,6 @@ mod tests {
                 buf.push((s >> 33) as u8);
             }
             let _ = decode_frames(&buf); // must not panic
-        }
-    }
-
-    #[test]
-    fn zigzag_roundtrip() {
-        for v in [0i64, 1, -1, 137, -137, i32::MAX as i64, i32::MIN as i64] {
-            assert_eq!(unzigzag(zigzag(v)), v);
         }
     }
 }

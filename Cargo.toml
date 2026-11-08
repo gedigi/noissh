@@ -3,16 +3,17 @@ resolver = "2"
 members = [
     "crates/noise-core",
     "crates/wire",
-    "crates/transport",
     "crates/term",
     "crates/predict",
     "crates/auth",
     "crates/pty",
     "crates/proto",
+    "crates/noise-quic",
+    "bench",
 ]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 authors = ["Gerardo <gedigi@live.com>"]
@@ -20,6 +21,18 @@ authors = ["Gerardo <gedigi@live.com>"]
 [workspace.dependencies]
 # Lean dependency surface: only the features actually used are enabled.
 snow = "0.10" # default-resolver provides ChaChaPoly + BLAKE2s + 25519 (pure Rust)
+# QUIC state machine (sans-IO). No TLS: noissh supplies its own crypto layer
+# (crates/noise-quic), so rustls/ring stay out of the build.
+quinn-proto = { version = "0.11", default-features = false }
+# Batched UDP I/O for QUIC: GSO/GRO, sendmmsg/recvmmsg and ECN behind a safe
+# API (Linux; plain sendmsg/recvmsg elsewhere).
+quinn-udp = { version = "0.6", default-features = false }
+bytes = "1"
+# Primitives for noise-quic's QUIC packet/header protection and key derivation;
+# already in the tree via snow.
+blake2 = { version = "0.10", default-features = false }
+chacha20 = "0.9"
+chacha20poly1305 = { version = "0.10", default-features = false }
 # Already in the tree via snow; used directly only to derive a public key from
 # its private key (so the private key file need not also store the public key).
 curve25519-dalek = { version = "4.1", default-features = false }
@@ -31,16 +44,16 @@ thiserror = "2"
 
 noise-core = { path = "crates/noise-core" }
 wire = { path = "crates/wire" }
-transport = { path = "crates/transport" }
 term = { path = "crates/term" }
 predict = { path = "crates/predict" }
 auth = { path = "crates/auth" }
 pty = { path = "crates/pty" }
 proto = { path = "crates/proto" }
+noise-quic = { path = "crates/noise-quic" }
 
 [package]
 name = "noissh"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 license.workspace = true
 authors.workspace = true
@@ -92,12 +105,15 @@ path = "src/bin/noissh-keygen.rs"
 [dependencies]
 noise-core = { workspace = true }
 wire = { workspace = true }
-transport = { workspace = true }
 term = { workspace = true }
 predict = { workspace = true }
 auth = { workspace = true }
 pty = { workspace = true }
 proto = { workspace = true }
+noise-quic = { workspace = true }
+quinn-proto = { workspace = true }
+quinn-udp = { workspace = true }
+bytes = { workspace = true }
 nix = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }

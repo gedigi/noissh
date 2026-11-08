@@ -1,28 +1,28 @@
-//! The v1 interactive-shell data plane: server-authoritative state-sync plus
-//! the reliable client→server input channel, layered on `wire::Frame`s.
+//! The interactive-shell data plane: server-authoritative, latest-wins
+//! screen state sync (SSP-style diffs and acks) plus local echo prediction,
+//! layered on `wire::Frame`s.
 //!
-//! Direction-specific meaning of [`wire::Frame::Ack`]:
-//! - client → server: acknowledges the highest applied screen-state seq.
-//! - server → client: acknowledges contiguous input bytes received.
+//! Screen diffs may be lost or reordered (they travel as QUIC datagrams): the
+//! client acks (as [`wire::Frame::Ack`]) the highest state it applied, and the
+//! server diffs from that. Keystrokes travel on a reliable stream, so the
+//! client only predicts their echo here.
 //!
-//! Both shells are I/O-free and operate purely on frames, so the resilience
-//! harness can drive them through a lossy/reordering/roaming shim.
+//! Both shells are I/O-free and operate purely on frames, so tests can drive
+//! them through a lossy/reordering shim.
 
 use std::collections::BTreeMap;
 
 use predict::{DisplayMode, Predictor};
 use term::{Grid, Terminal, apply_diff, encode_diff, is_full};
-use transport::{InputReceiver, InputSender};
 use wire::Frame;
 
-/// Server-side authoritative screen + input receiver.
+/// Server-side authoritative screen.
 pub struct ServerShell {
     term: Terminal,
     seq: u64,
     acked_seq: u64,
     history: BTreeMap<u64, Grid>,
     last_sent: Grid,
-    input_rx: InputReceiver,
     force_full: bool,
 }
 
@@ -37,13 +37,12 @@ impl ServerShell {
             acked_seq: 0,
             history,
             last_sent: blank,
-            input_rx: InputReceiver::new(),
             force_full: false,
         }
     }
 
     /// Re-bind this (already-running) shell to a freshly-connected client after
-    /// a reattach: forget the previous client's ack/input progress and arrange
+    /// a reattach: forget the previous client's ack progress and arrange
     /// to send the current screen as a full snapshot. The live terminal state
     /// (the running shell's screen) is preserved.
     pub fn rebind_to_new_client(&mut self) {
@@ -53,7 +52,6 @@ impl ServerShell {
         self.history.clear();
         self.history.insert(0, blank.clone());
         self.last_sent = blank; // forces poll_diff to re-emit the current screen
-        self.input_rx = InputReceiver::new(); // the new client's input restarts at 0
         self.force_full = true;
     }
 
@@ -87,16 +85,14 @@ impl ServerShell {
         }
     }
 
-    /// Ingest a client Input frame: returns the newly-available bytes (to write
-    /// to the pty) and the input-ack frame to send back.
-    pub fn ingest_input(&mut self, offset: u64, data: &[u8]) -> (Vec<u8>, Frame) {
-        let fresh = self.input_rx.ingest(offset, data);
-        (
-            fresh,
-            Frame::Ack {
-                seq: self.input_rx.ack(),
-            },
-        )
+    /// Whether the screen changed since the last diff was produced.
+    pub fn has_new_output(&self) -> bool {
+        !self.term.screen().render_eq(&self.last_sent)
+    }
+
+    /// Whether the client hasn't acknowledged the latest screen state yet.
+    pub fn unacked(&self) -> bool {
+        self.seq != self.acked_seq
     }
 
     /// Produce a state-diff frame if the client is behind. Idempotent retransmit
@@ -131,11 +127,15 @@ impl ServerShell {
     }
 }
 
-/// Client-side render grid + predictive echo + input sender.
+/// Client-side render grid + predictive echo.
 pub struct ClientShell {
     grid: Grid,
     current_seq: u64,
-    input_tx: InputSender,
+    /// A state diff arrived since our last ack (applied or not), so the server
+    /// needs to hear where we are. Acks are sent only then, not on every poll:
+    /// an unconditional ack per poll sent a datagram every client tick even on
+    /// an idle connection (and in exec/forward-only sessions with no shell).
+    ack_due: bool,
     predictor: Predictor,
 }
 
@@ -145,7 +145,7 @@ impl ClientShell {
         ClientShell {
             grid: grid.clone(),
             current_seq: 0,
-            input_tx: InputSender::new(),
+            ack_due: false,
             predictor: Predictor::new(grid),
         }
     }
@@ -155,32 +155,30 @@ impl ClientShell {
         self
     }
 
-    /// Locally type bytes: queue them for reliable send and predict their echo.
-    pub fn type_input(&mut self, bytes: &[u8]) {
-        self.input_tx.push(bytes);
+    /// Predict the echo of locally typed bytes (the transport delivers the
+    /// bytes themselves, reliably).
+    pub fn predict_input(&mut self, bytes: &[u8]) {
         self.predictor.predict_input(bytes);
     }
 
-    /// Whether there is unacknowledged input still to (re)transmit.
-    pub fn has_pending_input(&self) -> bool {
-        self.input_tx.pending().is_some()
-    }
-
-    /// Frames to send now: pending input (if any) plus the screen-state ack.
-    pub fn poll_frames(&self) -> Vec<Frame> {
-        let mut frames = Vec::new();
-        if let Some(input) = self.input_tx.pending() {
-            frames.push(input);
+    /// The screen-state ack to send, if a diff arrived since the last one.
+    /// Acked after every received diff, applied or not: a resent diff means
+    /// our previous ack was lost (or the server is ahead of our base), and
+    /// the ack tells it which state to diff from.
+    pub fn poll_ack(&mut self) -> Option<Frame> {
+        if !self.ack_due {
+            return None;
         }
-        frames.push(Frame::Ack {
+        self.ack_due = false;
+        Some(Frame::Ack {
             seq: self.current_seq,
-        });
-        frames
+        })
     }
 
     /// Apply a server state-diff. Full snapshots apply unconditionally; deltas
     /// apply only when their base matches our current state and they are newer.
     pub fn apply_state_diff(&mut self, seq: u64, base: u64, data: &[u8]) -> bool {
+        self.ack_due = true;
         // Full snapshots apply unconditionally; deltas only when their base
         // matches our current state and they are strictly newer.
         let applicable = is_full(data) || (base == self.current_seq && seq > self.current_seq);
@@ -190,11 +188,6 @@ impl ClientShell {
             self.predictor.reconcile(self.grid.clone());
         }
         applied
-    }
-
-    /// Server acknowledged input bytes up to `seq`.
-    pub fn on_input_ack(&mut self, seq: u64) {
-        self.input_tx.on_ack(seq);
     }
 
     pub fn current_seq(&self) -> u64 {
@@ -223,14 +216,8 @@ mod tests {
                 client.apply_state_diff(seq, base, &data);
             }
             // client -> server (state ack)
-            for f in client.poll_frames() {
-                match f {
-                    Frame::Ack { seq } => server.on_state_ack(seq),
-                    Frame::Input { offset, data } => {
-                        server.ingest_input(offset, &data);
-                    }
-                    _ => {}
-                }
+            if let Some(Frame::Ack { seq }) = client.poll_ack() {
+                server.on_state_ack(seq);
             }
         }
     }
@@ -267,14 +254,12 @@ mod tests {
                 {
                     client.apply_state_diff(seq, base, &data);
                 }
-                for f in client.poll_frames() {
+                if let Some(Frame::Ack { seq }) = client.poll_ack() {
                     drop += 1;
                     if drop.is_multiple_of(3) {
                         continue; // lose this ack
                     }
-                    if let Frame::Ack { seq } = f {
-                        server.on_state_ack(seq);
-                    }
+                    server.on_state_ack(seq);
                 }
             }
         }
@@ -282,31 +267,6 @@ mod tests {
         pump_converge(&mut server, &mut client, 30);
         assert!(client.screen().render_eq(server.screen()));
         assert_eq!(client.screen().row_text(0), "$ ls -la");
-    }
-
-    #[test]
-    fn input_channel_delivers_keystrokes_under_loss() {
-        let mut server = ServerShell::new(10, 40);
-        let mut client = ClientShell::new(10, 40);
-        client.type_input(b"echo hi\n");
-        let mut received = Vec::new();
-        let mut drop = 0u64;
-        for _ in 0..20 {
-            for f in client.poll_frames() {
-                if let Frame::Input { offset, data } = f {
-                    drop += 1;
-                    if drop.is_multiple_of(2) {
-                        continue; // simulate loss
-                    }
-                    let (fresh, ack) = server.ingest_input(offset, &data);
-                    received.extend_from_slice(&fresh);
-                    if let Frame::Ack { seq } = ack {
-                        client.on_input_ack(seq);
-                    }
-                }
-            }
-        }
-        assert_eq!(received, b"echo hi\n");
     }
 
     #[test]
@@ -331,20 +291,11 @@ mod tests {
         server.feed_output(b"$ ");
         pump_converge(&mut server, &mut client, 5);
         // Type a char locally; prediction should appear immediately.
-        client.type_input(b"x");
+        client.predict_input(b"x");
         let predicted = client.overlay();
         assert_eq!(predicted.cell(0, 2).ch, 'x');
         // Server echoes it; after convergence overlay matches authoritative.
         server.feed_output(b"x");
-        // deliver input then state.
-        for f in client.poll_frames() {
-            if let Frame::Input { offset, data } = f {
-                let (_b, ack) = server.ingest_input(offset, &data);
-                if let Frame::Ack { seq } = ack {
-                    client.on_input_ack(seq);
-                }
-            }
-        }
         pump_converge(&mut server, &mut client, 5);
         assert!(client.screen().render_eq(server.screen()));
         assert_eq!(client.overlay().cell(0, 2).ch, 'x');

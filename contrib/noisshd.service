@@ -1,5 +1,5 @@
 [Unit]
-Description=noissh server daemon (resilient Noise/UDP remote shell)
+Description=noissh server daemon (resilient remote shell over QUIC and Noise)
 Documentation=https://github.com/gedigi/noissh
 After=network-online.target
 Wants=network-online.target

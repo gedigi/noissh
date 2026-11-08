@@ -4,6 +4,101 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0]
+
+### Changed
+
+- **New transport: QUIC, secured by Noise (breaking: 0.7 and 0.6 don't
+  interoperate).** Each session is one QUIC connection (`quinn-proto`) whose
+  handshake is the same Noise XX exchange with the same keys, `known_hosts`
+  and `authorized_keys`. Port forwards, SOCKS connections, remote commands,
+  file transfers and agent connections are QUIC streams; keystrokes and
+  control messages share a high-priority control stream; screen updates are
+  QUIC datagrams. Congestion control is BBR. Upgrade client and server
+  together; see "Upgrading from 0.6 to 0.7" in the user guide. Measured
+  against 0.6 over a simulated 40 ms path (`noissh-bench`):
+  - bulk transfers 19× faster (1.67 → 31.8 MB/s; 43 MB/s on long transfers),
+    and 26.6 MB/s with 1 % packet loss (0.6: 0.13 MB/s);
+  - round-trip latency equals the path RTT (0.6 added ~15 ms), and a bulk
+    transfer no longer delays typing (echo p95 under load 47.5 ms; ssh 81.6);
+  - an idle session sends 0.4 packets/s each way (0.6: 3.4).
+
+  Against OpenSSH under kernel-emulated loss (CI, 40 ms RTT): 26.3 vs
+  0.57 MB/s at 1 % loss, 16.3 vs 0.21 MB/s at 5 %; 10.7 vs 5.1 MB/s at
+  150 ms without loss; level on a clean 40 ms path.
+- **Sessions survive long outages.** An address change is followed within the
+  connection (QUIC migration). If the connection times out (60 s without
+  contact, e.g. while the laptop sleeps), the client reconnects on its own and
+  the server hands it the running shell, which it keeps for 15 minutes after
+  losing its connection.
+- **A second window gets its own shell.** A new connection takes over a shell
+  of the same key only if that shell's connection is gone or silent for 8 s
+  (its client restarted); 0.6 handed it over even while the first window was
+  still connected.
+- **The SSH bootstrap checks the server's transport.** The one-shot server's
+  connect line now ends with `quic`; a 0.7 client that finds a pre-0.7
+  `noisshd` offers to upgrade it, or stops with instructions, instead of
+  timing out.
+
+### Security
+
+The Noise-in-QUIC binding was reviewed before release. These fixes concern
+code new in 0.7 (never released before):
+
+- **One forged packet could crash the server.** Header protection computed its
+  ChaCha20 mask through an API that panics at the last block counter; the
+  counter is taken from the packet, so a single spoofed Initial packet stopped
+  `noisshd` (and any connection had a 2^-32 chance per packet of crashing
+  itself). The mask now covers the whole counter range; regression tests send
+  the forged packet to a real endpoint.
+- **Half-open handshakes can't lock out clients.** Handshakes in progress have
+  their own cap (256), separate from established and detached sessions (512);
+  above 16 in progress, a new client must answer a QUIC Retry (proving it owns
+  its address) before the server keeps any state, and a handshake that hasn't
+  completed in 10 s is dropped.
+- Data after a handshake message (outside the Noise transcript) is refused;
+  the key exporter binds label, context and length unambiguously; private keys
+  and session secrets are wiped from memory when dropped.
+
+### Performance
+
+- **Batched UDP I/O** (`quinn-udp`): GSO sends up to 32 datagrams per system
+  call, `recvmmsg`/GRO receives several per call, and ECN marks are passed to
+  congestion control. Bulk throughput over direct loopback rose from about
+  94 to about 150 MB/s.
+
+### Added
+
+- **CI benchmark under `netem`** (`.github/workflows/bench.yml`,
+  `bench/netem.sh`): noissh against OpenSSH over loopback with kernel-emulated
+  delay and packet loss, results in the job summary. `noissh-bench` gains
+  `--no-link`, `--noissh-port`, `--ssh-port` and `--timeout`.
+- **`NOISSH_CC=cubic`** selects Cubic congestion control instead of BBR.
+- **`noissh-bench`** (`bench/`): compares noissh with OpenSSH over a simulated
+  network path (delay, jitter, UDP loss): bulk throughput, echo latency idle and
+  under load, idle packets per second.
+- **Design document** for the transport (`docs/design/quic-transport.md`),
+  with the benchmark results; `PROTOCOL.md`, `ARCHITECTURE.md` and
+  `SECURITY.md` describe the QUIC transport.
+- **`noise-quic` crate**: the Noise XX handshake as the crypto layer of
+  `quinn-proto` QUIC connections.
+
+### Removed
+
+- The 0.6 transport: the `transport` crate (session ids, anti-replay, the
+  stream mux), the handshake driver in `proto`, the input retransmission
+  channel, and the stream and ping frames in `wire`.
+
+### Fixed
+
+- **Docs: the SSH bootstrap's UDP port.** The user guide, protocol notes and man
+  pages said the bootstrapped server binds an ephemeral port; it asks for 51820
+  (or `--server-port`) and falls back to an ephemeral port only if that is
+  taken. The guide now also covers running several sessions at once, restarting
+  the daemon after changing `authorized_keys`, and a systemd user service.
+- **Docs: `noisshd(1)` described PAM support** that doesn't exist; its SECURITY
+  section now describes the `--user` drop as implemented.
+
 ## [0.6.4]
 
 ### Fixed

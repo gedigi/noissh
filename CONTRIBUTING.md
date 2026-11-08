@@ -32,6 +32,37 @@ cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 cargo test --workspace                            # all tests green
 ```
 
+### Benchmarks
+
+Changes to the transport should come with numbers from `noissh-bench` (see
+`bench/README.md`), before and after, on the same machine:
+
+```sh
+cargo build --release --workspace --bins
+./target/release/noissh-bench --rtt 40 --size 20
+```
+
+The CI *Benchmark* workflow also compares with OpenSSH under kernel-emulated
+loss (`bench/netem.sh`); check its job summary on your pull request.
+
+### Documentation
+
+Every PR keeps the documentation accurate. Check each of these against the code
+as it will be after your change, and fix anything wrong or missing in the same
+PR, including inaccuracies that were already there:
+
+- [ ] `README.md`
+- [ ] `docs/USER_GUIDE.md`, including the command reference and troubleshooting
+- [ ] `docs/ARCHITECTURE.md`, `docs/PROTOCOL.md`, `docs/SECURITY.md`
+- [ ] `docs/design/*.md`
+- [ ] `docs/man/*.1` (shipped in the release packages; check with `man -l`)
+- [ ] `--help` text in `src/bin/*.rs`
+- [ ] `contrib/`
+- [ ] `CHANGELOG.md`: user-visible changes under `## [Unreleased]`
+
+Check claims against the code (constants, defaults, flags, paths), not against
+other documents, and list the documentation changes in the PR description.
+
 ### Supply-chain checks
 
 CI also runs supply-chain hardening jobs (see `.github/workflows/ci.yml`). To

@@ -80,8 +80,10 @@ impl<S: Read + Write + AsFd> ForwardConn<S> {
         if self.read_closed || self.dead {
             return got;
         }
-        let mut buf = [0u8; 16384];
-        loop {
+        let mut buf = [0u8; 65536];
+        // Bounded per call, so one busy connection can't starve the others or
+        // overshoot the caller's backpressure check by much.
+        while got.len() < 256 * 1024 {
             match self.stream.read(&mut buf) {
                 Ok(0) => {
                     self.read_closed = true;
@@ -97,6 +99,13 @@ impl<S: Read + Write + AsFd> ForwardConn<S> {
             }
         }
         got
+    }
+
+    /// Whether the socket may still produce data (not at EOF, not failed):
+    /// only then is it worth polling for input — a socket at EOF is always
+    /// "readable" and would make the event loop spin.
+    pub fn wants_read(&self) -> bool {
+        !self.read_closed && !self.dead
     }
 
     /// Queue bytes (from the session) to write to TCP, then try to flush.

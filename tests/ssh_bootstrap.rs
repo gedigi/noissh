@@ -4,7 +4,7 @@
 //! connecting to a remote host, it drops the target argument and runs the rest
 //! of the command line locally — i.e. it launches the real `noisshd --one-shot`
 //! on this machine. The bootstrap then parses the connect line, and a real
-//! client connects over Noise/UDP and runs the shell.
+//! client connects over QUIC and runs the shell.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

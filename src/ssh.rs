@@ -2,7 +2,7 @@
 //!
 //! `ssh` is used only to launch the remote server and hand back its UDP port +
 //! ephemeral public key over the already-authenticated SSH channel; the actual
-//! session then runs over the Noise/UDP transport. The SSH connection is not
+//! session then runs over the QUIC transport. The SSH connection is not
 //! kept open — the one-shot server detaches (daemonizes) and keeps serving
 //! after `ssh` exits.
 
@@ -17,13 +17,29 @@ use crate::RuntimeError;
 /// The line the one-shot server prints on stdout for the client to parse.
 pub const CONNECT_PREFIX: &str = "NOISSH CONNECT";
 
-/// Format the connect line: `NOISSH CONNECT <port> <base64 server pubkey>`.
+/// The transport token a server appends to its connect line. A server without
+/// it (before 0.7) speaks the old transport, which this client can't use.
+pub const TRANSPORT_TOKEN: &str = "quic";
+
+/// Format the connect line: `NOISSH CONNECT <port> <base64 server pubkey> quic`.
 pub fn connect_line(port: u16, server_pubkey: &[u8]) -> String {
-    format!("{CONNECT_PREFIX} {port} {}", STANDARD.encode(server_pubkey))
+    format!(
+        "{CONNECT_PREFIX} {port} {} {TRANSPORT_TOKEN}",
+        STANDARD.encode(server_pubkey)
+    )
 }
 
-/// Parse a connect line, returning (udp_port, server_pubkey).
-pub fn parse_connect_line(line: &str) -> Option<(u16, Vec<u8>)> {
+/// A parsed connect line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectLine {
+    pub port: u16,
+    pub pubkey: Vec<u8>,
+    /// The server speaks QUIC (0.7+); false for an older server.
+    pub quic: bool,
+}
+
+/// Parse a connect line.
+pub fn parse_connect_line(line: &str) -> Option<ConnectLine> {
     let mut it = line.split_whitespace();
     if it.next()? != "NOISSH" || it.next()? != "CONNECT" {
         return None;
@@ -33,7 +49,8 @@ pub fn parse_connect_line(line: &str) -> Option<(u16, Vec<u8>)> {
     if pubkey.len() != 32 {
         return None;
     }
-    Some((port, pubkey))
+    let quic = it.next() == Some(TRANSPORT_TOKEN);
+    Some(ConnectLine { port, pubkey, quic })
 }
 
 /// Prefix the one-shot server prints to announce its version (so a newer client
@@ -105,6 +122,8 @@ pub struct Bootstrap {
     /// The remote `noisshd`'s announced version, if it reported one (servers
     /// before v0.4.11 do not, in which case this is `None`).
     pub server_version: Option<String>,
+    /// The server speaks QUIC (0.7+). An older one can't serve this client.
+    pub quic: bool,
 }
 
 /// Outcome of a single bootstrap attempt.
@@ -166,7 +185,7 @@ fn is_default_server_cmd(remote_server_cmd: &[String]) -> bool {
 
 /// Run one bootstrap attempt against `remote_server_cmd`.
 ///
-/// `udp_host` is the host the Noise/UDP session should be addressed to — it may
+/// `udp_host` is the host the QUIC session should be addressed to — it may
 /// differ from `host_of(target)` when the target is an ssh_config alias whose
 /// real address is in `HostName`. `ssh` itself still receives the original
 /// `target`, so it applies the user's `~/.ssh/config` (ProxyJump, Port, …).
@@ -203,7 +222,8 @@ fn attempt(
     // last thing it does (after any SSH banner / MOTD), so this prevents a
     // server-controlled banner from injecting a forged connect line earlier in
     // the stream.
-    if let Some((port, server_pubkey)) = stdout.lines().rev().find_map(parse_connect_line) {
+    if let Some(line) = stdout.lines().rev().find_map(parse_connect_line) {
+        let (port, server_pubkey) = (line.port, line.pubkey);
         let host = udp_host;
         let server_addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
             RuntimeError::BadAddress(format!(
@@ -217,6 +237,7 @@ fn attempt(
             server_addr,
             server_pubkey,
             server_version,
+            quic: line.quic,
         }));
     }
     if looks_like_missing_command(&output) {
@@ -370,6 +391,29 @@ fn maybe_offer_upgrade(
     b: Bootstrap,
 ) -> Result<Bootstrap, RuntimeError> {
     let ours = env!("CARGO_PKG_VERSION");
+    let host = host_of(target);
+    // A pre-0.7 server speaks the old transport: connecting would only time
+    // out, so stop here with the remedy (or apply it, if allowed).
+    if !b.quic {
+        let v = b.server_version.as_deref().unwrap_or("older than 0.7");
+        let question = format!(
+            "noissh: noisshd on {host} is v{v}, which speaks the pre-0.7 protocol and can't serve \
+             this client (v{ours}). Upgrade it now?"
+        );
+        if offer && prompt_yes_no(&question) {
+            install_remote(target, extra_ssh_args)?;
+            return Err(RuntimeError::SshFailed(format!(
+                "noisshd on {host} upgraded to v{ours}. Run the command again in a minute (the \
+                 old one-shot server releases its port within 60 s). If you run a standing \
+                 noisshd there, restart it too (e.g. `systemctl --user restart noisshd`)."
+            )));
+        }
+        return Err(RuntimeError::SshFailed(format!(
+            "noisshd on {host} is v{v}, which speaks the pre-0.7 protocol; this client (v{ours}) \
+             needs noisshd 0.7 or later. Upgrade it by running `noissh --ssh \
+             {target}` in a terminal and accepting the upgrade, or install a matching release."
+        )));
+    }
     let older = b
         .server_version
         .as_deref()
@@ -514,9 +558,17 @@ mod tests {
     fn connect_line_roundtrips() {
         let key = [9u8; 32];
         let line = connect_line(60001, &key);
-        let (port, pk) = parse_connect_line(&line).unwrap();
-        assert_eq!(port, 60001);
-        assert_eq!(pk, key);
+        let c = parse_connect_line(&line).unwrap();
+        assert_eq!(c.port, 60001);
+        assert_eq!(c.pubkey, key);
+        assert!(c.quic);
+    }
+
+    #[test]
+    fn a_connect_line_without_the_transport_token_is_a_pre_quic_server() {
+        let line = format!("{CONNECT_PREFIX} 51820 {}", STANDARD.encode([4u8; 32]));
+        let c = parse_connect_line(&line).unwrap();
+        assert!(!c.quic);
     }
 
     #[test]
@@ -581,8 +633,8 @@ mod tests {
         let blob = "Warning: something\nNOISSH CONNECT 7000 ".to_string()
             + &STANDARD.encode([2u8; 32])
             + "\nbye";
-        let (port, pk) = blob.lines().find_map(parse_connect_line).unwrap();
-        assert_eq!(port, 7000);
-        assert_eq!(pk, vec![2u8; 32]);
+        let c = blob.lines().find_map(parse_connect_line).unwrap();
+        assert_eq!(c.port, 7000);
+        assert_eq!(c.pubkey, vec![2u8; 32]);
     }
 }

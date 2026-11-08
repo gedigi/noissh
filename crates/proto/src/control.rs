@@ -46,6 +46,10 @@ pub enum ControlMsg {
     /// daemon and offer to upgrade it — the same check the SSH bootstrap does
     /// from the connect line, but over the session so it works without bootstrap.
     ServerVersion(String),
+    /// Server → client: the command on exec stream `id` exited with `status`.
+    /// Sent before the stream's stdout is finished, so the client has the code
+    /// by the time it has read all the output.
+    ExecExit { id: u64, status: i32 },
 }
 
 const M_OPEN_SHELL: u8 = 1;
@@ -55,6 +59,7 @@ const M_EXIT: u8 = 3;
 const M_REMOTE_FORWARD: u8 = 6;
 const M_BYE: u8 = 7;
 const M_SERVER_VERSION: u8 = 8;
+const M_EXEC_EXIT: u8 = 9;
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u64);
@@ -116,6 +121,11 @@ impl ControlMsg {
                 out.push(M_SERVER_VERSION);
                 put_str(&mut out, v);
             }
+            ControlMsg::ExecExit { id, status } => {
+                out.push(M_EXEC_EXIT);
+                put_varint(&mut out, *id);
+                put_varint(&mut out, zigzag(*status as i64));
+            }
         }
         out
     }
@@ -153,6 +163,11 @@ impl ControlMsg {
             }
             M_BYE => ControlMsg::Bye,
             M_SERVER_VERSION => ControlMsg::ServerVersion(get_str(buf, &mut pos)?),
+            M_EXEC_EXIT => {
+                let id = get_varint(buf, &mut pos)?;
+                let status = unzigzag(get_varint(buf, &mut pos)?) as i32;
+                ControlMsg::ExecExit { id, status }
+            }
             other => return Err(ControlError::Unknown(other)),
         })
     }
@@ -194,6 +209,11 @@ mod tests {
         roundtrip(ControlMsg::Bye);
         roundtrip(ControlMsg::ServerVersion("0.5.2".into()));
         roundtrip(ControlMsg::ServerVersion(String::new()));
+        roundtrip(ControlMsg::ExecExit { id: 4, status: 0 });
+        roundtrip(ControlMsg::ExecExit {
+            id: 1 << 40,
+            status: -9,
+        });
     }
 
     #[test]

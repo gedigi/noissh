@@ -84,7 +84,12 @@ expression = "MIT"
 license-files = []
 
 [[licenses.clarify]]
-name = "transport"
+name = "noise-quic"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "noissh-bench"
 expression = "MIT"
 license-files = []
 

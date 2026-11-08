@@ -7,10 +7,10 @@ use std::time::Duration;
 use auth::{AuthorizedKeys, KnownHosts, PublicKey};
 use noise_core::{Keypair, generate_keypair};
 use noissh::client::ClientCore;
+use noissh::quic::{SessionId, StreamEvent};
 use noissh::server::ServerCore;
 use predict::DisplayMode;
 use pty::LocalLogin;
-use transport::{SessionId, StreamEvent};
 
 fn connect(server: &mut ServerCore, kp: &Keypair, addr: SocketAddr) -> ClientCore {
     let dummy: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -86,7 +86,9 @@ fn forward_large_payload_is_chunked_under_mtu_and_round_trips() {
     let mut sid: Option<SessionId> = None;
     let mut got: Vec<u8> = Vec::new();
     let mut max_pkt = 0usize;
-    for _ in 0..4000 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_micros(200));
         for pkt in client.tick() {
             max_pkt = max_pkt.max(pkt.len());
             for (a, out) in server.handle_packet(addr, &pkt) {
@@ -122,9 +124,10 @@ fn forward_large_payload_is_chunked_under_mtu_and_round_trips() {
     }
     assert_eq!(got.len(), payload.len(), "not all bytes arrived");
     assert_eq!(got, payload, "payload corrupted in transit");
-    // Every datagram must stay within the MTU budget (plaintext cap + headers).
+    // Every datagram must stay within an Ethernet MTU (QUIC starts at 1200
+    // bytes and probes upward, up to 1452).
     assert!(
-        max_pkt <= 1300,
+        max_pkt <= 1452,
         "a datagram of {max_pkt} bytes exceeded the MTU budget"
     );
 }
@@ -166,9 +169,12 @@ fn forward_stream_round_trips_bytes_both_ways() {
     pump(&mut server, &mut client, addr, 10);
     assert_eq!(client.stream_read(id), b"HTTP/1.0 200 OK\r\n");
 
-    // Closing the client half is observed by the server.
+    // Closing the client half is observed by the server once it has read
+    // everything.
     client.stream_close(id);
     pump(&mut server, &mut client, addr, 10);
+    assert!(server.stream_read(sid, id).is_empty());
+    assert!(server.stream_recv_finished(sid, id));
     let closed = server
         .take_stream_events()
         .iter()

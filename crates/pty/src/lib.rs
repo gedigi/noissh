@@ -78,6 +78,12 @@ pub struct PtyHandle {
 }
 
 impl PtyHandle {
+    /// The PTY master, for registering with `poll()`.
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.pty.as_fd()
+    }
+
     /// Make the master end non-blocking (for event-loop integration).
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), PtyError> {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
