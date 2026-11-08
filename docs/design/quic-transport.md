@@ -313,10 +313,34 @@ Against the targets:
   is the batched receive. Packet encryption now dominates the profile. Through
   the userspace link the numbers above don't change: at these rates the link
   proxy is the limit.
-- **2× ssh at 1 % loss**: measured in CI with `netem` (`bench/netem.sh`,
-  workflow *Benchmark*, results in the job summary). For reference, the
-  Mathis bound for a loss-based TCP at 1 % loss and 40 ms is about 0.4 MB/s;
-  noissh keeps 26.6 MB/s through the userspace link.
+- **2× ssh at 1 % loss: met, by far** (CI, `netem`, below): 26.3 against
+  0.57 MB/s.
+
+### CI under `netem` (0.7.0)
+
+GitHub runner, kernel `netem` on loopback (only the server ports; 1500-byte
+MTU, offloads off), 20 MB bulk, OpenSSH 10.2 (`bench/netem.sh`, workflow
+*Benchmark*):
+
+| RTT | loss | tool | bulk MB/s | echo p50/p95 ms | echo under load p50/p95 ms |
+|---|---|---|---|---|---|
+| 40 ms | 0 % | noissh | 26.0 | 40.7 / 40.8 | 47.6 / 67.7 |
+| 40 ms | 0 % | ssh | 24.3 | 40.6 / 40.7 | 40.3 / 43.2 |
+| 40 ms | 1 % | noissh | 26.3 | 40.8 / 40.9 | 42.3 / 77.1 |
+| 40 ms | 1 % | ssh | 0.57 | 40.6 / 40.7 | 583.8 / 911.3 |
+| 150 ms | 0 % | noissh | 10.7 | 150.8 / 150.9 | 151.5 / 169.3 |
+| 150 ms | 0 % | ssh | 5.1 | 150.7 / 150.7 | 150.4 / 280.7 |
+| 40 ms | 5 % | noissh | 16.3 | 40.8 / 148.4 | 41.1 / 112.2 |
+| 40 ms | 5 % | ssh | 0.21 | 40.2 / 303.1 | 3536 / 5175 |
+
+With loss, ssh's single TCP connection collapses (46× slower than noissh at
+1 %, 78× at 5 %) and a keystroke waits behind the bulk transfer for seconds;
+noissh stays near the loss-free numbers. On a clean path the two are level
+(ssh 2× slower at 150 ms). One target is narrowly missed: on a clean 40 ms
+path, echo p95 under load is 1.66× idle (67.7 ms; target 1.5×), where ssh's
+is 43 ms — BBR keeps some queue in the path during the transfer, and GSO
+bursts add to it. A candidate for tuning after 0.7.0 (pacing GSO batches,
+BBR's probe-RTT behaviour).
 
 Noisy shared machine: repeated runs vary by ±20 %.
 

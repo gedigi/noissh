@@ -22,6 +22,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - round-trip latency equals the path RTT (0.6 added ~15 ms), and a bulk
     transfer no longer delays typing (echo p95 under load 47.5 ms; ssh 81.6);
   - an idle session sends 0.4 packets/s each way (0.6: 3.4).
+
+  Against OpenSSH under kernel-emulated loss (CI, 40 ms RTT): 26.3 vs
+  0.57 MB/s at 1 % loss, 16.3 vs 0.21 MB/s at 5 %; 10.7 vs 5.1 MB/s at
+  150 ms without loss; level on a clean 40 ms path.
 - **Sessions survive long outages.** An address change is followed within the
   connection (QUIC migration). If the connection times out (60 s without
   contact, e.g. while the laptop sleeps), the client reconnects on its own and
