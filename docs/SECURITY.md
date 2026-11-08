@@ -1,9 +1,12 @@
 # noissh Security Model
 
 > **Status:** noissh is new software (0.x). The protocol and code have **not**
-> been independently audited; in particular the binding of Noise into QUIC
-> (`noise-quic`, new in 0.7) awaits review. Do not rely on it for high-stakes use yet. Reports
-> of security issues are welcome — see [Reporting](#reporting).
+> been independently audited. The binding of Noise into QUIC (`noise-quic`,
+> new in 0.7) had an internal review before release (see
+> [Review of the Noise-in-QUIC binding](#review-of-the-noise-in-quic-binding));
+> that is not a substitute for an independent audit. Do not rely on it for
+> high-stakes use yet. Reports of security issues are welcome — see
+> [Reporting](#reporting).
 
 ## Cryptographic foundation
 
@@ -66,12 +69,15 @@ noissh mirrors SSH's trust model with Noise static keys:
 ## What noissh does *not* protect against (current limitations)
 
 - **Denial of service.** An attacker who can flood the UDP port can degrade
-  service. Each new handshake allocates a small amount of state (up to 512
-  connections at a time); QUIC's Retry address validation is not enabled. This
-  is a known area for hardening. (noissh *is* hardened against being used as a
+  service. Spoofed handshakes are contained: above 16 handshakes in progress a
+  new client must answer a QUIC Retry before the server keeps any state, at
+  most 256 handshakes run at once (separately from up to 512 established
+  sessions, so they can't crowd out real or detached sessions), and an
+  unfinished handshake is dropped after 10 s. An on-path attacker can still
+  abort a handshake (see below). noissh is hardened against being used as a
   reflection/amplification vector: the client pads its first packet to 1200
   bytes, smaller ones get no answer, and until the client's address is
-  validated the server sends at most three times what it received.)
+  validated the server sends at most three times what it received.
 - **Traffic analysis.** Packet sizes and timing are not padded; an observer can
   infer activity (typing, screen updates).
 - **Compromised endpoints.** noissh secures the link, not the machines. A
@@ -79,6 +85,32 @@ noissh mirrors SSH's trust model with Noise static keys:
 - **0-RTT / forward-secrecy edge cases for resumption.** Every connection
   performs a full `XX` handshake; resumption / `IK` with 0-RTT data (a possible
   future optimization) is not implemented, so there is no 0-RTT attack surface.
+
+## Review of the Noise-in-QUIC binding
+
+Before 0.7.0 the `noise-quic` crate was reviewed against the threat model above
+(a network attacker who can read, drop, inject and modify packets; a client
+without an authorized key; a server impersonating a pinned one). Findings and
+their resolution:
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| Header protection panicked at ChaCha20 block counter `0xffffffff`; the counter comes from the packet, so one spoofed Initial crashed the server | critical | fixed: the mask is computed with the ChaCha20 core over the whole counter range; regression tests (unit and a forged packet against a real endpoint) |
+| Half-open handshakes shared the session cap, so ~9 spoofed packets/s could lock out new clients | medium | fixed: Retry above 16 handshakes in progress, a separate cap of 256, 10 s handshake timeout; tested with a 300-packet flood |
+| Handshake-level keys are public, so an observer can forge Handshake packets for the whole handshake | low | accepted (abort only, no impersonation or tampering); documented |
+| Bytes after a Noise message were kept across a key change | low | fixed: refused (RFC 9001 §4.1.3) |
+| Exporter input was ambiguous and didn't bind the output length | info | fixed (unused by noissh) |
+| Secrets weren't wiped from memory | info | fixed: private keys and secrets are zeroized on drop |
+
+Checked and found sound: transcript binding of both sides' transport
+parameters; mutual authentication before any 1-RTT key exists, with the
+client's identity sent only after the server's key is accepted; packet nonces
+(IV XOR packet number) per direction and key generation; key separation
+between levels and directions; the key-update chain; integrity limits; header
+protection layout; per-token AEAD keys for address-validation tokens; the Retry
+tag; the handshake state machine (no skipped or repeated messages, bounded
+buffering); and the absence of panics reachable from network input apart from
+the one fixed above.
 
 ## Memory safety
 

@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0]
 
 ### Changed
 
@@ -36,8 +36,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `noisshd` offers to upgrade it, or stops with instructions, instead of
   timing out.
 
+### Security
+
+The Noise-in-QUIC binding was reviewed before release. These fixes concern
+code new in 0.7 (never released before):
+
+- **One forged packet could crash the server.** Header protection computed its
+  ChaCha20 mask through an API that panics at the last block counter; the
+  counter is taken from the packet, so a single spoofed Initial packet stopped
+  `noisshd` (and any connection had a 2^-32 chance per packet of crashing
+  itself). The mask now covers the whole counter range; regression tests send
+  the forged packet to a real endpoint.
+- **Half-open handshakes can't lock out clients.** Handshakes in progress have
+  their own cap (256), separate from established and detached sessions (512);
+  above 16 in progress, a new client must answer a QUIC Retry (proving it owns
+  its address) before the server keeps any state, and a handshake that hasn't
+  completed in 10 s is dropped.
+- Data after a handshake message (outside the Noise transcript) is refused;
+  the key exporter binds label, context and length unambiguously; private keys
+  and session secrets are wiped from memory when dropped.
+
+### Performance
+
+- **Batched UDP I/O** (`quinn-udp`): GSO sends up to 32 datagrams per system
+  call, `recvmmsg`/GRO receives several per call, and ECN marks are passed to
+  congestion control. Bulk throughput over direct loopback rose from about
+  94 to about 150 MB/s.
+
 ### Added
 
+- **CI benchmark under `netem`** (`.github/workflows/bench.yml`,
+  `bench/netem.sh`): noissh against OpenSSH over loopback with kernel-emulated
+  delay and packet loss, results in the job summary. `noissh-bench` gains
+  `--no-link`, `--noissh-port`, `--ssh-port` and `--timeout`.
 - **`NOISSH_CC=cubic`** selects Cubic congestion control instead of BBR.
 - **`noissh-bench`** (`bench/`): compares noissh with OpenSSH over a simulated
   network path (delay, jitter, UDP loss): bulk throughput, echo latency idle and

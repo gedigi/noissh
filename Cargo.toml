@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 authors = ["Gerardo <gedigi@live.com>"]
@@ -53,7 +53,7 @@ noise-quic = { path = "crates/noise-quic" }
 
 [package]
 name = "noissh"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 license.workspace = true
 authors.workspace = true

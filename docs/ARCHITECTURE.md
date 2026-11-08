@@ -63,7 +63,8 @@ crates/
   auth/        known_hosts (TOFU) + authorized_keys, X25519 key text format
   pty/         PTY allocation + login-shell launching (safe, via pty-process)
   proto/       control channel, state-sync plane, xfer request, auth decisions
-src/           runtime: quic (QUIC config, stream table, control channel),
+src/           runtime: quic (QUIC config, stream table, control channel), udp
+               (batched UDP I/O: GSO/GRO, ECN),
                client/server cores + UDP drivers, config, tty, ssh, forward
                (TCP/Unix), socks (-D), exec (remote command), xfer (file I/O)
 src/bin/       noissh (client), noisshd (server), noissh-keygen (key tool)

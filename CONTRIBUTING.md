@@ -42,6 +42,9 @@ cargo build --release --bins
 ./target/release/noissh-bench --rtt 40 --size 20
 ```
 
+The CI *Benchmark* workflow also compares with OpenSSH under kernel-emulated
+loss (`bench/netem.sh`); check its job summary on your pull request.
+
 ### Documentation
 
 Every PR keeps the documentation accurate. Check each of these against the code

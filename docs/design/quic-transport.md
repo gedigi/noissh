@@ -1,7 +1,8 @@
 # Design: noissh 0.7 transport on QUIC (quinn-proto) with Noise
 
-Status: **implemented** (milestones 1–5; the 0.6 transport is removed).
-Tuning (milestone 6) is in progress; measurements are in section 9. The
+Status: **implemented and released in 0.7.0** (milestones 1–6; the 0.6
+transport is removed). Measurements are in section 9, the security review in
+section 10. The
 protocol as built is specified in [PROTOCOL.md](../PROTOCOL.md).
 
 ## 1. Why
@@ -125,8 +126,11 @@ client                                         server
   the static keys and the server's transport parameters are encrypted inside
   msg2/msg3; the client's parameters (msg1, unencrypted) are bound to the
   transcript, so changing them makes the client fail to decrypt msg2 (tested).
-  An on-path attacker can disrupt the handshake, as with any QUIC Initial
-  packet, but cannot impersonate either side or alter what they agree on.
+  An on-path attacker can disrupt the handshake but cannot impersonate either
+  side or alter what they agree on. Note the disruption window is the whole
+  handshake, not just the Initial level as with TLS: anyone who saw msg1 can
+  derive the Handshake keys and forge Handshake-level packets (security review,
+  section 10). Keying msg2/msg3 from `ee` would close it; not done in 0.7.
 - **1-RTT keys**: `snow`'s split (feature `risky-raw-split`) gives the two raw
   32-byte cipher keys; each is mixed with the final handshake hash into that
   direction's secret. Packets use ChaCha20-Poly1305 with the QUIC nonce (IV XOR
@@ -201,8 +205,11 @@ connection is a forward stream.
   and replies are processed once per batch.
 - Descriptors whose stream is backed up (or at EOF) aren't polled for input,
   so a slow peer or a closed socket can't make the loop spin.
-- Later: GSO/GRO and `recvmmsg` through `quinn-udp` (safe API) for high
-  throughput on Linux.
+- Batched I/O through `quinn-udp` (safe API, `src/udp.rs`): GSO sends of up
+  to 32 datagrams per call, `recvmmsg` and GRO receives, ECN both ways; a
+  batch the socket can't take yet waits in a queue (polled for writability)
+  rather than being dropped, and one the kernel refuses as a whole is resent
+  datagram by datagram.
 
 The server stays single-threaded at first; a busy session cannot starve others
 because every operation is non-blocking.
@@ -299,12 +306,17 @@ Against the targets:
 - **Idle ≤ 1 pkt/s: met** (0.4 each way; 0.6 sent 3.4).
 - **Throughput ≥ ssh: met at 150 ms, close at 40 ms, not on a 1 ms path.**
   On a near-zero RTT the limit is CPU per packet (one `sendto`/`recvfrom` per
-  1200-byte datagram against ssh's 64 KB TCP writes); GSO/GRO is the next step.
-  Over 300 MB at 40 ms (steady state, past BBR's start-up) noissh reached
-  43 MB/s.
-- **2× ssh at 1 % loss: not measured yet**: TCP loss needs `netem` (CI). For
-  reference, the Mathis bound for a loss-based TCP at 1 % loss and 40 ms is
-  about 0.4 MB/s; noissh keeps 26.6 MB/s.
+  1200-byte datagram against ssh's 64 KB TCP writes). Over 300 MB at 40 ms
+  (steady state, past BBR's start-up) noissh reached 43 MB/s.
+  With batched I/O (GSO/GRO, `recvmmsg`) direct loopback rose from about 94 to
+  about 150 MB/s (ssh: about 400). GSO itself adds about 5 %; most of the gain
+  is the batched receive. Packet encryption now dominates the profile. Through
+  the userspace link the numbers above don't change: at these rates the link
+  proxy is the limit.
+- **2× ssh at 1 % loss**: measured in CI with `netem` (`bench/netem.sh`,
+  workflow *Benchmark*, results in the job summary). For reference, the
+  Mathis bound for a loss-based TCP at 1 % loss and 40 ms is about 0.4 MB/s;
+  noissh keeps 26.6 MB/s through the userspace link.
 
 Noisy shared machine: repeated runs vary by ±20 %.
 
@@ -318,6 +330,9 @@ Noisy shared machine: repeated runs vary by ±20 %.
   datagram limit (a full snapshot of a big terminal); a large diff is held
   back while 256 KiB of earlier ones are still queued, since a later diff
   supersedes it.
-- **Security review** of the Noise ↔ QUIC binding before release: transcript
-  binding of transport parameters, key separation between levels, nonce use.
+- **Security review** of the Noise ↔ QUIC binding: **done** before 0.7.0. One
+  critical bug (a forged packet could panic the header-protection code) and a
+  medium one (half-open handshakes could fill the session cap) were found and
+  fixed; the rest are low or informational. Details and the list of what was
+  checked: [SECURITY.md](../SECURITY.md#review-of-the-noise-in-quic-binding).
 - **Dependency footprint**: acceptable (listed above); `cargo deny` stays green.

@@ -1,0 +1,52 @@
+name: Benchmark
+
+# noissh vs OpenSSH over loopback impaired by netem (delay and packet loss),
+# which needs root and a kernel with sch_netem: a GitHub runner has both. The
+# results go to the job summary. Runs on pull requests that touch the code,
+# and on demand.
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  netem:
+    name: noissh vs ssh under netem
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenSSH server, iproute2, ethtool
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q openssh-server iproute2 ethtool
+          # sshd refuses to start without its privilege-separation directory.
+          sudo mkdir -p /run/sshd
+          sudo modprobe sch_netem || true
+      - name: Build
+        run: cargo build --release --bins
+      - name: Benchmark
+        run: |
+          bench/netem.sh 20 | tee results.md
+          {
+            echo "## noissh vs OpenSSH (netem on loopback, 20 MB bulk)"
+            echo
+            cat results.md
+          } >> "$GITHUB_STEP_SUMMARY"

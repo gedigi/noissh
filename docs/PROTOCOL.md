@@ -26,6 +26,13 @@ default). QUIC provides what noissh needs from a transport:
   before the client's address is validated: the client's first datagram is
   padded to at least 1200 bytes, and the server sends at most three times what
   it received until then.
+- **Address validation under load**: with more than 16 handshakes in progress,
+  the server answers a new client with a Retry, and keeps state only once the
+  client returns the Retry token (proving it receives at its address). At most
+  256 handshakes are in progress at a time, separately from up to 512
+  established sessions, and a handshake not done within 10 s is dropped.
+- **ECN** marks are read and set, so congestion control can react to them; on
+  Linux, datagrams are sent and received in batches (GSO, `recvmmsg`/GRO).
 
 Version and parameters:
 
@@ -67,7 +74,12 @@ client                                         server
   the static keys and the server's parameters are encrypted in msg2/msg3, and
   the client's parameters (msg1) are bound to the transcript, so altering them
   makes msg2 fail to decrypt. 1-RTT keys come from Noise's split, each mixed
-  with the final handshake hash.
+  with the final handshake hash. Because the Handshake keys are public too, an
+  observer of msg1 can forge Handshake-level packets (a close, an ACK) for the
+  rest of the handshake: that can abort a handshake, never impersonate a side.
+- **One message per level**: each side receives exactly one Noise message per
+  encryption level; bytes after it are refused (they would be outside the
+  transcript).
 - **Packet protection**: ChaCha20-Poly1305 (nonce: IV XOR packet number, the
   header as associated data); header protection with ChaCha20 (RFC 9001
   §5.4.4); key derivation with keyed BLAKE2s-256. Key updates follow RFC 9001
