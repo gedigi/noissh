@@ -22,7 +22,7 @@ the current user with a generated host key and config in a temporary
 directory; as root it needs `/run/sshd`, which the harness creates.
 
 ```sh
-cargo build --release --bins
+cargo build --release --workspace --bins
 ./target/release/noissh-bench --rtt 40 --size 20
 ./target/release/noissh-bench --rtt 40 --loss 1 --tools noissh
 ```
@@ -52,7 +52,7 @@ To compare under loss, `bench/netem.sh` impairs loopback with the kernel's
 pull request that touches the code and puts the table in the job summary):
 
 ```sh
-cargo build --release --bins
+cargo build --release --workspace --bins
 bench/netem.sh 20
 ```
 

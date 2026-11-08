@@ -38,7 +38,7 @@ Changes to the transport should come with numbers from `noissh-bench` (see
 `bench/README.md`), before and after, on the same machine:
 
 ```sh
-cargo build --release --bins
+cargo build --release --workspace --bins
 ./target/release/noissh-bench --rtt 40 --size 20
 ```
 

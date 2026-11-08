@@ -41,9 +41,10 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo modprobe sch_netem || true
       - name: Build
-        run: cargo build --release --bins
+        run: cargo build --release --workspace --bins
       - name: Benchmark
         run: |
+          set -o pipefail
           bench/netem.sh 20 | tee results.md
           {
             echo "## noissh vs OpenSSH (netem on loopback, 20 MB bulk)"

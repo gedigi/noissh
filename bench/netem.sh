@@ -15,6 +15,10 @@ SIZE=${1:-20}
 NOISSH_PORT=41001
 SSH_PORT=41002
 BIN=target/release
+if [ ! -x "$BIN/noissh-bench" ]; then
+    echo "missing $BIN/noissh-bench: run cargo build --release --workspace --bins" >&2
+    exit 1
+fi
 
 restore() {
     sudo tc qdisc del dev lo root 2>/dev/null || true
@@ -45,9 +49,10 @@ echo "|---|---|---|---|---|---|"
 for scenario in "20 0" "20 1" "75 0" "20 5"; do
     set -- $scenario
     impair "$1" "$2"
-    "$BIN/noissh-bench" --no-link --noissh-port $NOISSH_PORT --ssh-port $SSH_PORT \
-        --size "$SIZE" --timeout 300 --bin-dir "$BIN" |
-        awk -v rtt="$(( $1 * 2 )) ms" -v loss="$2 %" \
+    out=$("$BIN/noissh-bench" --no-link --noissh-port $NOISSH_PORT --ssh-port $SSH_PORT \
+        --size "$SIZE" --timeout 300 --bin-dir "$BIN")
+    echo "$out" >&2
+    echo "$out" | awk -v rtt="$(( $1 * 2 )) ms" -v loss="$2 %" \
             '$1 == "noissh" || $1 == "ssh" {
                 printf "| %s | %s | %s | %s | %s | %s |\n", rtt, loss, $1, $2, $3, $4
             }'
