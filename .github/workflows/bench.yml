@@ -2,17 +2,9 @@ name: Benchmark
 
 # noissh vs OpenSSH over loopback impaired by netem (delay and packet loss),
 # which needs root and a kernel with sch_netem: a GitHub runner has both. The
-# results go to the job summary. Runs on pull requests that touch the code,
-# and on demand.
+# results go to the job summary. It takes about ten minutes of runner time,
+# so it runs only on demand: Actions → Benchmark → Run workflow.
 on:
-  pull_request:
-    paths:
-      - "src/**"
-      - "crates/**"
-      - "bench/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/bench.yml"
   workflow_dispatch:
 
 permissions:

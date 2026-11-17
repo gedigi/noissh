@@ -43,7 +43,8 @@ cargo build --release --workspace --bins
 ```
 
 The CI *Benchmark* workflow also compares with OpenSSH under kernel-emulated
-loss (`bench/netem.sh`); check its job summary on your pull request.
+loss (`bench/netem.sh`). It runs only on demand (Actions → Benchmark → Run
+workflow, on your branch); the table is in the job summary.
 
 ### Documentation
 

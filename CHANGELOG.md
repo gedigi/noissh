@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The CI benchmark runs only on demand** (Actions → Benchmark → Run
+  workflow), no longer on every pull request: it takes about ten minutes of
+  runner time.
+
 ## [0.7.0]
 
 ### Changed

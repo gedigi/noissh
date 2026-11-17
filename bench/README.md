@@ -48,8 +48,9 @@ A transfer that takes longer than `--timeout` reports `timeout`.
 
 The userspace TCP link can delay but not drop: TCP retransmits underneath it.
 To compare under loss, `bench/netem.sh` impairs loopback with the kernel's
-`netem` instead (Linux, sudo; the CI *Benchmark* workflow runs it on every
-pull request that touches the code and puts the table in the job summary):
+`netem` instead (Linux, sudo; the CI *Benchmark* workflow runs it when started
+by hand, Actions → Benchmark → Run workflow, and puts the table in the job
+summary):
 
 ```sh
 cargo build --release --workspace --bins
