@@ -106,6 +106,9 @@ struct Args {
     /// `-F FILE`: the ssh config file to resolve host aliases from (also passed
     /// to `ssh` for the bootstrap).
     ssh_config: Option<String>,
+    /// `--accept-new-host-key`: pin a direct server's key on first use
+    /// without asking.
+    accept_new_host_key: bool,
 }
 
 /// Parse a `-L` spec `LPORT:HOST:PORT` into (local_port, "HOST:PORT").
@@ -162,6 +165,8 @@ Options:
   --server-port N       UDP port for the bootstrapped server (default: --port)
   --server-cmd CMD      remote server command for --ssh (default \"noisshd\")
   --no-install          do not auto-install noisshd on the remote if missing
+  --accept-new-host-key trust a direct server's key on first use without asking
+                        (otherwise you are shown the key and asked)
   -L LPORT:HOST:PORT    local port forward (repeatable)
   -R RPORT:HOST:PORT    remote port forward (repeatable)
   -D [BIND:]PORT        dynamic SOCKS forward (repeatable)
@@ -251,6 +256,7 @@ fn parse_args() -> Args {
         no_tty: false,
         null_stdin: false,
         ssh_config: None,
+        accept_new_host_key: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -277,6 +283,7 @@ fn parse_args() -> Args {
             "--copy-id" => a.copy_id = true,
             "--forget-host" => a.forget_host = Some(string_value(it.next(), "--forget-host")),
             "--no-install" => a.no_install = true,
+            "--accept-new-host-key" => a.accept_new_host_key = true,
             "--forward-agent" => a.forward_agent = true,
             "--port" => a.port = port_value(it.next(), "--port"),
             "--server-cmd" => a.server_cmd = string_value(it.next(), "--server-cmd"),
@@ -321,10 +328,8 @@ fn parse_args() -> Args {
     a
 }
 
-/// The remote command `-T` runs when no command is given: the user's login
-/// shell, reading commands from stdin. `$SHELL` comes from the server
-/// process's environment; `/bin/sh` covers a daemon started without it.
-const LOGIN_SHELL_COMMAND: &str = "exec \"${SHELL:-/bin/sh}\" -l";
+/// The remote command `-T` runs when no command is given (see its definition).
+use proto::LOGIN_SHELL_COMMAND;
 
 /// ssh session options that noissh itself provides (or that would conflict with
 /// the bootstrap's own `ssh` invocation), so a `-o` setting them is dropped
@@ -614,45 +619,70 @@ fn run() -> Result<(), RuntimeError> {
             if args.verbose {
                 eprintln!("noissh: resolved {host} to {addr}; sending Noise handshake (UDP)…");
             }
-            match Client::connect_with(
-                &keypair,
-                known,
-                label.clone(),
-                addr,
-                rows,
-                cols,
-                DisplayMode::Adaptive,
-                want_shell,
-                agent_sock.clone(),
-                DIRECT_CONNECT_TIMEOUT,
-            ) {
-                Ok(c) => {
-                    if args.verbose {
-                        eprintln!("noissh: direct session established to {label}");
+            // A key not yet pinned is not trusted silently: the user is shown
+            // it and asked (or passes --accept-new-host-key). The handshake
+            // stops before our own key or any data is sent, and is redone
+            // once the key is accepted.
+            let mut known = known;
+            loop {
+                match Client::connect_with_trust(
+                    &keypair,
+                    known.clone(),
+                    label.clone(),
+                    addr,
+                    rows,
+                    cols,
+                    DisplayMode::Adaptive,
+                    want_shell,
+                    agent_sock.clone(),
+                    DIRECT_CONNECT_TIMEOUT,
+                    args.accept_new_host_key,
+                ) {
+                    Ok(c) => {
+                        if args.verbose {
+                            eprintln!("noissh: direct session established to {label}");
+                        }
+                        client = Some(c);
+                        connected_direct = true;
                     }
-                    client = Some(c);
-                    connected_direct = true;
+                    Err(RuntimeError::UnknownHostKey { label: l, key }) => {
+                        let key = PublicKey(key);
+                        if !confirm_new_host_key(&l, &key) {
+                            return Err(RuntimeError::Usage(format!(
+                                "the host key of {l} is not known, and was not accepted:\n  {}\n\
+                                 Check it against the server's (noisshd prints it at start; \
+                                 `noissh-keygen --key <its key file>` shows it), then connect from \
+                                 a terminal to confirm it, or pass --accept-new-host-key.",
+                                key.to_text()
+                            )));
+                        }
+                        known.check_or_add(&l, &key);
+                        save_known_hosts(&kh_path, &known)?;
+                        eprintln!("noissh: host key for {l} pinned in {}", kh_path.display());
+                        continue;
+                    }
+                    // The known standing server didn't answer: fall back to SSH
+                    // (unless the user demanded a direct connection).
+                    Err(RuntimeError::Timeout) if !args.direct => {
+                        eprintln!(
+                            "noissh: no direct response from {host}:{}; bootstrapping over SSH…",
+                            args.port
+                        );
+                    }
+                    // Under `--direct` a timeout is terminal (no SSH fallback) — give
+                    // a direct-mode-specific explanation instead of a bare timeout.
+                    Err(RuntimeError::Timeout) => {
+                        return Err(RuntimeError::BadAddress(format!(
+                            "no response from {host}:{} on UDP. Is noisshd running there with \
+                             that port reachable? (drop --direct to bootstrap it over SSH.)",
+                            args.port
+                        )));
+                    }
+                    // A real failure (e.g. host-key mismatch) must not silently
+                    // trigger an SSH bootstrap that would re-pin a key.
+                    Err(e) => return Err(e),
                 }
-                // The known standing server didn't answer: fall back to SSH
-                // (unless the user demanded a direct connection).
-                Err(RuntimeError::Timeout) if !args.direct => {
-                    eprintln!(
-                        "noissh: no direct response from {host}:{}; bootstrapping over SSH…",
-                        args.port
-                    );
-                }
-                // Under `--direct` a timeout is terminal (no SSH fallback) — give
-                // a direct-mode-specific explanation instead of a bare timeout.
-                Err(RuntimeError::Timeout) => {
-                    return Err(RuntimeError::BadAddress(format!(
-                        "no response from {host}:{} on UDP. Is noisshd running there with that \
-                         port reachable? (drop --direct to bootstrap it over SSH.)",
-                        args.port
-                    )));
-                }
-                // A real failure (e.g. host-key mismatch) must not silently
-                // trigger an SSH bootstrap that would re-pin a key.
-                Err(e) => return Err(e),
+                break;
             }
         } else if args.direct {
             return Err(RuntimeError::BadAddress(format!(
@@ -805,6 +835,24 @@ const BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// never sends one, waits the whole window — and only on interactive connects.
 const DIRECT_VERSION_WAIT: Duration = Duration::from_millis(400);
 
+/// Show a server key seen for the first time and ask whether to trust it
+/// (default: no). False without asking when there is no terminal to ask on.
+fn confirm_new_host_key(label: &str, key: &PublicKey) -> bool {
+    use std::io::BufRead;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    eprintln!("noissh: the authenticity of host {label} can't be established.");
+    eprintln!("        Its key is: {}", key.to_text());
+    eprint!("        Trust this key and continue connecting? [y/N]: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
 fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::AsFd;
@@ -894,10 +942,9 @@ fn interactive_loop(client: &mut Client) -> Result<(), RuntimeError> {
             last_contact = Instant::now();
         }
 
-        // Service SSH agent forwarding (open/bridge/pump), if enabled.
-        if client.agent_enabled() {
-            client.pump_agent();
-        }
+        // Service SSH agent forwarding (open/bridge/pump) if enabled, and
+        // refuse any other stream the server opens.
+        client.pump_agent();
 
         // Local keystrokes. Filter the detach prefix (Ctrl-^) out of the stream:
         // forward ordinary input to the remote shell, and quit cleanly on the

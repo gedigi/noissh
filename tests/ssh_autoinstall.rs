@@ -2,7 +2,8 @@
 //!
 //! A stateful fake `ssh` simulates a remote where `noisshd` is initially absent:
 //! the first invocation reports "command not found" (exit 127); the installer
-//! invocation (recognised by the `install.sh` URL) drops a marker; and the
+//! invocation (recognised by its `NOISSH_BIN_DIR` setting) saves the script it
+//! is sent on stdin as a marker; and the
 //! retry — now that the marker exists — runs the real `noisshd`. The bootstrap
 //! must detect the missing command, run the installer, retry, and connect.
 //!
@@ -26,7 +27,8 @@ fn bootstrap_installs_missing_noisshd_then_connects() {
     let fake_ssh = dir.join("fake-ssh");
 
     // The fake ssh: args are `<target> <cmd...>`.
-    //  - an installer invocation (contains "install.sh") drops the marker;
+    //  - an installer invocation (sets NOISSH_BIN_DIR) saves its stdin (the
+    //    installer script, sent over the connection) as the marker;
     //  - a noisshd invocation before the marker exists fails 127;
     //  - after the marker exists it runs the real noisshd one-shot.
     fs::write(
@@ -34,7 +36,7 @@ fn bootstrap_installs_missing_noisshd_then_connects() {
         "#!/bin/sh\n\
          all=\"$*\"\n\
          case \"$all\" in\n\
-           *install.sh*) : > \"$NOISSH_TEST_MARKER\"; exit 0 ;;\n\
+           *NOISSH_BIN_DIR*) cat > \"$NOISSH_TEST_MARKER\"; exit 0 ;;\n\
          esac\n\
          if [ ! -f \"$NOISSH_TEST_MARKER\" ]; then\n\
            echo 'sh: 1: noisshd: not found' >&2\n\
@@ -71,6 +73,10 @@ fn bootstrap_installs_missing_noisshd_then_connects() {
     assert_eq!(boot.server_pubkey.len(), 32, "got a valid server key");
     assert!(boot.server_addr.port() != 0, "got a real UDP port");
     assert!(marker.exists(), "the installer step must have run");
+    // The installer is the one built into the client, sent over SSH: nothing
+    // is downloaded on the remote to get it.
+    let sent = fs::read_to_string(&marker).unwrap();
+    assert_eq!(sent, include_str!("../install.sh"));
 
     let _ = fs::remove_dir_all(&dir);
 }

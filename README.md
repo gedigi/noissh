@@ -49,8 +49,8 @@ laptop going to sleep.
 - **It forwards your keys.** **Agent forwarding** (`-A`) lets commands on the
   server use the SSH keys on your laptop, without copying them anywhere.
 - **It's secure by design.** Every connection is mutually authenticated and
-  encrypted. Servers are pinned on first use (like SSH's `known_hosts`); only
-  authorized keys can connect.
+  encrypted. Servers are pinned on first use, after you confirm their key
+  (like SSH's `known_hosts`); only authorized keys can connect.
 - **It's easy to start.** A single command connects over your existing SSH
   access — and installs the server component for you on first use if it's
   missing. No daemon to keep running, no keys to copy around.
@@ -113,7 +113,8 @@ noissh first tries a direct session to a server that's already running; if none
 answers, it uses your existing SSH access to start one for you and then runs the
 session over its own resilient, encrypted channel. **If `noisshd` isn't on the
 server yet, the first connect installs it for you** over the same SSH session
-(fetching the matching, checksum-verified release into `~/.local/bin`).
+(its installer travels over SSH and fetches the matching, checksum-verified
+release into `~/.local/bin`).
 
 Use `--ssh` to force the SSH path, `--direct` to require a direct connection (no
 SSH fallback), and `--no-install` to skip the automatic install.

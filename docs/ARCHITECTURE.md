@@ -176,14 +176,16 @@ QUIC gives each stream reliable ordered delivery, flow control and congestion
 control, and loses nothing when the client changes address:
 
 - **Port forwarding** — local `-L`, remote `-R`, and dynamic `-D` (a local SOCKS5/4
-  proxy whose `CONNECT`s open forward streams). `-R` listeners bind loopback.
-- **File transfer** — `--put` / `--get`, written via a temp file and atomically
-  renamed on success.
+  proxy whose `CONNECT`s open forward streams). `-R` listeners bind loopback,
+  and the client dials only the `-R` targets it asked for. Outgoing connections
+  are made on helper threads, so a slow one never stalls the session loop.
+- **File transfer** — `--put` / `--get`, written via a private, randomly named
+  temp file and atomically renamed on success.
 - **Agent forwarding** — `-A` exposes `SSH_AUTH_SOCK` on the server, tunnelling
   agent connections back to the client's local agent.
 - **Remote command execution** — a trailing `noissh user@host <cmd>` runs a
-  command under pipes (byte-exact stdout, separate stderr on a second stream,
-  exit code in an `ExecExit` control message).
+  command with the user's login shell under pipes (byte-exact stdout, separate
+  stderr on a second stream, exit code in an `ExecExit` control message).
 
 QUIC's anti-amplification rules (a padded first packet, at most 3× the bytes
 received before the client's address is validated) prevent UDP reflection (see
@@ -201,7 +203,10 @@ built on the safe `pty-process` crate (no `unsafe`):
   needed.
 - A standalone root daemon may optionally drop to a target user's `uid`/`gid`
   before exec (via `pty-process`'s safe API), with the supplementary-group
-  caveat noted in [SECURITY.md](SECURITY.md).
+  caveat noted in [SECURITY.md](SECURITY.md). In that mode only the shell is
+  served: everything the daemon process itself would have to do as root for
+  the client (remote commands, file transfer, port and agent forwarding) is
+  refused.
 
 Keeping the privileged surface minimal, isolating all parsing/crypto/protocol in
 safe unprivileged code, and forbidding `unsafe` entirely are deliberate security

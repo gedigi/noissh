@@ -247,36 +247,27 @@ fn attempt(
     }
 }
 
-/// Install `noisshd` on the remote over SSH by running the published installer
-/// (which detects the remote platform, fetches the matching release binary, and
-/// verifies its checksum). Installs into `~/.local/bin` so the retry can invoke
-/// it by an absolute path regardless of the non-interactive `PATH`. Installer
-/// output streams to the user's terminal.
+/// The installer, as shipped with this client. It is sent to the remote over
+/// the SSH connection rather than downloaded there, so what runs is exactly
+/// the script this client was built with: not whatever a mutable tag or
+/// branch on GitHub serves at that moment.
+const INSTALLER: &str = include_str!("../install.sh");
+
+/// Install `noisshd` on the remote over SSH by running the installer (which
+/// detects the remote platform, fetches the matching release binary, and
+/// verifies its checksum). The script itself travels over SSH on stdin.
+/// Installs into `~/.local/bin` so the retry can invoke it by an absolute path
+/// regardless of the non-interactive `PATH`. Installer output streams to the
+/// user's terminal.
 fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), RuntimeError> {
-    // Pin the installer, and the release it downloads (NOISSH_VERSION), to THIS
-    // client's tag rather than a moving branch or "latest", so an auto-install
-    // runs a versioned, reproducible script and installs the matching server
-    // (the installer itself then verifies the release binary's SHA-256
-    // checksum).
-    let installer = format!(
-        "https://raw.githubusercontent.com/gedigi/noissh/v{}/install.sh",
-        env!("CARGO_PKG_VERSION")
-    );
-    // One self-contained shell command: prefer curl, fall back to wget, error if
-    // neither is available. `$HOME` is expanded by the remote shell.
-    // Single-quote the URL in the remote command (defence in depth: the version
-    // is a numeric compile-time constant, but quoting keeps it inert regardless).
-    //
-    // Download to a temp file rather than piping `curl | sh`: a pipe reports the
-    // pipeline's exit status (the shell's), so a failed download (e.g. a 404 or
-    // network error) would be masked as success. `set -e` then aborts on a failed
-    // fetch so the caller actually sees the failure.
+    use std::io::Write;
+    // Pin the release the installer downloads (NOISSH_VERSION) to THIS
+    // client's version rather than "latest", so the matching server is
+    // installed (the installer verifies the release binary's SHA-256
+    // checksum). `$HOME` is expanded by the remote shell; the version is a
+    // compile-time constant, single-quoted to keep it inert regardless.
     let remote = format!(
-        "set -e; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; \
-         if command -v curl >/dev/null 2>&1; then curl -fsSL '{installer}' -o \"$tmp\"; \
-         elif command -v wget >/dev/null 2>&1; then wget -qO \"$tmp\" '{installer}'; \
-         else echo 'noissh: remote has neither curl nor wget to install noisshd' >&2; exit 3; fi; \
-         NOISSH_VERSION='v{ver}' NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh \"$tmp\" --yes",
+        "NOISSH_VERSION='v{ver}' NOISSH_BIN_DIR=\"$HOME/.local/bin\" sh -s -- --yes",
         ver = env!("CARGO_PKG_VERSION")
     );
     let mut cmd = Command::new(ssh_prog());
@@ -284,8 +275,15 @@ fn install_remote(target: &str, extra_ssh_args: &[String]) -> Result<(), Runtime
     cmd.arg("--"); // terminate ssh option parsing (target may start with `-`)
     cmd.arg(target);
     cmd.arg(remote);
-    // Inherit stdio so the user sees the installer's progress.
-    let status = cmd.status()?;
+    // The script goes in on stdin; stdout/stderr are inherited so the user
+    // sees the installer's progress.
+    cmd.stdin(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A write error (ssh exited early) shows up in the exit status below.
+        let _ = stdin.write_all(INSTALLER.as_bytes());
+    }
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {

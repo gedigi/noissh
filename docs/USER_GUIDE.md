@@ -65,8 +65,9 @@ The default — `noissh [user@]host` — does the right thing on its own. You do
 choose a mode up front:
 
 1. **Direct first.** noissh tries a QUIC session to a standing `noisshd` on
-   the host (UDP port 51820 by default, or `--port N`), pinning the server's key
-   via TOFU in `known_hosts`.
+   the host (UDP port 51820 by default, or `--port N`) whose key is already
+   pinned in `known_hosts` (or to any host with `--direct`, which asks before
+   pinning a new key).
 2. **SSH fallback.** If nothing answers within a few seconds (no daemon is
    running there), noissh automatically falls back to the SSH bootstrap: it
    launches `noisshd` over your existing SSH access — auto-installing it if
@@ -93,7 +94,12 @@ noissh --port 51820 host
 noissh --direct user@host     # require direct; never fall back to SSH
 ```
 
-On first connect the server's key is pinned (TOFU) in `known_hosts`. A later key
+The first time you connect directly to a server, noissh shows its key and asks
+whether to trust it; on yes the key is pinned in `known_hosts` (trust on first
+use). Compare it with the key the daemon prints when it starts. Nothing is sent
+to the server before you answer, not even your own key. Without a terminal to
+ask on, the connection is refused; pass `--accept-new-host-key` to pin a new
+key without being asked (for scripts, when you accept that risk). A later key
 change aborts the connection with a `HOST KEY MISMATCH` error.
 
 ### SSH bootstrap (the automatic fallback)
@@ -123,15 +129,16 @@ run a [standalone daemon](#standalone-daemon) instead: one server on one port
 serves them all.
 
 If the remote does not have `noisshd` yet, the bootstrap installs it for you
-automatically: noissh runs the published installer over the same SSH session,
+automatically: noissh runs its installer over the same SSH session (the script
+is the one built into your client, sent over SSH, not downloaded on the remote),
 which detects the remote OS/arch, downloads the matching prebuilt release binary,
 verifies its SHA-256 checksum, and installs it into `~/.local/bin`. Installer
 progress streams to your terminal, then the handshake is retried using that path
 and the connection proceeds. This applies only to the default server command; it
 is skipped when `--server-cmd` is set to something custom. Pass `--no-install` to
 opt out, in which case a missing `noisshd` simply fails as before. (The install
-step needs either `curl` or `wget` on the remote; if neither is present it fails
-with a clear message.)
+step needs either `curl` or `wget` on the remote to fetch the release; with
+neither, it can only build from source, which needs `cargo` there.)
 
 If the remote `noisshd` is already installed but older than your client, noissh
 asks whether to upgrade it — `[y/N]`, defaulting to no. Decline and it connects to
@@ -273,7 +280,10 @@ systemctl --user enable --now noisshd
 sudo loginctl enable-linger "$USER"   # keep it running while you're logged out
 ```
 
-Restart it after changing `authorized_keys`: `systemctl --user restart noisshd`.
+The daemon notices changes to `authorized_keys` within a couple of seconds: a
+key you add can connect, and removing a key ends its sessions, with no restart.
+The file and its directory must not be writable by group or others (as with
+`~/.ssh`), or the daemon refuses to use them.
 
 See
 [`contrib/README.md`](../contrib/README.md) for full notes plus
@@ -287,7 +297,8 @@ Homebrew/deb packaging placeholders.
   `authorized_keys` line (`noissh-x25519 <base64> user@host`).
 - **Server identity:** `~/.config/noissh/noisshd_key` (and `noisshd_key.pub`)
   on the server.
-- **Server trust (client side):** `~/.config/noissh/known_hosts`, TOFU-pinned.
+- **Server trust (client side):** `~/.config/noissh/known_hosts`: keys pinned
+  on first use, after you confirm them.
 - **Client authorization (server side):** `~user/.config/noissh/authorized_keys`.
 
 This mirrors SSH's `known_hosts` / `authorized_keys` model, but with Noise static
@@ -447,7 +458,8 @@ or use in a pipeline:
 noissh --ssh user@server tar czf - /etc > etc.tar.gz
 ```
 
-The trailing words are joined and run by the remote shell, so quoting, globs,
+The trailing words are joined and run by your login shell on the server
+(`<shell> -c '<command>'`, as with ssh), so quoting, globs,
 pipes, and redirections are interpreted there — quote them to protect them from
 your local shell when needed:
 
@@ -466,10 +478,11 @@ noissh -D 1080 user@server 'sleep 600'   # a SOCKS proxy for ten minutes
 `-n` gives the command an empty stdin instead of forwarding yours (like
 `ssh -n`), and `-N` runs no command at all.
 
-Like file transfer and agent forwarding, a remote command is refused by a standalone
-daemon configured with a `--user` privilege drop (see
-[Security](SECURITY.md)); use the SSH-bootstrap model or run the daemon as the
-target user.
+Like file transfer, port forwarding and agent forwarding, a remote command is
+refused by a standalone daemon configured with a `--user` privilege drop (see
+[Security](SECURITY.md)), where you should use the SSH-bootstrap model or run
+the daemon as the target user, and by one confined to a command with
+`--command`.
 
 ## File transfer
 
@@ -488,6 +501,11 @@ noissh --ssh --get /var/log/app.log:./app.log user@server
 The spec is split on the **first** colon. For `--put` the order is
 `LOCAL:REMOTE`; for `--get` it is `REMOTE:LOCAL`. Files on the server are read
 and written as the user you log in as, exactly like a normal login.
+
+A file is written to a private temporary file next to its destination and
+moved into place when the transfer completes. A new file is created readable
+and writable by you only (mode `0600`: the source file's mode isn't
+transferred); replacing an existing file keeps that file's mode.
 
 On a terminal, a live progress line shows how the transfer is going (a
 percentage and byte counts when uploading, where the size is known up front; a
@@ -528,8 +546,10 @@ locally — if `-A` is given but it is unset, noissh prints a warning and
 continues without agent forwarding.
 
 The server-side agent socket lives in a per-user directory created `0700`
-(noissh refuses a pre-existing path not owned by you) and the socket file itself
-is `0600`, so other local users on the server cannot reach your forwarded agent.
+(under `$XDG_RUNTIME_DIR` when set, else in the temporary directory; noissh
+never uses a pre-existing path not owned by you, and picks another name if
+someone else has taken it) and the socket file itself is `0600`, so other
+local users on the server cannot reach your forwarded agent.
 
 ## Using noissh as `ssh` (VS Code Remote-SSH and other tools)
 
@@ -583,8 +603,8 @@ Tips:
   them in parallel; with the SSH bootstrap each one needs its own server on port
   51820, so all but one end up on a random, usually blocked, port. Run a
   [standalone daemon](#standalone-daemon) on the server, authorize your key with
-  `noissh --copy-id host` (then restart the daemon), and connect once with
-  `noissh --direct host true` to pin its key; VS Code's connections then go
+  `noissh --copy-id host`, and connect once from a terminal with
+  `noissh --direct host true` to check and pin its key; VS Code's connections then go
   straight to it.
 - **Use the same noissh version on both ends (0.7 or later).** 0.7 replaced the
   transport with QUIC and doesn't interoperate with 0.6 (see
@@ -613,6 +633,8 @@ noissh [OPTIONS] [user@]host [command ...] [-- <ssh args>]
   --server-port N UDP port for the bootstrapped server (default: --port)
   --server-cmd C  remote server command for --ssh (default "noisshd")
   --no-install    do not auto-install noisshd on the remote if it is missing
+  --accept-new-host-key  trust a direct server's key on first use without
+                  asking (otherwise you are shown the key and asked)
   -L LPORT:HOST:PORT   local forward (repeatable)
   -R RPORT:HOST:PORT   remote forward (repeatable)
   -D [BIND:]PORT       dynamic SOCKS forward (repeatable); forwards run
@@ -658,10 +680,14 @@ noisshd --one-shot --authorize <b64pub> [--bind ADDR] [--command CMD ...]
                        and fatal socket errors
   --key PATH           static key file (default <config>/noisshd_key)
   --authorized-keys P  authorized_keys file (default <config>/authorized_keys),
-                       read at startup: restart after adding a key
+                       re-read when it changes: removing a key ends its
+                       sessions. Refused if it, or its directory, is writable
+                       by group or others
   --user NAME          drop sessions to this user (requires root); file transfer,
-                       agent forwarding, and exec are refused in this mode
-  --command CMD ...    run this command instead of the login shell
+                       port and agent forwarding, and exec are refused in this mode
+  --command CMD ...    run this command instead of the login shell; a standing
+                       daemon then serves only that command (no exec, file
+                       transfer or forwarding)
   --one-shot           ephemeral key, serve one session, then exit (SSH bootstrap)
   --authorize <b64>    the single client key to trust in one-shot mode
   --bind ADDR          bind address in one-shot mode (default 0.0.0.0:0; the
@@ -743,9 +769,15 @@ file are unchanged. Upgrade both ends:
   [standalone daemon](#standalone-daemon), which serves every session on one
   port.
 - **A direct connection gets no response although the daemon is running.**
-  Check that the client's key is in the daemon's `authorized_keys`, then restart
-  the daemon: it reads that file only at startup. Unknown keys are ignored
+  Check that the client's key is in the daemon's `authorized_keys` (the daemon
+  picks up changes to it within a couple of seconds). Unknown keys are ignored
   silently by design.
+- **`noisshd` refuses to start: "refusing to use …/authorized_keys".** The file
+  or its directory is writable by group or others, so someone else could add a
+  key. Fix it as the message says (`chmod go-w`).
+- **`the host key of … is not known`.** A direct connection met a server whose
+  key isn't pinned and there was no terminal to ask you on. Connect once from a
+  terminal to check and accept the key, or pass `--accept-new-host-key`.
 - **`HOST KEY MISMATCH`.** The server's key changed since you first connected.
   If this is expected (server reinstall), drop the stale pin with
   `noissh --forget-host <host>` (or remove the host's line from

@@ -6,7 +6,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+Fixes from a review of 0.7.0 (details in `docs/SECURITY.md`, "Review of
+0.7.0"). Upgrade clients and servers; they stay compatible with 0.7.0.
+
+- **The client no longer dials targets chosen by the server.** A server could
+  open a forward stream naming any `host:port`, and a client running a command
+  or forwards connected to it, giving a hostile server a way into the client's
+  network. The client now dials only the `-R` targets it asked for, and resets
+  any other stream a server opens.
+- **File transfers use a private, unpredictable temporary file** (random name,
+  created exclusively, mode `0600`) instead of `<dest>.noissh-tmp-<pid>`
+  opened through symlinks.
+- **`noisshd --user` refuses port forwarding too** (it connected out and
+  listened as root), starts the user's shell with a minimal environment and
+  that user's own login shell, and needs root.
+- **Terminal size is capped** (512 × 2048): a client could ask for a screen of
+  tens of gigabytes and abort the daemon.
+- **Screen history is bounded** (32 states): it grew without limit while a
+  client didn't acknowledge updates.
+- **Outgoing forward connections no longer block the daemon** (or the client):
+  they are made on helper threads, so one unreachable target can't stall every
+  session.
+- **Control characters in screen cells are dropped by the client**, so a server
+  can't write escape sequences to your terminal through the screen state.
+- Only authenticated packets count as a sign of life from a client (forged
+  ones could delay a reattach). The agent socket directory can no longer be
+  taken by another user to disable agent forwarding. The loaded private key is
+  wiped from memory when dropped.
+- Release builds pin their GitHub Actions to commits, use `--locked` and no
+  build cache; the SSH bootstrap sends its installer over SSH instead of
+  downloading it on the remote.
+
 ### Changed
+
+- **A direct connection asks before trusting a new host key.** `noissh
+  --direct host` shows a key it hasn't pinned and asks; nothing is sent to the
+  server before you agree. Without a terminal it is refused: pass the new
+  `--accept-new-host-key` for the old behaviour (scripts).
+- **Uploaded and downloaded files are created `0600`** (the source mode isn't
+  transferred); replacing an existing file keeps its mode. Before, new files
+  got the umask's default (usually `0644`).
+- **Remote commands run with your login shell** (`<shell> -c`, as with ssh)
+  instead of always `/bin/sh`. An account with a restricted or disabled shell
+  no longer gets `/bin/sh` through `noissh host cmd`.
+- **A standing `noisshd --command CMD` serves only `CMD`:** remote commands,
+  file transfer and forwarding are refused. (The one-shot server started by
+  the SSH bootstrap is unaffected.)
+- **`noisshd` re-reads `authorized_keys` when it changes**: no restart after
+  adding a key, and removing a key ends its sessions. It refuses to start if
+  the file or its directory is writable by group or others or owned by someone
+  else (`chmod go-w` them).
+- **`noisshd` rejects unknown options** and options missing a value (it used to
+  print a warning and carry on).
+- A config directory noissh creates is `0700`.
 
 - **The CI benchmark runs only on demand** (Actions → Benchmark → Run
   workflow), no longer on every pull request: it takes about ten minutes of

@@ -44,6 +44,12 @@ pub enum RuntimeError {
     /// known_hosts path and the recovery steps (it knows the config location).
     #[error("host key changed for {0} — possible man-in-the-middle; aborting")]
     HostKeyMismatch(String),
+    /// The server's key isn't pinned and the caller asked not to trust new
+    /// keys silently. Nothing was sent to that server beyond the first
+    /// handshake message (not even our own key). Carries the host:port label
+    /// and the key, for the caller to show and, if the user agrees, pin.
+    #[error("the host key of {label} is not known")]
+    UnknownHostKey { label: String, key: [u8; 32] },
     #[error("malformed key file (expected lines 'private <base64>' and 'public <base64>')")]
     BadKeyFile,
     #[error("the connection timed out")]

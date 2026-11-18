@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use auth::{AuthorizedKeys, PublicKey};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use noissh::config::{config_dir, load_authorized_keys, load_or_generate_keypair};
+use noissh::config::{
+    check_private_ownership, config_dir, load_authorized_keys, load_or_generate_keypair,
+};
 use noissh::server::{Server, ServerCore};
 use noissh::{RuntimeError, ssh};
 
@@ -59,12 +61,16 @@ Options:
   --listen ADDR         UDP listen address (default 0.0.0.0:51820)
   --bind ADDR           one-shot: UDP bind address (default 0.0.0.0:0)
   --key PATH            server keypair path (standalone)
-  --authorized-keys P   authorized client keys path (standalone; read at start)
+  --authorized-keys P   authorized client keys path (standalone); re-read when it
+                        changes. Must not be writable by group or others
   --authorize B64       one-shot: the single client public key to trust
   --user NAME           drop sessions to this user (standalone; requires root).
-                        File transfer, agent forwarding, and exec are refused in
-                        this mode — prefer the SSH bootstrap for multi-user.
-  --command CMD ...     run CMD instead of a login shell (rest of argv)
+                        File transfer, port and agent forwarding, and exec are
+                        refused in this mode — prefer the SSH bootstrap for
+                        multi-user.
+  --command CMD ...     run CMD instead of a login shell (rest of argv). A
+                        standalone daemon then serves only CMD: no exec, file
+                        transfer or forwarding
   -v, --verbose         log session lifecycle events
   -h, --help            print this help and exit
   -V, --version         print the version and exit
@@ -99,20 +105,45 @@ fn parse_args() -> Args {
             }
             "--one-shot" => a.one_shot = true,
             "-v" | "--verbose" => a.verbose = true,
-            "--listen" => a.listen = it.next(),
-            "--bind" => a.bind = it.next(),
-            "--key" => a.key = it.next(),
-            "--authorized-keys" => a.authorized_keys = it.next(),
-            "--authorize" => a.authorize = it.next(),
-            "--user" => a.user = it.next(),
+            "--listen" => a.listen = Some(value(&mut it, "--listen")),
+            "--bind" => a.bind = Some(value(&mut it, "--bind")),
+            "--key" => a.key = Some(value(&mut it, "--key")),
+            "--authorized-keys" => a.authorized_keys = Some(value(&mut it, "--authorized-keys")),
+            "--authorize" => a.authorize = Some(value(&mut it, "--authorize")),
+            "--user" => a.user = Some(value(&mut it, "--user")),
             "--command" => {
                 // Remaining args form the command to run instead of a shell.
                 a.command = Some(it.by_ref().collect());
             }
-            other => eprintln!("noisshd: ignoring unknown arg {other:?}"),
+            // An unknown or mistyped option is an error, never ignored: a
+            // daemon that skipped a misspelt `--user` or `--authorized-keys`
+            // would start with weaker settings than its operator asked for.
+            other => usage_exit(&format!("unknown option {other:?} (see noisshd --help)")),
         }
     }
     a
+}
+
+fn usage_exit(msg: &str) -> ! {
+    eprintln!("noisshd: {msg}");
+    exit(2);
+}
+
+/// The value of an option that takes one.
+fn value(it: &mut impl Iterator<Item = String>, flag: &str) -> String {
+    match it.next() {
+        Some(v) if !v.is_empty() => v,
+        _ => usage_exit(&format!("{flag} requires a value")),
+    }
+}
+
+/// How often the standing daemon checks `authorized_keys` for changes.
+const KEYS_RECHECK: Duration = Duration::from_secs(2);
+
+/// What identifies a version of the authorized_keys file (to notice changes).
+fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
 }
 
 fn run() -> Result<(), RuntimeError> {
@@ -135,7 +166,27 @@ fn run_standalone(args: Args) -> Result<(), RuntimeError> {
         .map(Into::into)
         .unwrap_or_else(|| dir.join("authorized_keys"));
 
+    // `--user` drops each session to another account, which only root can do.
+    if let Some(user) = &args.user {
+        if !nix::unistd::Uid::effective().is_root() {
+            return Err(RuntimeError::Usage(format!(
+                "--user {user} needs noisshd to run as root (it drops each session to that \
+                 user). Run noisshd as {user} instead, without --user."
+            )));
+        }
+        if !matches!(nix::unistd::User::from_name(user), Ok(Some(_))) {
+            return Err(RuntimeError::Usage(format!(
+                "--user: no such user {user:?}"
+            )));
+        }
+    }
+
     let keypair = load_or_generate_keypair(&key_path)?;
+    // Anyone who can write authorized_keys can log in: refuse a file (or a
+    // directory) that someone else could change.
+    check_private_ownership(&ak_path).map_err(|why| {
+        RuntimeError::Usage(format!("refusing to use {}: {why}", ak_path.display()))
+    })?;
     let authorized = load_authorized_keys(&ak_path)?;
 
     let listen_str = args.listen.as_deref().unwrap_or("0.0.0.0:51820");
@@ -147,7 +198,10 @@ fn run_standalone(args: Args) -> Result<(), RuntimeError> {
 
     let mut core = ServerCore::local(keypair.clone(), authorized);
     if let Some(cmd) = args.command {
-        core = core.with_command(cmd);
+        // A standing daemon given a command serves that command and nothing
+        // else: remote commands, file transfer and forwarding are refused, or
+        // the command would restrict nothing.
+        core = core.with_command(cmd).with_restricted(true);
     }
     if args.user.is_some() {
         // Drop sessions to this user (requires running as root). File transfer,
@@ -162,33 +216,63 @@ fn run_standalone(args: Args) -> Result<(), RuntimeError> {
         STANDARD.encode(&keypair.public)
     );
     if args.verbose {
-        serve_verbose(&mut server);
-    } else {
-        server.run();
+        eprintln!("noisshd: verbose logging enabled");
     }
-    Ok(())
-}
-
-/// Standalone serve loop with session-lifecycle logging (`-v`). Logs whenever
-/// the active-session count changes and on a fatal socket error.
-fn serve_verbose(server: &mut Server) {
     let mut active = server.core().session_count();
-    eprintln!("noisshd: verbose logging enabled");
+    let mut stamp = file_stamp(&ak_path);
+    let mut checked = Instant::now();
     loop {
         if !server.poll_once() {
             eprintln!("noisshd: fatal socket error; stopping");
             break;
         }
-        let now = server.core().session_count();
-        if now != active {
-            if now > active {
-                eprintln!("noisshd: session established ({now} active)");
-            } else {
-                eprintln!("noisshd: session ended ({now} active)");
+        // Pick up authorized_keys changes while running, so removing a key
+        // revokes it (and ends its sessions) without a restart.
+        if checked.elapsed() >= KEYS_RECHECK {
+            checked = Instant::now();
+            let now_stamp = file_stamp(&ak_path);
+            if now_stamp != stamp {
+                stamp = now_stamp;
+                match check_private_ownership(&ak_path) {
+                    Ok(()) => match load_authorized_keys(&ak_path) {
+                        Ok(keys) => {
+                            eprintln!(
+                                "noisshd: reloaded {} ({} key(s))",
+                                ak_path.display(),
+                                keys.len()
+                            );
+                            server.core_mut().set_authorized_keys(keys);
+                        }
+                        Err(e) => eprintln!(
+                            "noisshd: can't reload {}: {e}; keeping the previous keys",
+                            ak_path.display()
+                        ),
+                    },
+                    // Someone else can write the file now: trust none of it.
+                    Err(why) => {
+                        eprintln!(
+                            "noisshd: {} changed but is not safe to use ({why}); \
+                             authorizing no keys until that is fixed",
+                            ak_path.display()
+                        );
+                        server.core_mut().set_authorized_keys(AuthorizedKeys::new());
+                    }
+                }
             }
-            active = now;
+        }
+        if args.verbose {
+            let now = server.core().session_count();
+            if now != active {
+                if now > active {
+                    eprintln!("noisshd: session established ({now} active)");
+                } else {
+                    eprintln!("noisshd: session ended ({now} active)");
+                }
+                active = now;
+            }
         }
     }
+    Ok(())
 }
 
 fn run_one_shot(args: Args) -> Result<(), RuntimeError> {

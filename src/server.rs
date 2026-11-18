@@ -44,8 +44,12 @@ struct ServerSession {
     /// Set once the shell has exited (or the client said goodbye).
     exit_status: Option<i32>,
     exit_sent_at: Option<Instant>,
-    /// Last time a datagram arrived on this session's connection.
+    /// Last time an authenticated packet arrived on this session's connection.
     last_heard: Instant,
+    /// Frames received so far, as last seen: frames are only counted from
+    /// packets that passed authentication, so a rise means the peer (not
+    /// someone replaying its connection id) was heard.
+    rx_frames: u64,
     /// When the connection was lost while a shell kept running.
     detached_at: Option<Instant>,
     /// When the connection arrived (bounds how long a handshake may take).
@@ -103,22 +107,114 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// later, up-to-date diff replaces it).
 const DIFF_BACKLOG: usize = 256 * 1024;
 
-/// The per-user directory under which forwarded agent sockets live. Kept private
-/// to the owning user (mode 0700) so no other local user can reach the sockets.
-fn agent_socket_dir() -> std::path::PathBuf {
+/// Make `dir` a private directory of the current user: create it with mode
+/// 0700 if missing; if it exists it must be a real directory (not a symlink)
+/// that we own, and is tightened to 0700.
+fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
     let uid = nix::unistd::Uid::current().as_raw();
-    std::env::temp_dir().join(format!("noissh-{uid}"))
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "agent socket dir is not a directory",
+                ));
+            }
+            if meta.uid() != uid {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "agent socket dir not owned by current user",
+                ));
+            }
+            // Tighten in case a previous run (or umask) left it loose.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(dir)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The per-user directory under which forwarded agent sockets live, private to
+/// the owning user (mode 0700) so no other local user can reach the sockets.
+/// Chosen once per process:
+///
+/// 1. `$XDG_RUNTIME_DIR/noissh` (a per-user directory no one else can write);
+/// 2. `<tmp>/noissh-<uid>`;
+/// 3. if another user has taken that name (the temp directory is shared, so
+///    anyone can create it first to deny us agent forwarding), a directory
+///    with a random name next to it.
+fn agent_socket_dir() -> Option<std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let uid = nix::unistd::Uid::current().as_raw();
+        let mut candidates = Vec::new();
+        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)
+            && rt.is_absolute()
+        {
+            candidates.push(rt.join("noissh"));
+        }
+        let tmp = std::env::temp_dir();
+        candidates.push(tmp.join(format!("noissh-{uid}")));
+        let mut rnd = [0u8; 8];
+        if getrandom::fill(&mut rnd).is_ok() {
+            let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+            candidates.push(tmp.join(format!("noissh-{uid}-{hex}")));
+        }
+        candidates.into_iter().find(|d| secure_dir(d).is_ok())
+    })
+    .clone()
 }
 
 /// Filesystem path for a session's forwarded SSH agent socket. Unique per
 /// process and session so concurrent sessions never collide. The containing
-/// directory (created and locked down by the driver at bind time) is what keeps
-/// the socket private; see [`Server::ensure_agent_dir`].
-fn agent_socket_path(sid: SessionId) -> String {
-    agent_socket_dir()
-        .join(format!("agent-{}-{sid:016x}.sock", std::process::id()))
-        .to_string_lossy()
-        .into_owned()
+/// directory is what keeps the socket private; see [`agent_socket_dir`].
+/// `None` if no private directory could be set up (agent forwarding is then
+/// not offered).
+fn agent_socket_path(sid: SessionId) -> Option<String> {
+    Some(
+        agent_socket_dir()?
+            .join(format!("agent-{}-{sid:016x}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Largest terminal a client may ask for. The screen is kept in memory (several
+/// copies of it), so the size a client names must be bounded: 512 × 2048 is
+/// the most cells the client's own diff decoder accepts (2^20).
+pub const MAX_ROWS: u16 = 512;
+pub const MAX_COLS: u16 = 2048;
+
+fn clamp_size(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.clamp(1, MAX_ROWS), cols.clamp(1, MAX_COLS))
+}
+
+/// Frames received on a connection so far. Only packets that passed
+/// authentication contribute, and every such packet carries at least one of
+/// these frames or is a reply to ours.
+fn rx_frame_count(conn: &Connection) -> u64 {
+    let f = conn.stats().frame_rx;
+    f.acks
+        + f.ping
+        + f.stream
+        + f.datagram
+        + f.crypto
+        + f.max_data
+        + f.max_stream_data
+        + f.reset_stream
+        + f.stop_sending
+        + f.path_challenge
+        + f.path_response
+        + f.connection_close
+        + f.immediate_ack
+        + f.ack_frequency
+        + f.new_connection_id
+        + f.retire_connection_id
 }
 
 /// Socket-free server logic: consumes datagrams, returns datagrams to send.
@@ -129,6 +225,12 @@ pub struct ServerCore {
     login: Box<dyn LoginSession + Send>,
     command: Option<Vec<String>>,
     user: Option<String>,
+    /// The session is confined to `command`: nothing else the client could
+    /// use to run code or move data is served.
+    restricted: bool,
+    /// The keys clients may connect with; shared with the handshake check so
+    /// it can be replaced while running.
+    authorized: Arc<std::sync::RwLock<AuthorizedKeys>>,
     conns: HashMap<ConnectionHandle, SessionId>,
     sessions: HashMap<SessionId, ServerSession>,
     next_sid: SessionId,
@@ -172,17 +274,25 @@ impl ServerCore {
         idle: Duration,
     ) -> Self {
         let private = quic::key32(&keypair.private).unwrap_or([0; 32]);
-        let check: noise_quic::PeerCheck =
-            Arc::new(move |key: &[u8; 32]| authorize_client(&authorized, key));
+        let authorized = Arc::new(std::sync::RwLock::new(authorized));
+        let check: noise_quic::PeerCheck = {
+            let authorized = authorized.clone();
+            Arc::new(move |key: &[u8; 32]| {
+                let keys = authorized.read().unwrap_or_else(|e| e.into_inner());
+                authorize_client(&keys, key)
+            })
+        };
         let crypto = Arc::new(noise_quic::ServerConfig::new(private, check));
         let cfg = Self::server_config(crypto.clone(), idle);
         ServerCore {
             endpoint: Endpoint::new(quic::endpoint_config(), Some(cfg), true, None),
             crypto,
-            public: keypair.public,
+            public: keypair.public.clone(),
             login,
             command,
             user: None,
+            restricted: false,
+            authorized,
             conns: HashMap::new(),
             sessions: HashMap::new(),
             next_sid: 1,
@@ -241,6 +351,47 @@ impl ServerCore {
     /// user) has process identity == session identity and is unaffected.
     pub fn privsep_active(&self) -> bool {
         self.user.is_some()
+    }
+
+    /// Confine sessions to the configured command (`--command` on a standing
+    /// daemon): remote commands, file transfer, port forwarding and agent
+    /// forwarding are refused, so a client gets that command and nothing else.
+    pub fn with_restricted(mut self, restricted: bool) -> Self {
+        self.restricted = restricted;
+        self
+    }
+
+    /// Whether anything beyond the session's shell (remote commands, file
+    /// transfer, port forwarding, agent forwarding) is refused: under a
+    /// `--user` drop, where the driver would act with its own (root)
+    /// identity, and for a daemon confined to a command.
+    pub fn extras_refused(&self) -> bool {
+        self.user.is_some() || self.restricted
+    }
+
+    /// Replace the set of authorized client keys (the file changed). New
+    /// handshakes use the new set at once; sessions of a key that is no
+    /// longer listed are closed and their shells stopped.
+    pub fn set_authorized_keys(&mut self, keys: AuthorizedKeys) {
+        let now = Instant::now();
+        for s in self.sessions.values_mut() {
+            let listed = s.client_key.is_none_or(|k| authorize_client(&keys, &k));
+            if listed {
+                continue;
+            }
+            if let Some((_, conn)) = s.conn.as_mut() {
+                conn.close(now, VarInt::from_u32(1), "key no longer authorized".into());
+            }
+            if let Some(pty) = &mut s.pty {
+                let _ = pty.kill();
+            }
+            s.pty = None;
+            s.streams.fail_all();
+            s.lost = true;
+            // Like a deliberate close: no detached shell is kept.
+            s.closed_by_peer = true;
+        }
+        *self.authorized.write().unwrap_or_else(|e| e.into_inner()) = keys;
     }
 
     /// One-shot lifecycle: true once a session existed and every session has
@@ -351,7 +502,9 @@ impl ServerCore {
                             if let Some(conn) = s.conn() {
                                 conn.handle_event(ev);
                             }
-                            s.last_heard = now;
+                            // `last_heard` is updated in `service`, and only
+                            // for packets that authenticate: this datagram
+                            // may be forged.
                             // Established sessions are serviced once per batch of
                             // datagrams, in `tick`; handshakes answer at once.
                             if s.established { None } else { sid }
@@ -396,6 +549,7 @@ impl ServerCore {
                 exit_status: None,
                 exit_sent_at: None,
                 last_heard: now,
+                rx_frames: 0,
                 created_at: now,
                 detached_at: None,
                 diff_sent_seq: 0,
@@ -420,6 +574,11 @@ impl ServerCore {
                 if let Some(cev) = self.endpoint.handle_event(*ch, ev) {
                     conn.handle_event(cev);
                 }
+            }
+            let rx = rx_frame_count(conn);
+            if rx != s.rx_frames {
+                s.rx_frames = rx;
+                s.last_heard = now;
             }
             while let Some(ev) = conn.poll() {
                 match ev {
@@ -489,6 +648,7 @@ impl ServerCore {
                 term,
                 agent,
             } => {
+                let (rows, cols) = clamp_size(rows, cols);
                 let Some(s) = self.sessions.get(&sid) else {
                     return;
                 };
@@ -539,13 +699,14 @@ impl ServerCore {
                 // under privsep: the driver (not the dropped shell user) would
                 // own the socket and accept its connections.
                 let mut env = Vec::new();
-                let agent_path = if agent && self.user.is_none() {
-                    let path = agent_socket_path(sid);
-                    env.push(("SSH_AUTH_SOCK".to_string(), path.clone()));
-                    Some(path)
+                let agent_path = if agent && !self.extras_refused() {
+                    agent_socket_path(sid)
                 } else {
                     None
                 };
+                if let Some(path) = &agent_path {
+                    env.push(("SSH_AUTH_SOCK".to_string(), path.clone()));
+                }
                 let req = SpawnRequest {
                     user: self.user.clone(),
                     command: self.command.clone(),
@@ -568,6 +729,7 @@ impl ServerCore {
                 }
             }
             ControlMsg::Resize { cols, rows } => {
+                let (rows, cols) = clamp_size(rows, cols);
                 let Some(s) = self.sessions.get_mut(&sid) else {
                     return;
                 };
@@ -581,7 +743,12 @@ impl ServerCore {
                 }
             }
             ControlMsg::RemoteForward { bind_port, target } => {
-                self.remote_forward_requests.push((sid, bind_port, target));
+                // Refused where the driver must not open sockets for the
+                // client (a `--user` drop: it would listen as root, and could
+                // take a privileged port; or a daemon confined to a command).
+                if !self.extras_refused() {
+                    self.remote_forward_requests.push((sid, bind_port, target));
+                }
             }
             ControlMsg::Bye => {
                 if let Some(s) = self.sessions.get_mut(&sid) {
@@ -904,6 +1071,8 @@ pub struct Server {
     /// Forwarded TCP connections (both `-L` dial-outs and `-R` accepts), keyed
     /// by (session, stream id).
     forwards: HashMap<(SessionId, u64), crate::forward::ForwardConn>,
+    /// `-L`/`-D` dial-outs still being established (on helper threads).
+    pending: HashMap<(SessionId, u64), crate::forward::PendingConnect>,
     /// Remote-forward (`-R`) listeners: (listener, session, target).
     remote_listeners: Vec<(std::net::TcpListener, SessionId, String)>,
     /// In-progress file transfers keyed by (session, stream id).
@@ -947,6 +1116,7 @@ impl Server {
             core,
             io,
             forwards: HashMap::new(),
+            pending: HashMap::new(),
             remote_listeners: Vec::new(),
             xfers: HashMap::new(),
             agent_listeners: Vec::new(),
@@ -955,48 +1125,17 @@ impl Server {
         })
     }
 
-    /// Ensure the per-user agent-socket directory exists, is a real directory we
-    /// own, and is private (mode 0700). Rejects a pre-existing path owned by
-    /// another user or that is not a directory (symlink/replace defence).
-    fn ensure_agent_dir() -> std::io::Result<std::path::PathBuf> {
-        use std::io::{Error, ErrorKind};
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-
-        let dir = agent_socket_dir();
-        let uid = nix::unistd::Uid::current().as_raw();
-        match std::fs::symlink_metadata(&dir) {
-            Ok(meta) => {
-                if !meta.file_type().is_dir() {
-                    return Err(Error::new(
-                        ErrorKind::AlreadyExists,
-                        "agent socket dir is not a directory",
-                    ));
-                }
-                if meta.uid() != uid {
-                    return Err(Error::new(
-                        ErrorKind::PermissionDenied,
-                        "agent socket dir not owned by current user",
-                    ));
-                }
-                // Tighten in case a previous run (or umask) left it loose.
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-            }
-            Err(e) => return Err(e),
-        }
-        Ok(dir)
-    }
-
     /// Bind the per-session agent listener at `path`, locked down so only the
     /// owning user can connect: a 0700 parent directory plus a 0600 socket.
     fn bind_agent_socket(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
         use nix::sys::stat::{Mode, umask};
         use std::os::unix::fs::PermissionsExt;
 
-        Self::ensure_agent_dir()?;
         let p = std::path::Path::new(path);
+        // Re-check the directory at bind time: it must still be ours and private.
+        if let Some(dir) = p.parent() {
+            secure_dir(dir)?;
+        }
         let _ = std::fs::remove_file(p); // clear a stale socket from a prior run
         // Bind under a restrictive umask so the socket is created 0600 from the
         // start — closing the window between bind and a path-based chmod where it
@@ -1106,30 +1245,29 @@ impl Server {
 
         for (sid, ev) in self.core.take_stream_events() {
             match ev {
+                // Everything but the shell is refused under a `--user` drop
+                // (the driver would act as its own, possibly root, identity:
+                // connect out as root, read and write files as root) and for
+                // a daemon confined to a command. See
+                // ServerCore::extras_refused.
+                StreamEvent::Opened { id, .. } if self.core.extras_refused() => {
+                    self.core.stream_reset(sid, id);
+                }
                 StreamEvent::Opened {
                     id,
                     kind: StreamKind::Forward,
                     meta,
                 } => {
-                    match std::str::from_utf8(&meta)
-                        .ok()
-                        .and_then(|t| ForwardConn::connect(t).ok())
-                    {
-                        Some(conn) => {
-                            self.forwards.insert((sid, id), conn);
+                    // Connect on a helper thread: resolving a name or waiting
+                    // for an unreachable address must not stall this loop
+                    // (and with it every other session).
+                    match std::str::from_utf8(&meta) {
+                        Ok(t) if self.pending.len() < crate::forward::MAX_PENDING_CONNECTS => {
+                            self.pending
+                                .insert((sid, id), crate::forward::PendingConnect::start(t));
                         }
-                        None => self.core.stream_reset(sid, id), // unreachable target
+                        _ => self.core.stream_reset(sid, id),
                     }
-                }
-                StreamEvent::Opened {
-                    id,
-                    kind: StreamKind::FileTransfer,
-                    ..
-                } if self.core.privsep_active() => {
-                    // The driver can't confine file I/O to the dropped session
-                    // user, so refuse rather than read/write as the driver's
-                    // (possibly root) identity. See ServerCore::privsep_active.
-                    self.core.stream_reset(sid, id);
                 }
                 StreamEvent::Opened {
                     id,
@@ -1156,15 +1294,6 @@ impl Server {
                     }
                     None => self.core.stream_reset(sid, id),
                 },
-                // Exec under a privsep drop would run as the driver's (possibly
-                // root) identity — refuse, like file transfer.
-                StreamEvent::Opened {
-                    id,
-                    kind: StreamKind::Exec,
-                    ..
-                } if self.core.privsep_active() => {
-                    self.core.stream_reset(sid, id);
-                }
                 StreamEvent::Opened {
                     id,
                     kind: StreamKind::Exec,
@@ -1187,6 +1316,9 @@ impl Server {
                         Err(_) => self.core.stream_reset(sid, id),
                     }
                 }
+                // A client may not open the server-to-client kinds (agent);
+                // refuse rather than leave the stream open and unread.
+                StreamEvent::Opened { id, .. } => self.core.stream_reset(sid, id),
                 // Draining happens in the bounded pump loop below.
                 StreamEvent::Readable { .. } => {}
                 StreamEvent::Closed { id } => {
@@ -1208,6 +1340,7 @@ impl Server {
                     // Forget the stream (the peer already aborted it).
                     self.core.stream_reset(sid, id);
                     self.forwards.remove(&(sid, id));
+                    self.pending.remove(&(sid, id));
                     self.xfers.remove(&(sid, id));
                     self.agent_conns.remove(&(sid, id));
                     if let Some(mut e) = self.execs.remove(&(sid, id)) {
@@ -1232,6 +1365,24 @@ impl Server {
         for k in dead {
             self.forwards.remove(&k);
             self.xfers.remove(&k);
+        }
+        // Dial-outs that finished (or failed), and those whose session is gone.
+        let pkeys: Vec<(SessionId, u64)> = self.pending.keys().copied().collect();
+        for k in pkeys {
+            if !self.core.has_session(k.0) {
+                self.pending.remove(&k);
+                continue;
+            }
+            let Some(outcome) = self.pending.get_mut(&k).and_then(|p| p.poll()) else {
+                continue;
+            };
+            self.pending.remove(&k);
+            match outcome {
+                Ok(conn) => {
+                    self.forwards.insert(k, conn);
+                }
+                Err(_) => self.core.stream_reset(k.0, k.1), // unreachable target
+            }
         }
         let keys: Vec<(SessionId, u64)> = self.forwards.keys().copied().collect();
         for k in keys {
@@ -1428,8 +1579,9 @@ impl Server {
         let mut timeout = deadline.map_or(max, |t| {
             t.saturating_duration_since(Instant::now()).min(max)
         });
-        // A running command's exit has no descriptor to wait on.
-        if !self.execs.is_empty() {
+        // A running command's exit, and a connection being established on a
+        // helper thread, have no descriptor to wait on.
+        if !self.execs.is_empty() || !self.pending.is_empty() {
             timeout = timeout.min(Duration::from_millis(20));
         }
         let sock_flags = if self.io.wants_write() {
@@ -1497,6 +1649,10 @@ impl Server {
         &self.core
     }
 
+    pub fn core_mut(&mut self) -> &mut ServerCore {
+        &mut self.core
+    }
+
     /// One service iteration: wait for something to do (at most 100 ms),
     /// drain ready datagrams, move forwarded data, then tick. Returns false on
     /// a fatal socket error (the loop should stop).
@@ -1526,5 +1682,20 @@ impl Server {
     /// Serve forever.
     pub fn run(&mut self) {
         while self.poll_once() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_client_cannot_ask_for_an_unbounded_screen() {
+        // 65535 x 65535 cells would be tens of gigabytes per copy of the screen.
+        assert_eq!(clamp_size(u16::MAX, u16::MAX), (MAX_ROWS, MAX_COLS));
+        assert_eq!(clamp_size(0, 0), (1, 1));
+        assert_eq!(clamp_size(24, 80), (24, 80));
+        // The largest screen is one the client's diff decoder accepts (2^20 cells).
+        assert!(MAX_ROWS as usize * MAX_COLS as usize <= 1 << 20);
     }
 }

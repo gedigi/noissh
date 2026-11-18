@@ -21,14 +21,21 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) {
     }
 }
 
-/// Drain whatever is available from an optional pipe; clears the slot on EOF.
+/// Most bytes taken from a pipe in one call.
+const READ_PIPE_MAX: usize = 256 * 1024;
+
+/// Read what is available from an optional pipe (up to [`READ_PIPE_MAX`]);
+/// clears the slot on EOF.
 fn read_pipe<R: Read>(slot: &mut Option<R>) -> Vec<u8> {
     let mut out = Vec::new();
     let Some(r) = slot.as_mut() else {
         return out;
     };
     let mut buf = [0u8; 16384];
-    loop {
+    // Bounded per call: a command that writes faster than we read (`yes`)
+    // would otherwise keep this loop, and the whole session loop, busy
+    // forever while `out` grows without limit.
+    while out.len() < READ_PIPE_MAX {
         match r.read(&mut buf) {
             Ok(0) => {
                 *slot = None; // EOF
@@ -63,18 +70,40 @@ pub struct ExecProc {
 }
 
 impl ExecProc {
-    /// Spawn `cmd` via `/bin/sh -c` with piped, non-blocking stdio, running in
-    /// the user's home directory (like a login would) rather than the daemon's
-    /// working directory.
+    /// Spawn `cmd` with the user's login shell (`<shell> -c <cmd>`, as sshd
+    /// does), with piped, non-blocking stdio, running in the user's home
+    /// directory (like a login would) rather than the daemon's working
+    /// directory.
+    ///
+    /// The login shell, not `/bin/sh`: an account whose shell is restricted
+    /// (`rbash`, `git-shell`) or disabled (`nologin`) must not get an
+    /// unrestricted shell through remote commands. `/bin/sh` is the fallback
+    /// only when the account has no shell recorded.
+    ///
+    /// [`proto::LOGIN_SHELL_COMMAND`] (what `noissh -T host` sends to get a
+    /// shell reading commands from stdin) is run as `<shell> -l` directly, so
+    /// it works whatever the shell's syntax.
     pub fn spawn(cmd: &str) -> std::io::Result<Self> {
-        let mut command = Command::new("/bin/sh");
+        let user = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .ok()
+            .flatten();
+        let shell = user
+            .as_ref()
+            .map(|u| u.shell.clone())
+            .filter(|s| !s.as_os_str().is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        let mut command = Command::new(&shell);
+        if cmd == proto::LOGIN_SHELL_COMMAND {
+            command.arg("-l");
+        } else {
+            command.arg("-c").arg(cmd);
+        }
         command
-            .arg("-c")
-            .arg(cmd)
+            .env("SHELL", &shell)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
+        if let Some(user) = &user {
             command.current_dir(&user.dir);
         }
         let mut child = command.spawn()?;

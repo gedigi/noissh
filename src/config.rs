@@ -86,7 +86,7 @@ pub fn load_or_generate_keypair(path: &Path) -> Result<Keypair, RuntimeError> {
     } else {
         let kp = generate_keypair()?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dir(parent)?;
         }
         write_private(path, private_key_text(&kp).as_bytes())?;
         ensure_public_key_file(path, &kp);
@@ -221,7 +221,7 @@ pub fn load_known_hosts(path: &Path) -> Result<KnownHosts, RuntimeError> {
 pub fn save_known_hosts(path: &Path, kh: &KnownHosts) -> Result<(), RuntimeError> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(".tmp-{}", std::process::id()));
@@ -232,6 +232,63 @@ pub fn save_known_hosts(path: &Path, kh: &KnownHosts) -> Result<(), RuntimeError
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Create `dir` (and its parents) if missing; a directory created here is
+/// private to its owner (mode 0700), as `~/.ssh` is. An existing directory is
+/// left as it is.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Check that only the file's owner (or root) can change `path`, as sshd's
+/// `StrictModes` does for `authorized_keys`: the file and the directory
+/// holding it must be owned by the current user or root, and must not be
+/// writable by group or others. Otherwise another local user could add a key
+/// and log in as this one. A missing file passes (there is nothing to trust).
+///
+/// Returns the reason when the check fails.
+pub fn check_private_ownership(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let me = nix::unistd::Uid::current().as_raw();
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    for (what, p) in [("file", path.to_path_buf()), ("directory", dir)] {
+        // Follow symlinks: what matters is who can change what is read.
+        let meta = match fs::metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("can't check {}: {e}", p.display())),
+        };
+        if meta.uid() != me && meta.uid() != 0 {
+            return Err(format!(
+                "{what} {} is owned by uid {}, not by you or root",
+                p.display(),
+                meta.uid()
+            ));
+        }
+        let mode = meta.permissions().mode();
+        // A sticky directory (like /tmp) only lets owners replace entries, but
+        // it is still no place for an authorized_keys file: refuse it too.
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{what} {} is writable by group or others (mode {:03o}); run: chmod go-w {}",
+                p.display(),
+                mode & 0o777,
+                p.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -300,6 +357,31 @@ pub fn load_config(path: &Path) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorized_keys_writable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("noissh-own-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a config dir we create is private");
+        let ak = dir.join("authorized_keys");
+        // A missing file is fine; so is a private one.
+        assert!(check_private_ownership(&ak).is_ok());
+        fs::write(&ak, "").unwrap();
+        fs::set_permissions(&ak, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check_private_ownership(&ak).is_ok());
+        // Writable by group or others: refused.
+        fs::set_permissions(&ak, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(check_private_ownership(&ak).is_err());
+        fs::set_permissions(&ak, fs::Permissions::from_mode(0o600)).unwrap();
+        // So is a directory others can write (they could replace the file).
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_private_ownership(&ak).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn keypair_persists_and_reloads() {

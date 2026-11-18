@@ -411,6 +411,7 @@ dependencies = [
  "curve25519-dalek",
  "snow",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -436,6 +437,7 @@ dependencies = [
  "base64",
  "bytes",
  "daemonize",
+ "getrandom 0.4.3",
  "nix",
  "noise-core",
  "noise-quic",

@@ -20,8 +20,8 @@ const SERVER_ADDR: &str = "127.0.0.1:51820";
 fn keypair() -> ([u8; 32], [u8; 32]) {
     let kp = noise_core::generate_keypair().unwrap();
     (
-        kp.private.try_into().unwrap(),
-        kp.public.try_into().unwrap(),
+        kp.private.clone().try_into().unwrap(),
+        kp.public.clone().try_into().unwrap(),
     )
 }
 

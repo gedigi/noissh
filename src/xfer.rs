@@ -48,21 +48,39 @@ pub struct FileSink {
 }
 
 /// A temp path next to `dest` (same directory, so the rename is atomic and not
-/// cross-device).
-fn temp_path(dest: &Path) -> PathBuf {
+/// cross-device). The name ends in random bytes: it cannot be predicted, so
+/// another user who can write to the directory cannot plant a file or symlink
+/// there beforehand, and two transfers to the same destination never share it.
+fn temp_path(dest: &Path) -> std::io::Result<PathBuf> {
+    let mut rnd = [0u8; 8];
+    getrandom::fill(&mut rnd).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
     let mut name = dest
         .file_name()
         .map(|s| s.to_os_string())
         .unwrap_or_else(|| ".noissh".into());
-    name.push(format!(".noissh-tmp-{}", std::process::id()));
-    dest.with_file_name(name)
+    name.push(format!(".noissh-tmp-{suffix}"));
+    Ok(dest.with_file_name(name))
 }
+
+/// Mode of a newly created destination file: private to its owner. The
+/// transfer request doesn't carry the source file's mode, so the safe choice
+/// is made here; an existing destination keeps its own mode instead.
+const NEW_FILE_MODE: u32 = 0o600;
 
 impl FileSink {
     pub fn create(path: &str) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         let dest = PathBuf::from(path);
-        let tmp = temp_path(&dest);
-        let file = File::create(&tmp)?;
+        let tmp = temp_path(&dest)?;
+        // `create_new` is O_CREAT|O_EXCL: it fails rather than open an existing
+        // file, and never follows a symlink at the temp path. The file is
+        // private while the transfer is in progress.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(NEW_FILE_MODE)
+            .open(&tmp)?;
         Ok(FileSink {
             file,
             tmp,
@@ -77,6 +95,16 @@ impl FileSink {
 
     /// Flush and atomically move the temp file into place. Consumes the sink.
     pub fn finalize(mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        // Replacing an existing regular file keeps that file's mode (as an
+        // in-place overwrite would); a new file stays private (0600).
+        if let Ok(meta) = std::fs::symlink_metadata(&self.dest)
+            && meta.file_type().is_file()
+        {
+            let mode = meta.permissions().mode() & 0o777;
+            self.file
+                .set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         self.file.sync_all()?;
         std::fs::rename(&self.tmp, &self.dest)?;
         self.finalized = true;
@@ -182,6 +210,47 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_does_not_follow_a_planted_symlink_and_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("noissh-sink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("upload.bin");
+        // The old, predictable temp name, pointing at a victim file: it must
+        // be left alone.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let planted = dir.join(format!("upload.bin.noissh-tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let mut a = FileSink::create(dest.to_str().unwrap()).unwrap();
+        let b = FileSink::create(dest.to_str().unwrap()).unwrap();
+        assert_ne!(
+            a.tmp, b.tmp,
+            "concurrent transfers must not share a temp file"
+        );
+        assert_ne!(a.tmp, planted);
+        let mode = std::fs::metadata(&a.tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        a.write(b"data").unwrap();
+        a.finalize().unwrap();
+        drop(b);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"data");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // An existing destination keeps its mode.
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = FileSink::create(dest.to_str().unwrap()).unwrap();
+        c.write(b"v2").unwrap();
+        c.finalize().unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn human_bytes_units() {
