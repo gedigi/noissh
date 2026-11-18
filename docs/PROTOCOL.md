@@ -1,10 +1,10 @@
 # noissh Protocol
 
-This document specifies the noissh wire protocol as implemented (0.7): QUIC
+This document specifies the noissh wire protocol as implemented (0.8, wire-compatible with 0.7): QUIC
 secured by a Noise handshake, the streams and datagrams noissh carries over it,
 the session-layer frames, and the SSH bootstrap. It describes the current
 implementation, not a frozen standard: the protocol is pre-1.0 and may change.
-0.7 is not compatible with 0.6 peers.
+0.7 and later are not compatible with 0.6 peers.
 
 Session-layer integers are **LEB128 unsigned varints** unless stated otherwise;
 fixed-width integers are **big-endian**.

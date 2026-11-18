@@ -134,7 +134,7 @@ the one fixed above.
 ## Review of 0.7.0
 
 A code review of 0.7.0 (whole tree, by reading; the handshake binding itself
-held up) found the following, all fixed in the release after it:
+held up) found the following, all fixed in 0.8.0:
 
 | Finding | Severity | Resolution |
 |---|---|---|

@@ -19,7 +19,7 @@ use auth::{AuthorizedKeys, KnownHosts, PublicKey, Tofu};
 /// Decide whether a client's authenticated static key is authorized, taking the
 /// raw 32-byte key as produced by the handshake.
 /// The remote command `noissh -T host` runs when no command is given: the
-/// user's login shell, reading commands from stdin. A server after 0.7.0
+/// user's login shell, reading commands from stdin. A server from 0.8.0 on
 /// recognises this exact string and runs the login shell with `-l` itself; an
 /// older one hands it to `/bin/sh -c`, where `$SHELL` comes from the server
 /// process's environment and `/bin/sh` covers a daemon started without it.
