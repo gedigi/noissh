@@ -50,17 +50,35 @@ fn spawn_mock_agent(stop: Arc<AtomicBool>) -> String {
 }
 
 /// Find the server-side agent socket this process created. Sockets live in a
-/// per-user 0700 directory (`<tmp>/noissh-<uid>/agent-<pid>-<sid>.sock`).
+/// per-user 0700 directory: `$XDG_RUNTIME_DIR/noissh` when that is set, else
+/// `<tmp>/noissh-<uid>` (or, if someone else holds that name,
+/// `<tmp>/noissh-<uid>-<random>`), as `agent-<pid>-<sid>.sock`.
 fn find_server_agent_sock() -> Option<std::path::PathBuf> {
     let uid = nix::unistd::Uid::current().as_raw();
     let prefix = format!("agent-{}-", std::process::id());
-    let dir = std::env::temp_dir().join(format!("noissh-{uid}"));
-    let entries = std::fs::read_dir(&dir).ok()?;
-    for e in entries.flatten() {
+    let mut dirs = Vec::new();
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        dirs.push(std::path::PathBuf::from(rt).join("noissh"));
+    }
+    let tmp = std::env::temp_dir();
+    let base = format!("noissh-{uid}");
+    for e in std::fs::read_dir(&tmp).ok()?.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(&prefix) && name.ends_with(".sock") {
-            return Some(e.path());
+        if name == base.as_str() || name.starts_with(&format!("{base}-")) {
+            dirs.push(e.path());
+        }
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".sock") {
+                return Some(e.path());
+            }
         }
     }
     None
