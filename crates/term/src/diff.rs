@@ -150,8 +150,8 @@ pub fn apply_diff(grid: &mut Grid, bytes: &[u8]) -> Result<(), DiffError> {
             if grid.rows != rows || grid.cols != cols {
                 *grid = Grid::new(rows, cols);
             }
-            for i in 0..rows * cols {
-                grid.cells[i] = get_cell(bytes, &mut pos)?;
+            for cell in grid.cells.iter_mut().take(rows * cols) {
+                *cell = get_cell(bytes, &mut pos)?;
             }
         }
         TAG_DELTA => {
