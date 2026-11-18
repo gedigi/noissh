@@ -13,6 +13,9 @@ on:
         description: "Release tag to create/publish (e.g. v0.6.0)"
         required: true
 
+# Third-party actions are pinned to a commit (the comment names the version):
+# a tag can be moved, and this workflow can publish releases and sign
+# provenance.
 permissions:
   contents: write
   id-token: write # required for build-provenance attestation (Sigstore)
@@ -36,7 +39,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: |
@@ -55,10 +58,12 @@ jobs:
             echo 'linker = "aarch64-linux-gnu-gcc"'
           } >> .cargo/config.toml
 
-      - uses: Swatinem/rust-cache@v2
+      # No build cache here: a release is built from scratch, so nothing a
+      # previous (possibly less trusted) run left behind can reach the binaries.
 
       - name: Build
-        run: cargo build --release --bins --target "${{ matrix.target }}"
+        # --locked: build exactly the dependency versions in Cargo.lock.
+        run: cargo build --locked --release --bins --target "${{ matrix.target }}"
 
       - name: Package
         run: |
@@ -83,18 +88,18 @@ jobs:
           sha256sum "noissh-${{ matrix.target }}.deb" > "noissh-${{ matrix.target }}.deb.sha256"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: noissh-${{ matrix.target }}.tar.gz
 
       - name: Attest .deb provenance (Linux)
         if: contains(matrix.target, 'linux')
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: noissh-${{ matrix.target }}.deb
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # A tag with a suffix (v0.6.0-rc.1) is a prerelease: published for
           # testing, but not marked "latest", so install.sh keeps the stable one.
@@ -107,7 +112,7 @@ jobs:
 
       - name: Upload .deb to release (Linux)
         if: contains(matrix.target, 'linux')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # A tag with a suffix (v0.6.0-rc.1) is a prerelease: published for
           # testing, but not marked "latest", so install.sh keeps the stable one.

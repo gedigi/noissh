@@ -116,6 +116,7 @@ quinn-udp = { workspace = true }
 bytes = { workspace = true }
 nix = { workspace = true }
 base64 = { workspace = true }
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 terminal_size = "0.4.4"
 daemonize = "0.5.0"

@@ -115,18 +115,30 @@ clean end of that direction; a reset (RESET_STREAM + STOP_SENDING, error code
 - **Forward**: the side that accepts the stream connects to the target and
   pipes bytes both ways; it resets the stream if the target is unreachable.
   For `-R`, the client first sends `RemoteForward` (section 5) and the server
-  opens one stream per accepted connection.
+  opens one stream per accepted connection, with the target the client gave
+  in that request. The client accepts such a stream only if its target is one
+  it requested, and resets any other: the server can't make it dial elsewhere.
 - **File transfer**: `PUT`: the client sends the file and finishes its half;
-  the server writes it to a temporary file, moves it into place, then finishes
+  the server writes it to a temporary file (private, with a random name, next
+  to the destination), moves it into place, then finishes
   its half (success) or resets the stream (failure). `GET`: the server sends
   the file and finishes (or resets if it can't be read).
 - **Exec**: the client's stream carries the command's stdin (client → server)
   and stdout (server → client); the server opens a second exec stream for
   stderr. Before finishing stdout, the server sends `ExecExit{id, status}` on
-  the control stream, with `id` the client's stream id. The server resets the
-  stream if the command can't be started.
+  the control stream, with `id` the client's stream id. The server runs the
+  command with the user's login shell (`<shell> -c <command>`), and resets the
+  stream if the command can't be started. The command
+  `exec "${SHELL:-/bin/sh}" -l` (what `noissh -T host` sends) is run as
+  `<shell> -l`.
 - **Agent**: each connection to the forwarded agent socket on the server opens
-  an agent stream, which the client pipes to its local `$SSH_AUTH_SOCK`.
+  an agent stream, which the client pipes to its local `$SSH_AUTH_SOCK` (only
+  when it asked for agent forwarding; otherwise it resets the stream).
+
+A stream of a kind its opener may not open (an agent stream from the client;
+in an interactive session, anything but an agent stream from the server) is
+reset. A server running with `--user`, or a standing one with `--command`,
+resets every client stream and ignores `RemoteForward`.
 
 Priorities: the control stream first (keystrokes, acks, screen updates), file
 transfers last, everything else in between.
@@ -162,7 +174,12 @@ type byte and its fields:
   current seq on the control stream. The server sends a new diff when the
   screen changes (at most every 8 ms) and resends the unacknowledged state
   after 1.5 × RTT + 10 ms (at least 30 ms). Lost or reordered diffs are thus
-  simply superseded: only the newest screen matters.
+  simply superseded: only the newest screen matters. The server keeps at most
+  32 unacknowledged states to diff from; when the client acknowledges one it
+  no longer has, it sends a full snapshot.
+- **Cells** hold printable characters: the client replaces a control character
+  in a received cell with U+FFFD, so a server can't write escape sequences to
+  the user's terminal through the screen state.
 
 ### Screen diff encoding
 
@@ -192,7 +209,8 @@ reserved (a never-wired second-factor prompt, since removed).
 
 - The client sends `OpenShell` (interactive sessions) and its `RemoteForward`
   requests right after the handshake, and again on every reconnection.
-  `agent` asks the server for an agent socket (`-A`).
+  `agent` asks the server for an agent socket (`-A`). The server limits
+  `rows` to 512 and `cols` to 2048 (here and in `Resize`).
 - The server sends `ServerVersion` as its first message on every connection;
   a direct client uses it to offer upgrading an outdated standing daemon.
 - When the shell exits, the server sends `Exit`; the client closes the
@@ -213,7 +231,8 @@ reserved (a never-wired second-factor prompt, since removed).
   connection.
 - **Reattach after a client restart**: a new connection's `OpenShell` also
   takes over a running shell of the same client key whose own connection has
-  been silent for at least 8 s (its client is gone). A shell whose connection
+  been silent for at least 8 s (its client is gone). Only packets that
+  authenticate count as a sign of life. A shell whose connection
   is alive is never taken: a second window gets its own shell.
 - **Liveness**: the client sends a PING after 3 s of silence (QUIC
   keep-alive), and every second while it has heard nothing for 4 s, so a

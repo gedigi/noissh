@@ -32,6 +32,10 @@ struct Trust {
     label: String,
     new_key: bool,
     mismatch: bool,
+    /// Pin a key seen for the first time (TOFU). When false, an unknown key
+    /// fails the handshake and is recorded in `unknown` for the caller.
+    accept_new: bool,
+    unknown: Option<[u8; 32]>,
 }
 
 /// Socket-free client logic: consumes raw datagrams, produces raw datagrams.
@@ -128,6 +132,8 @@ impl ClientCore {
             label: host_label.into(),
             new_key: false,
             mismatch: false,
+            accept_new: true,
+            unknown: None,
         }));
         let check = {
             let trust = trust.clone();
@@ -138,7 +144,15 @@ impl ClientCore {
                     label,
                     new_key,
                     mismatch,
+                    accept_new,
+                    unknown,
                 } = &mut *t;
+                if !*accept_new && known.get(label).is_none() {
+                    // Not pinned, and not to be trusted without asking: stop
+                    // before message 3, so this server learns nothing of us.
+                    *unknown = Some(*key);
+                    return false;
+                }
                 match verify_server(known, label, key) {
                     Tofu::Mismatch => {
                         *mismatch = true;
@@ -244,6 +258,17 @@ impl ClientCore {
     /// be called before the handshake completes.
     pub fn set_want_shell(&mut self, want: bool) {
         self.want_shell = want;
+    }
+
+    /// Whether a server key seen for the first time is pinned and trusted
+    /// (the default), or fails the handshake with
+    /// [`RuntimeError::UnknownHostKey`] so the caller can ask the user first.
+    /// Set before the server's reply arrives (right after construction).
+    pub fn set_accept_new_hosts(&mut self, accept: bool) {
+        self.trust
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .accept_new = accept;
     }
 
     /// Request SSH agent forwarding (`-A`). Must be set before the shell opens.
@@ -454,12 +479,14 @@ impl ClientCore {
                 Event::Connected => became_connected = true,
                 Event::ConnectionLost { reason } => {
                     self.streams.fail_all();
-                    let (mismatch, label) = {
+                    let (mismatch, unknown, label) = {
                         let t = self.trust.lock().unwrap_or_else(|e| e.into_inner());
-                        (t.mismatch, t.label.clone())
+                        (t.mismatch, t.unknown, t.label.clone())
                     };
                     if mismatch {
                         self.failure = Some(RuntimeError::HostKeyMismatch(label));
+                    } else if let Some(key) = unknown {
+                        self.failure = Some(RuntimeError::UnknownHostKey { label, key });
                     } else if !self.established {
                         self.failure = Some(match reason {
                             ConnectionError::TimedOut => RuntimeError::Timeout,
@@ -671,6 +698,40 @@ impl Client {
         agent_sock: Option<String>,
         connect_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::connect_with_trust(
+            keypair,
+            known,
+            host_label,
+            server_addr,
+            rows,
+            cols,
+            prediction,
+            want_shell,
+            agent_sock,
+            connect_timeout,
+            true,
+        )
+    }
+
+    /// Like [`Client::connect_with`]; with `accept_new_hosts = false` a server
+    /// whose key isn't in `known` is not trusted on first use: the connection
+    /// fails with [`RuntimeError::UnknownHostKey`] (before anything but the
+    /// first handshake message was sent), so the caller can show the key and
+    /// ask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_trust(
+        keypair: &Keypair,
+        known: KnownHosts,
+        host_label: impl Into<String>,
+        server_addr: SocketAddr,
+        rows: u16,
+        cols: u16,
+        prediction: DisplayMode,
+        want_shell: bool,
+        agent_sock: Option<String>,
+        connect_timeout: Duration,
+        accept_new_hosts: bool,
+    ) -> Result<Self, RuntimeError> {
         let bind: SocketAddr = if server_addr.is_ipv6() {
             "[::]:0".parse().unwrap()
         } else {
@@ -686,6 +747,7 @@ impl Client {
             cols,
             prediction,
         )?;
+        core.set_accept_new_hosts(accept_new_hosts);
         core.set_want_shell(want_shell);
         // Agent forwarding must be requested before the handshake completes, as
         // the OpenShell carrying the flag is sent the instant the session is up.
@@ -794,6 +856,9 @@ impl Client {
                         None => self.core.stream_reset(id),
                     }
                 }
+                // Nothing else may be opened by the server in an interactive
+                // session: refuse it rather than leave it open.
+                StreamEvent::Opened { id, .. } => self.core.stream_reset(id),
                 StreamEvent::Closed { id } => {
                     if let Some(c) = self.agent_conns.get_mut(&id) {
                         c.mark_peer_closed();
@@ -1307,6 +1372,12 @@ pub struct Forwarder {
     pending_socks: Vec<crate::socks::SocksConn>,
     /// Live forwarded connections, keyed by stream id.
     conns: std::collections::HashMap<u64, crate::forward::ForwardConn>,
+    /// The `-R` targets this client asked for. The server names the target
+    /// of each connection it forwards back; only these are ever dialled.
+    remote_targets: Vec<String>,
+    /// `-R` connections still being established (on helper threads), keyed
+    /// by stream id.
+    pending: std::collections::HashMap<u64, crate::forward::PendingConnect>,
 }
 
 impl Forwarder {
@@ -1342,13 +1413,17 @@ impl Forwarder {
             socks_listeners,
             pending_socks: Vec::new(),
             conns: std::collections::HashMap::new(),
+            remote_targets: remote.iter().map(|(_, t)| t.clone()).collect(),
+            pending: std::collections::HashMap::new(),
         })
     }
 
     /// Whether there is local work in progress that warrants a short poll
     /// timeout (buffered output to flush, SOCKS handshakes to drive).
     pub fn is_busy(&self) -> bool {
-        self.conns.values().any(|c| c.wants_write()) || !self.pending_socks.is_empty()
+        self.conns.values().any(|c| c.wants_write())
+            || !self.pending_socks.is_empty()
+            || !self.pending.is_empty()
     }
 
     /// Every descriptor the session loop should wait on, with the events to
@@ -1447,23 +1522,37 @@ impl Forwarder {
     /// Handle a stream event if it concerns a forward; otherwise hand it back
     /// for the caller to process.
     pub fn handle_event(&mut self, core: &mut ClientCore, ev: StreamEvent) -> Option<StreamEvent> {
-        use crate::forward::ForwardConn;
+        use crate::forward::PendingConnect;
         match ev {
-            // Inbound `-R` connection: dial the local target.
+            // Inbound `-R` connection: dial the local target, but only one
+            // this client itself asked for with `-R`. The target named in the
+            // stream comes from the server; dialling whatever it says would
+            // let a hostile server reach into this machine's network.
             StreamEvent::Opened {
                 id,
                 kind: StreamKind::Forward,
                 meta,
             } => {
-                match std::str::from_utf8(&meta)
+                let target = std::str::from_utf8(&meta)
                     .ok()
-                    .and_then(|t| ForwardConn::connect(t).ok())
-                {
-                    Some(conn) => {
-                        self.conns.insert(id, conn);
+                    .filter(|t| self.remote_targets.iter().any(|r| r == t));
+                match target {
+                    Some(t) if self.pending.len() < crate::forward::MAX_PENDING_CONNECTS => {
+                        self.pending.insert(id, PendingConnect::start(t));
                     }
-                    None => core.stream_reset(id),
+                    _ => core.stream_reset(id),
                 }
+                None
+            }
+            StreamEvent::Readable { id } | StreamEvent::Closed { id }
+                if self.pending.contains_key(&id) =>
+            {
+                // Read once the connection is up (`pump`).
+                None
+            }
+            StreamEvent::Reset { id } if self.pending.contains_key(&id) => {
+                self.pending.remove(&id);
+                core.stream_reset(id);
                 None
             }
             // Session→TCP draining happens in `pump`, bounded by the out
@@ -1490,6 +1579,20 @@ impl Forwarder {
     /// Pump both directions of every forwarded connection (with backpressure
     /// caps), propagate half-close, and reap finished connections.
     pub fn pump(&mut self, core: &mut ClientCore) {
+        // `-R` connections that finished connecting (or failed to).
+        let ready: Vec<u64> = self.pending.keys().copied().collect();
+        for id in ready {
+            let Some(outcome) = self.pending.get_mut(&id).and_then(|p| p.poll()) else {
+                continue;
+            };
+            self.pending.remove(&id);
+            match outcome {
+                Ok(conn) => {
+                    self.conns.insert(id, conn);
+                }
+                Err(_) => core.stream_reset(id),
+            }
+        }
         let ids: Vec<u64> = self.conns.keys().copied().collect();
         for id in ids {
             let Some(c) = self.conns.get_mut(&id) else {

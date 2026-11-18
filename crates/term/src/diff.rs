@@ -74,7 +74,13 @@ fn put_cell(out: &mut Vec<u8>, cell: &Cell) {
 }
 
 fn get_cell(buf: &[u8], pos: &mut usize) -> Result<Cell, DiffError> {
-    let ch = char::from_u32(get_varint(buf, pos)? as u32).unwrap_or('\u{fffd}');
+    // A cell holds a printable character. Control characters (ESC, CSI, …)
+    // never come from a real server (its emulator consumes them); the client
+    // writes cells straight to the user's terminal, so letting them through
+    // would give a hostile server raw escape sequences there.
+    let ch = char::from_u32(get_varint(buf, pos)? as u32)
+        .filter(|c| !c.is_control())
+        .unwrap_or('\u{fffd}');
     let fg = get_color(buf, pos)?;
     let bg = get_color(buf, pos)?;
     let flags = get_u8(buf, pos)?;
@@ -144,8 +150,8 @@ pub fn apply_diff(grid: &mut Grid, bytes: &[u8]) -> Result<(), DiffError> {
             if grid.rows != rows || grid.cols != cols {
                 *grid = Grid::new(rows, cols);
             }
-            for i in 0..rows * cols {
-                grid.cells[i] = get_cell(bytes, &mut pos)?;
+            for cell in grid.cells.iter_mut().take(rows * cols) {
+                *cell = get_cell(bytes, &mut pos)?;
             }
         }
         TAG_DELTA => {
@@ -178,6 +184,20 @@ mod tests {
         let mut t = Terminal::new(rows, cols);
         t.advance(input);
         t.grid.clone()
+    }
+
+    #[test]
+    fn control_characters_in_cells_are_not_passed_to_the_terminal() {
+        // A hostile server spells an escape sequence across cells.
+        let mut evil = Grid::new(1, 4);
+        for (i, ch) in ['\u{1b}', ']', '\u{9b}', '\u{7}'].into_iter().enumerate() {
+            evil.cells[i].ch = ch;
+        }
+        let bytes = encode_diff(None, &evil);
+        let mut client = Grid::new(1, 4);
+        apply_diff(&mut client, &bytes).unwrap();
+        let got: Vec<char> = client.cells.iter().map(|c| c.ch).collect();
+        assert_eq!(got, ['\u{fffd}', ']', '\u{fffd}', '\u{fffd}']);
     }
 
     #[test]

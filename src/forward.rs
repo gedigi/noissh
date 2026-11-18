@@ -42,8 +42,73 @@ impl ForwardConn<TcpStream> {
     }
 
     /// Connect out to `target` ("host:port"), returning a non-blocking conn.
+    ///
+    /// This blocks for name resolution and the TCP handshake (bounded by
+    /// [`CONNECT_TIMEOUT`] per address). Event loops use [`PendingConnect`]
+    /// instead, which does the same work off the loop's thread.
     pub fn connect(target: &str) -> std::io::Result<Self> {
-        ForwardConn::new(TcpStream::connect(target)?)
+        ForwardConn::new(connect_blocking(target)?)
+    }
+}
+
+/// Longest a forward's outgoing TCP connection may take, per resolved address.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Outgoing connections that may be in progress at once in one process. More
+/// are refused (the forward stream is reset), which bounds the helper threads
+/// a peer can make us start.
+pub const MAX_PENDING_CONNECTS: usize = 64;
+
+/// Resolve `target` and connect to the first address that answers.
+fn connect_blocking(target: &str) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = std::io::Error::new(ErrorKind::NotFound, "no address for the forward target");
+    for addr in target.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// An outgoing forward connection being established on a helper thread, so
+/// that a slow resolver or an unreachable address (a TCP handshake can take
+/// minutes to fail) never stalls the single-threaded session loop, and with it
+/// every other session.
+pub struct PendingConnect {
+    rx: std::sync::mpsc::Receiver<std::io::Result<TcpStream>>,
+}
+
+impl PendingConnect {
+    /// Start connecting to `target` ("host:port").
+    pub fn start(target: &str) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = target.to_string();
+        // If the thread can't be started, the sender is dropped with the
+        // closure and `poll` reports the failure.
+        let _ = std::thread::Builder::new()
+            .name("noissh-connect".into())
+            .spawn(move || {
+                // The receiver may be gone (stream reset meanwhile): the
+                // socket is then simply dropped.
+                let _ = tx.send(connect_blocking(&target));
+            });
+        PendingConnect { rx }
+    }
+
+    /// `None` while the connection is still being established; then its
+    /// outcome, once.
+    pub fn poll(&mut self) -> Option<std::io::Result<ForwardConn>> {
+        use std::sync::mpsc::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(Ok(s)) => Some(ForwardConn::new(s)),
+            Ok(Err(e)) => Some(Err(e)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                Some(Err(std::io::Error::other("connect helper failed")))
+            }
+        }
     }
 }
 

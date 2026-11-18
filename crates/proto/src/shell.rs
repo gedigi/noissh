@@ -16,6 +16,10 @@ use predict::{DisplayMode, Predictor};
 use term::{Grid, Terminal, apply_diff, encode_diff, is_full};
 use wire::Frame;
 
+/// Screen states kept while waiting for the client's acknowledgement (each is
+/// a full copy of the screen).
+pub const MAX_HISTORY: usize = 32;
+
 /// Server-side authoritative screen.
 pub struct ServerShell {
     term: Terminal,
@@ -78,10 +82,18 @@ impl ServerShell {
 
     /// Client acknowledged screen-state `seq`.
     pub fn on_state_ack(&mut self, seq: u64) {
-        if seq > self.acked_seq && self.history.contains_key(&seq) {
+        if seq <= self.acked_seq || seq > self.seq {
+            return;
+        }
+        if self.history.contains_key(&seq) {
             self.acked_seq = seq;
             // Prune history strictly below the acked base.
             self.history.retain(|&k, _| k >= seq);
+        } else {
+            // The client is at a state we no longer keep (see
+            // [`MAX_HISTORY`]), so no delta can be built from it: send the
+            // screen in full, which applies whatever the client holds.
+            self.force_full = true;
         }
     }
 
@@ -103,6 +115,21 @@ impl ServerShell {
             self.seq += 1;
             self.history.insert(self.seq, current.clone());
             self.last_sent = current;
+            // Bound the history: a client that stops acknowledging (a dead
+            // link, or a hostile client) would otherwise make it grow by one
+            // full screen per update, without limit. The acknowledged base
+            // and the newest states are kept; the oldest others go.
+            while self.history.len() > MAX_HISTORY {
+                let oldest = self
+                    .history
+                    .keys()
+                    .copied()
+                    .find(|&k| k != self.acked_seq && k != self.seq);
+                match oldest {
+                    Some(k) => self.history.remove(&k),
+                    None => break,
+                };
+            }
         }
         if self.seq == self.acked_seq {
             return None; // client is fully caught up
@@ -208,6 +235,40 @@ impl ClientShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_is_bounded_without_acks_and_the_client_still_converges() {
+        let mut server = ServerShell::new(4, 20);
+        let mut client = ClientShell::new(4, 20);
+        // The client applies the first state, but its ack never arrives.
+        server.feed_output(b"a");
+        let Some(Frame::StateDiff { seq, base, data }) = server.poll_diff() else {
+            panic!("expected a diff");
+        };
+        assert!(client.apply_state_diff(seq, base, &data));
+        let stale_ack = client.current_seq();
+        // Many more screens, none acknowledged.
+        for i in 0..500u32 {
+            server.feed_output(format!("{}", i % 10).as_bytes());
+            let _ = server.poll_diff();
+        }
+        assert!(
+            server.history.len() <= MAX_HISTORY,
+            "history grew to {}",
+            server.history.len()
+        );
+        // The late ack names a state no longer kept: the next diff is a full
+        // snapshot, which the client applies, and the two converge.
+        server.on_state_ack(stale_ack);
+        let Some(Frame::StateDiff { seq, base, data }) = server.poll_diff() else {
+            panic!("expected a diff");
+        };
+        assert!(is_full(&data));
+        assert!(client.apply_state_diff(seq, base, &data));
+        assert!(client.screen().render_eq(server.screen()));
+        server.on_state_ack(client.current_seq());
+        assert!(!server.unacked());
+    }
 
     fn pump_converge(server: &mut ServerShell, client: &mut ClientShell, rounds: usize) {
         for _ in 0..rounds {

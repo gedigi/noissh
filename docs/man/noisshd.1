@@ -60,19 +60,29 @@ with the public key written to the same path plus
 .IR .pub .
 .TP
 .BI \-\-authorized\-keys " PATH"
-Authorized client keys (default <config>/authorized_keys). Read once at
-startup: restart the daemon after adding a key.
+Authorized client keys (default <config>/authorized_keys). The file is read
+again when it changes (within a couple of seconds): a key added to it can
+connect, and removing a key ends its sessions. The file and its directory must
+be owned by the daemon's user or root and not be writable by group or others;
+otherwise
+.B noisshd
+refuses to use them.
 .TP
 .BI \-\-command " CMD ..."
 Run this command instead of the login shell (the remaining arguments form the
-command). Useful for restricted or scripted sessions.
+command). Useful for restricted or scripted sessions: a standalone daemon
+given
+.B \-\-command
+serves that command and nothing else (remote commands, file transfer, port
+forwarding and agent forwarding are refused).
 .TP
 .BI \-\-user " NAME"
 Standalone mode only: drop each session to user
 .I NAME
 (uid/gid) before exec. Requires running
 .B noisshd
-as root. File transfer, agent forwarding, and remote\-command exec are refused in
+as root. File transfer, port forwarding, agent forwarding, and remote\-command
+exec are refused in
 this mode, because the daemon process itself does not drop privileges; prefer the
 SSH bootstrap (or run the daemon as the target user) for full multi\-user use.
 .TP
@@ -99,9 +109,17 @@ PTY exists. Shells run as the user
 runs as (no root needed). With
 .B \-\-user
 (as root), each shell drops to that user's uid and gid before exec, without
-supplementary groups; file transfer, agent forwarding and remote commands are
+supplementary groups, with that user's own login shell and a minimal
+environment; file transfer, port and agent forwarding and remote commands are
 then refused, since the daemon itself keeps its privileges. For multi\-user
 hosts prefer the SSH bootstrap, or run one daemon per user.
+.PP
+Remote commands run with the login shell of the user (as with
+.BR sshd (8)),
+so an account with a restricted or disabled shell gets nothing more through
+them. An unknown option is an error:
+.B noisshd
+does not start with a mistyped setting ignored.
 .SH ENVIRONMENT
 .TP
 .B NOISSH_CC

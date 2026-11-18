@@ -31,9 +31,11 @@ Runs the standalone server daemon on UDP port 51820 with sensible sandboxing.
 
 4. Authorize client keys by adding their public key lines to
    `~noissh/.config/noissh/authorized_keys` (one `noissh-x25519 <base64>` per
-   line). A client prints its line with `noissh-keygen`. The daemon reads this
-   file only at startup, so restart it afterwards:
-   `sudo systemctl restart noisshd`.
+   line). A client prints its line with `noissh-keygen`. The daemon picks up
+   changes to this file within a couple of seconds (no restart needed), and
+   removing a key ends that key's sessions. Keep the file and its directory
+   writable by their owner only (`chmod go-w`): the daemon refuses them
+   otherwise.
 
 5. Open UDP 51820 in your firewall. Check status / logs:
 
@@ -67,14 +69,9 @@ end
 TODO: tagged release tarball + sha256, a tap (`gedigi/homebrew-tap`), and a
 `brew services` plist mirroring the systemd unit for macOS.
 
-## Debian package (placeholder)
+## Debian package
 
-Not yet built. Planned layout:
-
-- `debian/control` — package metadata, `Build-Depends: cargo, rustc`.
-- `debian/rules` — `cargo build --release`, install `noissh`, `noisshd`,
-  `noissh-keygen` into `/usr/bin`.
-- `debian/noisshd.service` — ship this unit via `dh_installsystemd`.
-- `debian/postinst` — create the `noissh` system user.
-
-TODO: fill in `debian/` and wire up `cargo-deb` or `dpkg-buildpackage`.
+The release workflow builds `.deb` packages for x86_64 and aarch64 Linux with
+`cargo-deb` (metadata in the root `Cargo.toml`, `[package.metadata.deb]`) and
+attaches them to each GitHub release. They install the three binaries and the
+man pages; they do not install this systemd unit or create a user.

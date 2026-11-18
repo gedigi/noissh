@@ -182,8 +182,15 @@ pub(crate) fn spawn(req: &SpawnRequest) -> Result<PtyHandle, PtyError> {
         }
     };
 
-    let shell =
-        std::env::var("SHELL").unwrap_or_else(|_| target.shell.to_string_lossy().into_owned());
+    // Our own session: `$SHELL` if set, else the account's shell. A session
+    // for another user (`user` set) always gets that account's shell: the
+    // daemon's `$SHELL` is root's, and using it would hand a full shell to an
+    // account whose own is restricted or disabled.
+    let passwd_shell = target.shell.to_string_lossy().into_owned();
+    let shell = match &req.user {
+        Some(_) => passwd_shell,
+        None => std::env::var("SHELL").unwrap_or(passwd_shell),
+    };
 
     let (pty, pts) = pty_process::blocking::open()?;
     pty.resize(Size::new(req.rows, req.cols))?;
@@ -203,6 +210,17 @@ pub(crate) fn spawn(req: &SpawnRequest) -> Result<PtyHandle, PtyError> {
         }
     };
 
+    if req.user.is_some() {
+        // Don't hand the daemon's (root's) environment to the other user's
+        // session: start from a minimal one.
+        cmd = cmd.env_clear().env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        if let Ok(lang) = std::env::var("LANG") {
+            cmd = cmd.env("LANG", lang);
+        }
+    }
     cmd = cmd
         .current_dir(&target.dir) // start a login shell in the user's home
         .env("TERM", &req.term)
@@ -214,9 +232,11 @@ pub(crate) fn spawn(req: &SpawnRequest) -> Result<PtyHandle, PtyError> {
         cmd = cmd.env(k, v);
     }
     if req.user.is_some() {
-        // Basic privilege drop (uid/gid). Requires root. Supplementary groups
-        // are not initialised here; prefer the SSH-bootstrap model for full
-        // multi-user fidelity.
+        // Basic privilege drop (uid/gid). Requires root. The standard library
+        // clears the supplementary groups (`setgroups(0)`) before `setuid`
+        // when dropping from root, so root's groups are not kept; the target
+        // user's own supplementary groups are not initialised. Prefer the
+        // SSH-bootstrap model for full multi-user fidelity.
         cmd = cmd.uid(target.uid.as_raw()).gid(target.gid.as_raw());
     }
 

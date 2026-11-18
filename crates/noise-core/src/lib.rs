@@ -24,11 +24,19 @@ impl From<snow::Error> for NoiseError {
     }
 }
 
-/// A static X25519 keypair.
+/// A static X25519 keypair. The private key is wiped from memory when the
+/// keypair is dropped.
 #[derive(Clone)]
 pub struct Keypair {
     pub private: Vec<u8>,
     pub public: Vec<u8>,
+}
+
+impl Drop for Keypair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private.zeroize();
+    }
 }
 
 /// Generate a fresh static keypair.
@@ -36,10 +44,16 @@ pub fn generate_keypair() -> Result<Keypair, NoiseError> {
     let params = PATTERN.parse().map_err(NoiseError::from)?;
     let builder = snow::Builder::new(params);
     let kp = builder.generate_keypair()?;
-    Ok(Keypair {
-        private: kp.private,
-        public: kp.public,
-    })
+    let mut kp = kp;
+    let out = Keypair {
+        private: kp.private.clone(),
+        public: kp.public.clone(),
+    };
+    {
+        use zeroize::Zeroize;
+        kp.private.zeroize();
+    }
+    Ok(out)
 }
 
 /// Derive the X25519 public key for `private` (a 32-byte static private key, as
